@@ -1,15 +1,36 @@
 """
 MistAI Desktop Assistant
-✅ Working wake word detection
-✅ Proper action verification & delays
-✅ User captions removed
-✅ Clean imports (removed unused)
-✅ Production API endpoints
+Working wake word detection
+Proper action verification & delays
+User captions removed
+Clean imports (removed unused)
+Production API endpoints
 
 Requirements:
     pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow pywin32
 """
 
+# ==========================================
+# CRITICAL: UTF-8 SETUP MUST BE FIRST
+# ==========================================
+import sys
+import io
+# ==========================================
+# NOW IMPORT EVERYTHING ELSE
+# ==========================================
+import os
+import warnings
+import logging
+
+# Suppress warnings AFTER importing
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+# Suppress pywebview spam - DO THIS ONCE ONLY
+logging.basicConfig(level=logging.CRITICAL)
+logging.getLogger("pywebview").setLevel(logging.CRITICAL)
+
+# Now import the rest
 import webview
 import pyautogui
 import requests
@@ -20,13 +41,10 @@ import threading
 import json
 from datetime import datetime
 import psutil
-import os
 from queue import Queue
 import tkinter as tk
 from tkinter import font as tkfont
-import warnings
 import difflib
-import logging
 
 # Optional OCR imports
 try:
@@ -34,65 +52,79 @@ try:
     import numpy as np
     import pytesseract
     from PIL import Image
-
     OCR_AVAILABLE = True
 except:
     OCR_AVAILABLE = False
 
-# ✅ SUPPRESS ANNOYING WARNINGS
-warnings.filterwarnings("ignore")
-os.environ["PYTHONWARNINGS"] = "ignore"
+VERSION = "1.0.0"
 
-# ✅ SUPPRESS PYWEBVIEW SPAM
-logging.basicConfig(level=logging.CRITICAL)
-logging.getLogger("pywebview").setLevel(logging.CRITICAL)
+def setup_bundled_tesseract():
+    """Setup Tesseract - checks bundled version first, then system install"""
+    if not OCR_AVAILABLE:
+        return False
+    
+    # Detect if running as PyInstaller bundle
+    if getattr(sys, 'frozen', False):
+        # Running as compiled .exe - use bundled Tesseract
+        base_path = sys._MEIPASS
+        bundled_tesseract_exe = os.path.join(base_path, 'Tesseract-OCR', 'tesseract.exe')
+        bundled_tessdata = os.path.join(base_path, 'Tesseract-OCR', 'tessdata')
+        
+        print(f"Looking for bundled Tesseract at: {bundled_tesseract_exe}")
+        
+        if os.path.exists(bundled_tesseract_exe):
+            # Set Tesseract executable path
+            pytesseract.pytesseract.tesseract_cmd = bundled_tesseract_exe
+            
+            # Set tessdata path environment variable
+            os.environ['TESSDATA_PREFIX'] = os.path.join(base_path, 'Tesseract-OCR')
+            
+            print(f"Using bundled Tesseract")
+            print(f"EXE: {bundled_tesseract_exe}")
+            print(f"TESSDATA: {bundled_tessdata}")
+            
+            # Verify tessdata exists
+            if os.path.exists(bundled_tessdata):
+                eng_file = os.path.join(bundled_tessdata, 'eng.traineddata')
+                if os.path.exists(eng_file):
+                    print(f"English language data found")
+                else:
+                    print(f"WARNING: eng.traineddata not found")
+            
+            return True
+        else:
+            print(f"Bundled Tesseract not found at expected location")
+            print(f"Falling back to system installation...")
+    
+    # Not bundled OR bundled version not found - check system installation
+    print("Checking for system Tesseract installation...")
 
-# Suppress all the COM/WebView2 error spam
-import sys
-
-
-class SuppressOutput:
-    def __enter__(self):
-        self._original_stderr = sys.stderr
-        sys.stderr = open(os.devnull, "w")
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stderr.close()
-        sys.stderr = self._original_stderr
-
-
-# ✅ SILENCE PYWEBVIEW SPAM
-import logging
-
-logging.getLogger("pywebview").setLevel(logging.CRITICAL)
-logging.basicConfig(level=logging.CRITICAL)
-
-# Redirect stderr to suppress COM errors
-import sys
-
-if os.name == "nt":
-    sys.stderr = open(os.devnull, "w")
-
-# Setup OCR if available
-if OCR_AVAILABLE and os.name == "nt":
     possible_paths = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"C:\Users\cryst\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
-        r"C:\Users\kristianc_seoscholar\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+        os.path.join(os.getenv('LOCALAPPDATA', ''), 'Programs', 'Tesseract-OCR', 'tesseract.exe'),
+        os.path.join(os.getenv('PROGRAMFILES', ''), 'Tesseract-OCR', 'tesseract.exe'),
     ]
+    
     for path in possible_paths:
         if os.path.exists(path):
             pytesseract.pytesseract.tesseract_cmd = path
-            break
+            print(f"Using system Tesseract: {path}")
+            return True
+    
+    return False
 
-print(f"✅ OCR: {'Available' if OCR_AVAILABLE else 'Not available (optional)'}")
+# Initialize Tesseract
+if OCR_AVAILABLE:
+    tesseract_found = setup_bundled_tesseract()
+    if not tesseract_found:
+        OCR_AVAILABLE = False
 
-# ✅ Configuration - PRODUCTION URLS
+# Configuration - PRODUCTION URLS
 API_URL = "https://mist-ai.fly.dev/api/chat"
 STATUS_URL = "https://mist-ai.fly.dev/api/status"
 MODEL = "gemini"
-DEBUG_MODE = False  # ✅ Set to False for production
+DEBUG_MODE = False  # Set to False for production
 
 # Wake words with phonetic alternatives
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]
@@ -124,7 +156,7 @@ def fuzzy_match_wake_word(text):
     for wake_word, alternatives in WAKE_WORD_ALTERNATIVES.items():
         for alt in alternatives:
             if alt in text_lower:
-                print(f"   🎯 Fuzzy match: '{alt}' → '{wake_word}'")
+                print(f"   Fuzzy match: '{alt}' -> '{wake_word}'")
                 # Extract command after the alternative word
                 command = text_lower.split(alt, 1)[-1].strip()
                 return wake_word, command
@@ -136,13 +168,21 @@ def fuzzy_match_wake_word(text):
         if len(word) >= 3 and len(word) <= 6:
             similarity = difflib.SequenceMatcher(None, word, "mist").ratio()
             if similarity >= 0.75:  # 75% similar
-                print(f"   🎯 Similarity match: '{word}' → 'mist' ({similarity:.0%})")
+                print(f"   Similarity match: '{word}' -> 'mist' ({similarity:.0%})")
                 word_index = words.index(word)
                 command = " ".join(words[word_index + 1 :])
                 return "mist", command
 
     return None, None
 
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 class SimpleCaptionWindow:
     """Simple, reliable Tkinter caption overlay"""
@@ -272,14 +312,14 @@ class Api:
         self.speech_thread.start()
 
         # Test PyAutoGUI
-        print("\n🔧 TESTING PYAUTOGUI:")
+        print("\nTESTING PYAUTOGUI:")
         try:
             pyautogui.FAILSAFE = True
             pyautogui.PAUSE = 0.2
             pos = pyautogui.position()
-            print(f"✅ PyAutoGUI working! Mouse: {pos} | Screen: {pyautogui.size()}")
+            print(f"PyAutoGUI working! Mouse: {pos} | Screen: {pyautogui.size()}")
         except Exception as e:
-            print(f"❌ PYAUTOGUI ERROR: {e}")
+            print(f"PYAUTOGUI ERROR: {e}")
 
         # Memory system
         self.conversation_active = False
@@ -353,7 +393,7 @@ class Api:
         self.speech_queue.put(text)
 
     # ============================================
-    # 📺 CAPTION SYSTEM
+    # CAPTION SYSTEM
     # ============================================
 
     def toggle_captions(self, enabled):
@@ -386,7 +426,7 @@ class Api:
         return {"success": True}
 
     # ============================================
-    # 🎤 WAKE WORD DETECTION
+    # WAKE WORD DETECTION
     # ============================================
 
     def start_wake_word_detection(self):
@@ -402,7 +442,7 @@ class Api:
         )
         self.wake_word_thread.start()
 
-        print("🎤 Wake word detection started")
+        print("[Mic] Wake word detection started")
         return {"success": True, "message": "Wake word detection active"}
 
     def stop_wake_word_detection(self):
@@ -413,11 +453,11 @@ class Api:
         self.wake_word_active = False
         self.stop_wake_word.set()
 
-        print("🎤 Wake word detection stopped")
+        print("[Mic] Wake word detection stopped")
         return {"success": True, "message": "Wake word detection stopped"}
 
     def _wake_word_loop(self):
-        print(f"👂 Listening for wake words: {WAKE_WORDS}")
+        print(f"[Ear] Listening for wake words: {WAKE_WORDS}")
 
         wake_recognizer = sr.Recognizer()
         wake_recognizer.energy_threshold = 550
@@ -434,14 +474,14 @@ class Api:
 
                 try:
                     text = wake_recognizer.recognize_google(audio).lower()
-                    print(f"👂 Heard: {text}")
+                    print(f"[Ear] Heard: {text}")
 
                     wake_word, command_after_wake = fuzzy_match_wake_word(text)
 
                     if wake_word:
                         self.conversation_active = True
                         self.last_interaction_time = time.time()
-                        print(f"✅ Wake word detected: {wake_word}")
+                        print(f"[Check] Wake word detected: {wake_word}")
                         self._notify_wake_word_detected()
 
                         gender = self.get_user_gender()
@@ -453,29 +493,29 @@ class Api:
                             greeting = "Yes?"
 
                         if command_after_wake:
-                            print(f"🎯 Executing command: '{command_after_wake}'")
+                            print(f"[Target] Executing command: '{command_after_wake}'")
                             self._execute_wake_command(command_after_wake)
                         else:
                             self.speak_now(greeting, interrupt=True)
                             follow_up = self._listen_for_command(timeout=5)
                             if follow_up:
-                                print(f"🎯 Follow-up command: '{follow_up}'")
+                                print(f"[Target] Follow-up command: '{follow_up}'")
                                 self._execute_wake_command(follow_up)
                             else:
-                                print("⏱️ Waiting for next command...")
+                                print("[Timer] Waiting for next command...")
 
                     elif self.conversation_active and text:
                         time_since_last = time.time() - self.last_interaction_time
 
                         if time_since_last < self.conversation_timeout:
                             print(
-                                f"💬 Continuous conversation: '{text}' (timeout in {self.conversation_timeout - time_since_last:.0f}s)"
+                                f"[Speech] Continuous conversation: '{text}' (timeout in {self.conversation_timeout - time_since_last:.0f}s)"
                             )
                             self.last_interaction_time = time.time()
                             self._execute_wake_command(text)
                         else:
                             self.conversation_active = False
-                            print("💤 Conversation timed out - back to wake word mode")
+                            print("[Sleep] Conversation timed out - back to wake word mode")
 
                 except sr.UnknownValueError:
                     pass
@@ -497,16 +537,16 @@ class Api:
                     source, timeout=timeout, phrase_time_limit=10
                 )
                 command = self.recognizer.recognize_google(audio)
-                print(f"🎯 Command received: '{command}'")
+                print(f"[Target] Command received: '{command}'")
                 return command
         except sr.WaitTimeoutError:
-            print("⏱️ No command received")
+            print("[Timer] No command received")
             return None
         except sr.UnknownValueError:
-            print("❌ Could not understand command")
+            print("[X] Could not understand command")
             return None
         except Exception as e:
-            print(f"⚠️ Listen error: {e}")
+            print(f"[Warning] Listen error: {e}")
             return None
 
     def _execute_wake_command(self, command):
@@ -514,25 +554,25 @@ class Api:
 
         def execute_in_background():
             try:
-                print(f"\n🚀 WAKE COMMAND START: '{command}'")
-                print(f"   📡 Calling API at {API_URL}...")
+                print(f"\n[Rocket] WAKE COMMAND START: '{command}'")
+                print(f"   [Satellite] Calling API at {API_URL}...")
 
                 result = self.ask_mistai(command, MODEL, self.get_user_gender())
 
-                print(f"   📥 API Response received")
+                print(f"   [Inbox] API Response received")
                 print(f"   Success: {result.get('success')}")
 
                 if result.get("success") and result.get("command"):
                     cmd = result["command"]
                     print(
-                        f"   🎬 Executing: {cmd.get('action')} | {cmd.get('parameter')}"
+                        f"   [Clapperboard] Executing: {cmd.get('action')} | {cmd.get('parameter')}"
                     )
-                    print(f"   💬 Speech: {cmd.get('speech')}")
+                    print(f"   [Speech] Speech: {cmd.get('speech')}")
 
                     speech = cmd.get("speech", "")
                     if speech:
                         self.speak_now(speech, interrupt=False)
-                        print(f"   🔊 Speaking: '{speech}'")
+                        print(f"   [Speaker] Speaking: '{speech}'")
 
                     self.execute_action(
                         cmd.get("action"),
@@ -541,27 +581,27 @@ class Api:
                     )
 
                     self._notify_command_executed(command, speech)
-                    print(f"   ✅ WAKE COMMAND COMPLETE")
+                    print(f"   [Check] WAKE COMMAND COMPLETE")
                 else:
                     error = result.get("error", "Unknown error")
-                    print(f"   ❌ API Error: {error}")
+                    print(f"   [X] API Error: {error}")
                     self.speak_now("Sorry, I couldn't process that.")
 
             except requests.exceptions.Timeout:
-                print(f"   ⏱️ API TIMEOUT")
+                print(f"   [Timer] API TIMEOUT")
                 self.speak_now("Sorry, that took too long.")
             except requests.exceptions.ConnectionError:
-                print(f"   🔌 CONNECTION ERROR")
+                print(f"   [Plug] CONNECTION ERROR")
                 self.speak_now("Sorry, I can't connect to my brain.")
             except Exception as e:
-                print(f"   ❌ EXCEPTION: {e}")
+                print(f"   [X] EXCEPTION: {e}")
                 import traceback
 
                 traceback.print_exc()
                 self.speak_now("Sorry, something went wrong.")
 
         threading.Thread(target=execute_in_background, daemon=True).start()
-        print(f"   🔄 Wake command queued for execution")
+        print(f"   [Arrows] Wake command queued for execution")
 
     def _notify_wake_word_detected(self):
         """Notify UI that wake word was detected"""
@@ -584,7 +624,7 @@ class Api:
             pass
 
     # ============================================
-    # 👁️ PROACTIVE MODE
+    # PROACTIVE MODE
     # ============================================
 
     def toggle_proactive_mode(self, enabled):
@@ -598,16 +638,16 @@ class Api:
                     target=self._proactive_loop, daemon=True
                 )
                 self.proactive_thread.start()
-                print("👁️ Proactive mode enabled")
+                print("[Eye] Proactive mode enabled")
                 return {"success": True, "message": "Proactive mode enabled"}
         else:
             self.stop_proactive.set()
-            print("👁️ Proactive mode disabled")
+            print("[Eye] Proactive mode disabled")
             return {"success": True, "message": "Proactive mode disabled"}
 
     def _proactive_loop(self):
         """Continuous screen monitoring"""
-        print("👁️ Proactive monitoring started")
+        print("[Eye] Proactive monitoring started")
 
         while not self.stop_proactive.is_set() and self.proactive_mode:
             try:
@@ -636,7 +676,7 @@ class Api:
             except Exception as e:
                 time.sleep(2)
 
-        print("👁️ Proactive monitoring stopped")
+        print("[Eye] Proactive monitoring stopped")
 
     def _generate_suggestion(self, screen_text, active_window):
         """Generate intelligent suggestion"""
@@ -699,7 +739,7 @@ Respond with ONLY your suggestion text, or "none"."""
             pass
 
     # ============================================
-    # 🔧 UTILITY METHODS
+    # UTILITY METHODS
     # ============================================
 
     def get_user_gender(self):
@@ -730,7 +770,7 @@ Respond with ONLY your suggestion text, or "none"."""
         return None
 
     # ============================================
-    # 🔍 OCR & VISION METHODS
+    # OCR & VISION METHODS
     # ============================================
 
     def find_buttons_on_screen(self):
@@ -798,7 +838,7 @@ Respond with ONLY your suggestion text, or "none"."""
             return buttons
             
         except Exception as e:
-            print(f"   ❌ Button detection error: {e}")
+            print(f"   [X] Button detection error: {e}")
             return []
 
     def find_text_on_screen(self, search_text, confidence=45, save_debug=None):
@@ -807,7 +847,7 @@ Respond with ONLY your suggestion text, or "none"."""
             save_debug = DEBUG_MODE
             
         if not OCR_AVAILABLE:
-            print("   ❌ OCR not available")
+            print("   [X] OCR not available")
             return None
 
         try:
@@ -817,13 +857,13 @@ Respond with ONLY your suggestion text, or "none"."""
             
             original_screenshot = screenshot_np.copy() if save_debug else None
 
-            print(f"   🔍 HYBRID search for: '{search_text}'")
+            print(f"   [Search] HYBRID search for: '{search_text}'")
             
-            print(f"   🔘 Step 1: Detecting UI buttons...")
+            print(f"   [Circle] Step 1: Detecting UI buttons...")
             buttons = self.find_buttons_on_screen()
             
             if buttons:
-                print(f"   📋 Found {len(buttons)} button(s):")
+                print(f"   [List] Found {len(buttons)} button(s):")
                 for i, (x, y, w, h, text) in enumerate(buttons[:5], 1):
                     print(f"      {i}. '{text}' at ({x},{y})")
                 
@@ -832,12 +872,12 @@ Respond with ONLY your suggestion text, or "none"."""
                 
                 if best_match:
                     x, y, w, h, text = best_match
-                    print(f"   ✅ BUTTON MATCH: '{text}'")
+                    print(f"   [Check] BUTTON MATCH: '{text}'")
                     if save_debug:
                         self._save_debug_screenshot(original_screenshot, buttons, best_match, search_text, "button")
                     return (x, y, w, h)
 
-            print(f"   📝 Step 2: Trying enhanced OCR...")
+            print(f"   [Document] Step 2: Trying enhanced OCR...")
             
             mistai_rect = self.get_mistai_window_rect()
             if mistai_rect:
@@ -869,7 +909,7 @@ Respond with ONLY your suggestion text, or "none"."""
             MIN_SCORE = 70 if len(search_text.split()) == 1 else 85
             
             if best_match and best_score >= MIN_SCORE:
-                print(f"   ✅ OCR MATCH: score={best_score} strategy={best_strategy}")
+                print(f"   [Check] OCR MATCH: score={best_score} strategy={best_strategy}")
                 if save_debug:
                     x, y, w, h = best_match
                     self._save_debug_screenshot(
@@ -879,7 +919,7 @@ Respond with ONLY your suggestion text, or "none"."""
                     )
                 return best_match
             
-            print(f"   ❌ NOT FOUND (best score: {best_score}, needed: {MIN_SCORE})")
+            print(f"   [X] NOT FOUND (best score: {best_score}, needed: {MIN_SCORE})")
             
             if save_debug:
                 self._save_debug_screenshot(original_screenshot, buttons, None, search_text, "failed")
@@ -887,7 +927,7 @@ Respond with ONLY your suggestion text, or "none"."""
             return None
             
         except Exception as e:
-            print(f"   ❌ Error: {e}")
+            print(f"   [X] Error: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -970,17 +1010,19 @@ Respond with ONLY your suggestion text, or "none"."""
             return best_match, best_score
             
         except Exception as e:
-            print(f"   ⚠️ OCR strategy error: {e}")
+            print(f"   [Warning] OCR strategy error: {e}")
             return None, 0
 
     def _save_debug_screenshot(self, screenshot, buttons, matched_element, search_text, mode="button"):
         """Save debug screenshot with auto-cleanup"""
+        if not DEBUG_MODE:
+            return
         try:
-            debug_dir = os.path.join(os.getcwd(), "ocr_debug")
-            
+            debug_dir = os.path.join(os.path.expanduser("~"), "MistAI", "ocr_debug")   
+                    
             if not os.path.exists(debug_dir):
                 os.makedirs(debug_dir)
-                print(f"   📁 Created debug dir: {debug_dir}")
+                print(f"   [Folder] Created debug dir: {debug_dir}")
             
             try:
                 debug_files = [f for f in os.listdir(debug_dir) if f.endswith('.png')]
@@ -994,7 +1036,7 @@ Respond with ONLY your suggestion text, or "none"."""
                             except:
                                 pass
             except Exception as cleanup_error:
-                print(f"   ⚠️ Cleanup warning: {cleanup_error}")
+                print(f"   [Warning] Cleanup warning: {cleanup_error}")
             
             timestamp = datetime.now().strftime("%H%M%S")
             debug_image = screenshot.copy()
@@ -1022,12 +1064,12 @@ Respond with ONLY your suggestion text, or "none"."""
             
             success = cv2.imwrite(filename, debug_image)
             if success:
-                print(f"   💾 Debug saved: {filename}")
+                print(f"   [Disk] Debug saved: {filename}")
             else:
-                print(f"   ❌ Failed to save debug screenshot")
+                print(f"   [X] Failed to save debug screenshot")
             
         except Exception as e:
-            print(f"   ⚠️ Debug screenshot error: {e}")
+            print(f"   [Warning] Debug screenshot error: {e}")
 
     def read_screen_text(self):
         """Fast screen reading"""
@@ -1064,7 +1106,7 @@ Respond with ONLY your suggestion text, or "none"."""
             click_x = x + w // 2
             click_y = y + h // 2
             
-            print(f"   🖱️ Clicking at ({click_x}, {click_y})")
+            print(f"   [Mouse] Clicking at ({click_x}, {click_y})")
             pyautogui.moveTo(click_x, click_y, duration=0.3)
             time.sleep(0.1)
             pyautogui.click()
@@ -1112,7 +1154,7 @@ Respond with ONLY your suggestion text, or "none"."""
             return text, 0, psm
 
         except Exception as e:
-            print(f"   ❌ OCR error: {e}")
+            print(f"   [X] OCR error: {e}")
             return "", 0, 3
 
     def get_running_apps(self):
@@ -1245,10 +1287,6 @@ Respond with ONLY your suggestion text, or "none"."""
         except:
             return {"online": False, "reason": "Connection error"}
 
-    # ============================================
-    # 🤖 AI INTERACTION
-    # ============================================
-
     def ask_mistai(self, message, model="gemini", gender="none"):
         self.sync_opened_apps()
         try:
@@ -1268,7 +1306,7 @@ Respond with ONLY your suggestion text, or "none"."""
 
             screen_context = ""
             if OCR_AVAILABLE:
-                print("   📸 Taking fresh screenshot for context...")
+                print("   [Camera] Taking fresh screenshot for context...")
                 screen_text = self.read_screen_text()
                 screen_context = f"\nVISIBLE ON SCREEN RIGHT NOW: {screen_text[:500]}"
                 
@@ -1309,8 +1347,8 @@ RECENT CONVERSATION:
 CRITICAL RULES FOR CLICKING:
 1. **If user asks to click on something**: 
 - Check if it's in "VISIBLE ON SCREEN RIGHT NOW" or "VISIBLE BUTTONS"
-- If YES → use click_on_text action
-- If NO → use click_on_text anyway and let OCR try harder (it can see more than the preview)
+- If YES -> use click_on_text action
+- If NO -> use click_on_text anyway and let OCR try harder (it can see more than the preview)
 - NEVER say "I don't see it" without trying click_on_text first
 
 2. **Trust your vision system**:
@@ -1319,13 +1357,13 @@ CRITICAL RULES FOR CLICKING:
 - Always attempt the action first, apologize only if it fails
 
 3. **Example responses**:
-❌ WRONG: {{"action": "none", "speech": "I don't see that username"}}
-✅ RIGHT: {{"action": "click_on_text", "parameter": "Fulvex", "speech": "Looking for Fulvex"}}
+WRONG: {{"action": "none", "speech": "I don't see that username"}}
+RIGHT: {{"action": "click_on_text", "parameter": "Fulvex", "speech": "Looking for Fulvex"}}
 
 AVAILABLE ACTIONS:
 - open_app: Open/focus application (firefox, chrome, discord, notepad, etc.)
 - type_search: Type text into active field and press enter
-- click_on_text: Find visible text on screen via OCR and click it ← USE THIS WHEN USER ASKS TO CLICK
+- click_on_text: Find visible text on screen via OCR and click it <- USE THIS WHEN USER ASKS TO CLICK
 - press_key: Press a keyboard key (enter, escape, tab, etc.)
 - click: Click at current mouse position
 - scroll: Scroll up or down
@@ -1342,7 +1380,7 @@ RESPONSE FORMAT (JSON only, no markdown):
 {{"action": "...", "parameter": "...", "speech": "..."}}
 
 REMEMBER:
-- When user says "click on X" → ALWAYS try click_on_text first
+- When user says "click on X" -> ALWAYS try click_on_text first
 - The screen preview is LIMITED - OCR can see more than what's shown
 - Be ACTION-FIRST, not cautious
 - You're a DO-er, not a "let me check first"-er"""
@@ -1380,16 +1418,12 @@ REMEMBER:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # ============================================
-    # ⚡ ACTION EXECUTION
-    # ============================================
-
     def execute_action(self, action_type, parameter, speech=""):
         """Execute action with FULL caption support"""
 
         def run():
             try:
-                print(f"\n🔧 EXECUTING ACTION: {action_type} | Param: {parameter}")
+                print(f"\n[Wrench] EXECUTING ACTION: {action_type} | Param: {parameter}")
 
                 if action_type == "multi_step":
                     if isinstance(parameter, list):
@@ -1405,7 +1439,7 @@ REMEMBER:
                             action_name = step.get("action", "none")
                             action_param = step.get("parameter", "")
 
-                            print(f"\n📍 Step {i+1}/{len(parameter)}: {action_name} - {action_param}")
+                            print(f"\n[Pin] Step {i+1}/{len(parameter)}: {action_name} - {action_param}")
                             
                             if self.captions_enabled:
                                 step_caption = f"Step {i+1}/{len(parameter)}: {self._get_action_caption(action_name, action_param)}"
@@ -1413,7 +1447,7 @@ REMEMBER:
 
                             success = self.execute_action_sync(action_name, action_param)
 
-                            print(f"   {'✅' if success else '❌'} Step {i+1}")
+                            print(f"   {'[Check]' if success else '[X]'} Step {i+1}")
 
                             if not success and action_name in ["open_app", "click_on_text", "type_search"]:
                                 if self.captions_enabled:
@@ -1453,7 +1487,7 @@ REMEMBER:
                     self.speak_now(speech, interrupt=False)
 
             except Exception as e:
-                print(f"❌ Action error: {e}")
+                print(f"[X] Action error: {e}")
                 if self.captions_enabled:
                     self.show_caption(f"❌ Error: {str(e)[:50]}", "assistant")
 
@@ -1463,28 +1497,28 @@ REMEMBER:
     def execute_action_sync(self, action_type, parameter):
         """Execute single action with MistAI-powered recovery"""
         try:
-            print(f"\n🎯 SYNC ACTION: {action_type} | Param: {parameter}")
+            print(f"\n[Target] SYNC ACTION: {action_type} | Param: {parameter}")
             
             if self.captions_enabled:
                 action_caption = self._get_action_caption(action_type, parameter)
                 self.show_caption(action_caption, "assistant")
 
             if action_type == "click_on_text":
-                print(f"🖱️ Clicking on text: {parameter}")
+                print(f"[Mouse] Clicking on text: {parameter}")
                 
                 if OCR_AVAILABLE:
-                    print(f"   🔍 Searching for text...")
+                    print(f"   [Search] Searching for text...")
                     
                     result = self.click_on_text(parameter)
                     
                     if result:
-                        print(f"   ✅ Found and clicked '{parameter}'")
+                        print(f"   [Check] Found and clicked '{parameter}'")
                         if self.captions_enabled:
                             self.show_caption(f"✅ Clicked '{parameter}'", "assistant")
                         time.sleep(0.8)
                         return True
                     
-                    print(f"   ❌ Could not find '{parameter}'")
+                    print(f"   [X] Could not find '{parameter}'")
                     if self.captions_enabled:
                         self.show_caption(f"❌ Can't find '{parameter}', thinking...", "assistant")
                     
@@ -1492,7 +1526,7 @@ REMEMBER:
                     buttons = self.find_buttons_on_screen()
                     button_texts = [btn[4] for btn in buttons] if buttons else []
                     
-                    print(f"   🧠 Asking MistAI for recovery strategy...")
+                    print(f"   [Brain] Asking MistAI for recovery strategy...")
                     
                     recovery_result = self._ask_for_recovery(
                         failed_action="click_on_text",
@@ -1507,22 +1541,22 @@ REMEMBER:
                         recovery_param = recovery_cmd.get("parameter")
                         recovery_speech = recovery_cmd.get("speech", "")
                         
-                        print(f"   🔄 MistAI suggests: {recovery_action} | {recovery_param}")
+                        print(f"   [Cycle] MistAI suggests: {recovery_action} | {recovery_param}")
                         
                         if self.captions_enabled and recovery_speech:
                             self.show_caption(recovery_speech, "assistant")
                         
                         if recovery_action == "click_on_text" and recovery_param != parameter:
-                            print(f"   🔄 Trying alternative: '{recovery_param}'")
+                            print(f"   [Cycle] Trying alternative: '{recovery_param}'")
                             alt_result = self.click_on_text(recovery_param)
                             if alt_result:
-                                print(f"   ✅ Recovery successful!")
+                                print(f"   [Check] Recovery successful!")
                                 if self.captions_enabled:
                                     self.show_caption(f"✅ Found it as '{recovery_param}'", "assistant")
                                 return True
                         
                         elif recovery_action == "scroll":
-                            print(f"   🔄 Scrolling {recovery_param}...")
+                            print(f"   [Cycle] Scrolling {recovery_param}...")
                             if self.captions_enabled:
                                 self.show_caption(f"Scrolling {recovery_param}...", "assistant")
                             
@@ -1531,18 +1565,18 @@ REMEMBER:
                             
                             retry_result = self.click_on_text(parameter)
                             if retry_result:
-                                print(f"   ✅ Found after scrolling!")
+                                print(f"   [Check] Found after scrolling!")
                                 if self.captions_enabled:
                                     self.show_caption(f"✅ Found '{parameter}' after scrolling", "assistant")
                                 return True
                         
                         elif recovery_action == "none":
-                            print(f"   ⚠️ MistAI advises giving up")
+                            print(f"   [Warning] MistAI advises giving up")
                             if self.captions_enabled:
                                 self.show_caption("❌ Couldn't complete this action", "assistant")
                             return False
                     
-                    print(f"   ❌ Recovery failed")
+                    print(f"   [X] Recovery failed")
                     if self.captions_enabled:
                         self.show_caption(f"❌ Couldn't find '{parameter}'", "assistant")
                     return False
@@ -1552,7 +1586,7 @@ REMEMBER:
                     return result
 
             elif action_type == "open_app":
-                print(f"🚀 Opening app: {parameter}")
+                print(f"[Rocket] Opening app: {parameter}")
                 if self.captions_enabled:
                     self.show_caption(f"Opening {parameter}...", "assistant")
                 
@@ -1571,7 +1605,7 @@ REMEMBER:
                         time.sleep(1.0)
                         active = self.get_active_window().lower()
                         if param_lower in active:
-                            print(f"   ✅ VERIFIED: {parameter} is active")
+                            print(f"   [Check] VERIFIED: {parameter} is active")
                             if self.captions_enabled:
                                 self.show_caption(f"✅ {parameter} is ready", "assistant")
                             
@@ -1591,11 +1625,11 @@ REMEMBER:
                 
                 active_window = self.get_active_window().lower()
                 if param_lower in active_window:
-                    print(f"   ✅ VERIFIED: {parameter} launched")
+                    print(f"   [Check] VERIFIED: {parameter} launched")
                     if self.captions_enabled:
                         self.show_caption(f"✅ {parameter} opened", "assistant")
                 else:
-                    print(f"   ⚠️ App might not have opened")
+                    print(f"   [Warning] App might not have opened")
                     if self.captions_enabled:
                         self.show_caption(f"⚠️ {parameter} might not have opened", "assistant")
 
@@ -1605,7 +1639,7 @@ REMEMBER:
                 return True
 
             elif action_type == "type_search":
-                print(f"⌨️ Typing: {parameter}")
+                print(f"[Keyboard] Typing: {parameter}")
                 if self.captions_enabled:
                     self.show_caption(f"Typing: {parameter}", "assistant")
                 
@@ -1627,7 +1661,7 @@ REMEMBER:
 
             elif action_type == "scroll":
                 scroll_amount = 300 if parameter == "up" else -300
-                print(f"🔄 Scrolling {parameter}...")
+                print(f"[Cycle] Scrolling {parameter}...")
                 if self.captions_enabled:
                     self.show_caption(f"Scrolling {parameter}...", "assistant")
                 
@@ -1639,7 +1673,7 @@ REMEMBER:
                 return True
 
             elif action_type == "volume":
-                print(f"🔊 Volume {parameter}...")
+                print(f"[Speaker] Volume {parameter}...")
                 if self.captions_enabled:
                     self.show_caption(f"Volume {parameter}", "assistant")
                 
@@ -1651,7 +1685,7 @@ REMEMBER:
                 return True
 
             elif action_type == "press_key":
-                print(f"⌨️ Pressing key: {parameter}")
+                print(f"[Keyboard] Pressing key: {parameter}")
                 if self.captions_enabled:
                     self.show_caption(f"Pressing {parameter}...", "assistant")
                 
@@ -1663,7 +1697,7 @@ REMEMBER:
                 return True
 
             elif action_type == "maximize":
-                print(f"🔲 Maximizing window...")
+                print(f"[Square] Maximizing window...")
                 if self.captions_enabled:
                     self.show_caption("Maximizing window...", "assistant")
                 
@@ -1675,7 +1709,7 @@ REMEMBER:
                 return True
 
             elif action_type == "fullscreen":
-                print(f"⛶ Toggling fullscreen...")
+                print(f"[Window] Toggling fullscreen...")
                 if self.captions_enabled:
                     self.show_caption("Toggling fullscreen...", "assistant")
                 
@@ -1689,7 +1723,7 @@ REMEMBER:
             return True
 
         except Exception as e:
-            print(f"❌ Action sync error: {e}")
+            print(f"[X] Action sync error: {e}")
             if self.captions_enabled:
                 self.show_caption(f"❌ Error: {str(e)[:50]}", "assistant")
             return False
@@ -1723,7 +1757,7 @@ Screen text (OCR): {screen_text[:400]}
 
 RECOVERY OPTIONS:
 1. **Try alternative text**: If you see a similar button/text, suggest clicking it instead
-Example: User wanted "Open Discord" but you see "OpenDiscord" → suggest that
+Example: User wanted "Open Discord" but you see "OpenDiscord" -> suggest that
 
 2. **Scroll**: If the element might be off-screen, suggest scrolling up or down
 
@@ -1760,7 +1794,7 @@ Be smart and practical. What's the best recovery strategy?"""
             return {"success": False}
             
         except Exception as e:
-            print(f"   ❌ Recovery request error: {e}")
+            print(f"   [X] Recovery request error: {e}")
             return {"success": False}
 
     def start_listening(self):
@@ -1791,8 +1825,6 @@ Be smart and practical. What's the best recovery strategy?"""
         threading.Thread(target=listen_thread, daemon=True).start()
         return {"success": True}
 
-
-# HTML UI (unchanged - same as your original)
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="en">
@@ -2036,21 +2068,21 @@ HTML_CONTENT = """
     const captionsToggle = document.getElementById('captions-toggle');
 
     window.addEventListener('pywebviewready', async function() {
-        console.log('✅ Pywebview ready event fired');
+        console.log('[Check] Pywebview ready event fired');
         pywebviewReady = true;
         await init();
     });
 
     async function init() {
-        console.log('🔄 Initializing...');
+        console.log('[Cycle] Initializing...');
         
         if (!window.pywebview || !window.pywebview.api) {
-            console.error('❌ pywebview.api not available!');
+            console.error('[X] pywebview.api not available!');
             addMessage('❌ System initialization failed', 'system');
             return;
         }
         
-        console.log('✅ pywebview.api available');
+        console.log('[Check] pywebview.api available');
         
         const savedGender = localStorage.getItem('userGender');
         if (savedGender) {
@@ -2199,7 +2231,7 @@ HTML_CONTENT = """
             }
             updateMemoryBadge();
         } catch (e) {
-            console.error('❌ Error in handleSend:', e);
+            console.error('[X] Error in handleSend:', e);
             addMessage(`Error: ${e}`, 'system');
         } finally {
             isProcessing = false;
@@ -2239,7 +2271,7 @@ if __name__ == "__main__":
     api = Api()
 
     window = webview.create_window(
-        "MistAI Desktop Assistant",
+        f"MistAI Desktop Assistant v{VERSION}",
         html=HTML_CONTENT,
         js_api=api,
         width=800,
@@ -2248,7 +2280,5 @@ if __name__ == "__main__":
     )
     api.window = window
 
-    # ✅ Suppress pywebview COM/WebView2 error spam
-    print("\n🚀 Starting MistAI...")
-    with SuppressOutput():
-        webview.start(debug=False, gui="edgechromium")
+    print(f"\n[Rocket] Starting MistAI v{VERSION}...")
+    webview.start(debug=False, gui="edgechromium")

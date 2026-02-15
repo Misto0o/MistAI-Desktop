@@ -257,6 +257,7 @@ body {
     margin-bottom: 1rem;
     color: var(--text-primary);
     font-weight: 700;
+    text-align: center;
 }
 
 .content-card h4 {
@@ -878,9 +879,10 @@ body {
 .footer-card {
     background: var(--bg-card);
     border: 1px solid var(--border);
+    text-align: center;
 }
 
-.footer-content {
+.footer-content-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 3rem;
@@ -1067,6 +1069,7 @@ a:hover {
     font-size: 5rem;
     margin-bottom: 1rem;
     animation: float 3s ease-in-out infinite;
+    user-select: none;
 }
 
 @keyframes float {

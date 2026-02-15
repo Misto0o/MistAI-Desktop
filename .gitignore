@@ -1,0 +1,9 @@
+*.manifest
+*.spec
+build/
+dist/
+
+# MistAI Specific
+# Keep your cleaned Tesseract-OCR folder if it's custom
+# MistAI_OCREngine/ 
+# Uncomment above if you want to ignore it
