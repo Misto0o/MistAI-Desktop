@@ -24,24 +24,6 @@ for root, dirs, files in os.walk(TESSERACT_SOURCE):
         tesseract_files.append((source_path, dest_folder))
 
 # ==========================================
-# PYAUDIO BUNDLING (Windows)
-# ==========================================
-pyaudio_binaries = []
-if os.name == 'nt':
-    try:
-        import pyaudio
-        site_packages = site.getsitepackages()
-        for site_pkg in site_packages:
-            pyaudio_path = os.path.join(site_pkg, 'pyaudio')
-            if os.path.exists(pyaudio_path):
-                for file in os.listdir(pyaudio_path):
-                    if file.endswith('.pyd') or file.endswith('.dll'):
-                        pyaudio_binaries.append((os.path.join(pyaudio_path, file), '.'))
-                        print(f"Found PyAudio binary: {file}")
-    except Exception as e:
-        print(f"Warning: Could not bundle PyAudio: {e}")
-
-# ==========================================
 # SPLASH IMAGE & ICON
 # ==========================================
 splash_image = os.path.join(SPEC_DIR, 'splash.png')
@@ -58,7 +40,7 @@ if os.path.exists(splash_image):
 a = Analysis(
     ['assistant.py'],
     pathex=[],
-    binaries=pyaudio_binaries,
+    binaries=[],
     datas=data_files,
     hiddenimports=[
         'webview',

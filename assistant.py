@@ -55,7 +55,7 @@ try:
 except:
     OCR_AVAILABLE = False
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 def show_splash_screen():
     """Show splash screen before launching assistant"""
