@@ -1,78 +1,64 @@
 # -*- mode: python ; coding: utf-8 -*-
-# MistAI Desktop Assistant - Production Build with Bundled Tesseract
-# This spec file bundles Tesseract OCR for true one-click installation
-
 import os
-import glob
+import site
 from pathlib import Path
 
 block_cipher = None
-
-# ==========================================
-# TESSERACT BUNDLING CONFIGURATION
-# ==========================================
-
-# Get the base directory where this spec file is located
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 
-# Path to your bundled Tesseract folder
+# ==========================================
+# TESSERACT BUNDLING
+# ==========================================
 TESSERACT_SOURCE = os.path.join(SPEC_DIR, 'MistAI_OCREngine', 'Tesseract-OCR')
 
-# Verify Tesseract folder exists
 if not os.path.exists(TESSERACT_SOURCE):
     raise FileNotFoundError(f"Tesseract folder not found at: {TESSERACT_SOURCE}")
 
-# Collect ALL Tesseract files recursively
 tesseract_files = []
 for root, dirs, files in os.walk(TESSERACT_SOURCE):
     for file in files:
         source_path = os.path.join(root, file)
-        # Calculate relative path from Tesseract-OCR folder
         rel_path = os.path.relpath(source_path, TESSERACT_SOURCE)
-        # Destination in bundle: Tesseract-OCR/...
         dest_path = os.path.join('Tesseract-OCR', rel_path)
-        # Add as tuple (source, destination_folder)
         dest_folder = os.path.dirname(dest_path)
         tesseract_files.append((source_path, dest_folder))
 
-# Verify critical files exist
-critical_files = [
-    os.path.join(TESSERACT_SOURCE, 'tesseract.exe'),
-    os.path.join(TESSERACT_SOURCE, 'tessdata', 'eng.traineddata'),
-]
+# ==========================================
+# PYAUDIO BUNDLING (Windows)
+# ==========================================
+pyaudio_binaries = []
+if os.name == 'nt':
+    try:
+        import pyaudio
+        site_packages = site.getsitepackages()
+        for site_pkg in site_packages:
+            pyaudio_path = os.path.join(site_pkg, 'pyaudio')
+            if os.path.exists(pyaudio_path):
+                for file in os.listdir(pyaudio_path):
+                    if file.endswith('.pyd') or file.endswith('.dll'):
+                        pyaudio_binaries.append((os.path.join(pyaudio_path, file), '.'))
+                        print(f"Found PyAudio binary: {file}")
+    except Exception as e:
+        print(f"Warning: Could not bundle PyAudio: {e}")
 
-for critical_file in critical_files:
-    if not os.path.exists(critical_file):
-        print(f"WARNING: Critical file missing: {critical_file}")
-    else:
-        print(f"Found critical file: {os.path.basename(critical_file)}")
-
+# ==========================================
+# SPLASH IMAGE & ICON
+# ==========================================
 splash_image = os.path.join(SPEC_DIR, 'splash.png')
-if os.path.exists(splash_image):
-    print(f"Found splash.png at {splash_image}")
-else:
-    print(f"WARNING: splash.png not found at {splash_image}")
-
-# Add icon check
 icon_path = os.path.join(SPEC_DIR, 'mistaifaviocn', 'favicon.ico')
-if not os.path.exists(icon_path):
-    print(f"WARNING: icon not found at {icon_path}")
-else:
-    print(f"Found favicon.ico")
 
-# Now create data_files list with splash image
 data_files = tesseract_files.copy()
 if os.path.exists(splash_image):
     data_files.append((splash_image, '.'))
+    print(f"Found splash.png")
 
 # ==========================================
 # PYINSTALLER ANALYSIS
 # ==========================================
-
 a = Analysis(
-    ['assistant.py'],  # ← Changed from assistant.py to splash.py
+    ['assistant.py'],
     pathex=[],
-    binaries=[],
+    binaries=pyaudio_binaries,
     datas=data_files,
     hiddenimports=[
         'webview',
@@ -80,6 +66,8 @@ a = Analysis(
         'requests',
         'speech_recognition',
         'pyttsx3',
+        'pyaudio',
+        '_portaudio',
         'psutil',
         'pytesseract',
         'PIL',
@@ -135,7 +123,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # No console
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
