@@ -7,21 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            artifact_name: MistAI-Windows
-            asset_name: MistAI-Windows.exe
-          - os: macos-latest
-            artifact_name: MistAI-macOS
-            asset_name: MistAI-macOS.app
-          - os: ubuntu-latest
-            artifact_name: MistAI-Linux
-            asset_name: MistAI-Linux
-
+  build-windows:
+    runs-on: windows-latest
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,50 +17,96 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'  # ← Changed to 3.11 (your current version)
+          python-version: '3.11'
 
-      - name: Install system dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk tesseract-ocr libtesseract-dev
-
-      - name: Install system dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install tesseract
-
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
           pip install pyinstaller
+          pip install pywebview pyautogui requests SpeechRecognition pyttsx3 psutil pytesseract Pillow opencv-python numpy pywin32
+          # Skip pyaudio on CI - it's optional for voice input
 
-      - name: Build with PyInstaller (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Build with PyInstaller
         run: |
           python -m PyInstaller MistAI.spec --clean
 
-      - name: Build with PyInstaller (macOS/Linux)
-        if: matrix.os != 'windows-latest'
+      - name: Create ZIP
+        run: |
+          cd dist
+          Compress-Archive -Path MistAI.exe -DestinationPath MistAI-Windows-x64.zip
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MistAI-Windows
+          path: dist/MistAI-Windows-x64.zip
+
+  build-macos:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          brew install portaudio tesseract
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow opencv-python numpy
+
+      - name: Build with PyInstaller
         run: |
           pyinstaller MistAI.spec --clean
 
-      - name: Prepare Windows artifact
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd dist
-          Compress-Archive -Path MistAI.exe -DestinationPath MistAI-Windows.zip
-        shell: pwsh
-
-      - name: Prepare macOS artifact
-        if: matrix.os == 'macos-latest'
+      - name: Create ZIP
         run: |
           cd dist
           zip -r MistAI-macOS.zip MistAI.app
 
-      - name: Prepare Linux artifact
-        if: matrix.os == 'ubuntu-latest'
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MistAI-macOS
+          path: dist/MistAI-macOS.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk portaudio19-dev tesseract-ocr libtesseract-dev
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow opencv-python numpy
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller MistAI.spec --clean
+
+      - name: Create tarball
         run: |
           cd dist
           tar -czf MistAI-Linux.tar.gz MistAI
@@ -80,12 +114,11 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/*.{zip,tar.gz}
-          if-no-files-found: error
+          name: MistAI-Linux
+          path: dist/MistAI-Linux.tar.gz
 
   release:
-    needs: build
+    needs: [build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     
@@ -99,11 +132,44 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/MistAI-Windows/*.zip
-            artifacts/MistAI-macOS/*.zip
-            artifacts/MistAI-Linux/*.tar.gz
+            artifacts/MistAI-Windows/MistAI-Windows-x64.zip
+            artifacts/MistAI-macOS/MistAI-macOS.zip
+            artifacts/MistAI-Linux/MistAI-Linux.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
+          body: |
+            ## MistAI Desktop Assistant v${{ github.ref_name }}
+            
+            ### Installation
+            
+            **Windows:**
+            1. Download `MistAI-Windows-x64.zip`
+            2. Extract and run `MistAI.exe`
+            
+            **macOS:**
+            1. Download `MistAI-macOS.zip`
+            2. Extract and run `MistAI.app`
+            3. Install Tesseract: `brew install tesseract` (for OCR)
+            
+            **Linux:**
+            1. Download `MistAI-Linux.tar.gz`
+            2. Extract: `tar -xzf MistAI-Linux.tar.gz`
+            3. Run: `./MistAI`
+            4. Install Tesseract: `sudo apt install tesseract-ocr` (for OCR)
+            
+            ### What's New
+            - ✨ Professional splash screen with fade-in animation
+            - 🌍 Multi-platform support (Windows, macOS, Linux)
+            - 🔧 Improved stability and error handling
+            
+            ### Features
+            - 🎤 Wake word detection ("Hey Mist")
+            - 👁️ Screen vision with OCR (Windows bundled, others need Tesseract)
+            - 📺 Live caption overlay
+            - 💡 Proactive suggestions
+            - 🧠 Context memory
+            
+            **Requirements:** Microphone • Internet connection
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
