@@ -70,7 +70,7 @@ if os.path.exists(splash_image):
 # ==========================================
 
 a = Analysis(
-    ['splash.py'],  # ← Changed from assistant.py to splash.py
+    ['launcher.py'],  # ← Changed from assistant.py to splash.py
     pathex=[],
     binaries=[],
     datas=data_files,

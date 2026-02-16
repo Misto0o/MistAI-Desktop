@@ -29,9 +29,31 @@ jobs:
           pip install pyinstaller
           pip install pywebview pyautogui requests SpeechRecognition pyttsx3 psutil pytesseract Pillow opencv-python numpy pywin32
 
+      - name: Verify file structure
+        run: |
+          echo "Checking for required files..."
+          if (Test-Path "launcher.py") { echo "✓ launcher.py found" } else { echo "✗ launcher.py missing"; exit 1 }
+          if (Test-Path "splash.py") { echo "✓ splash.py found" } else { echo "✗ splash.py missing"; exit 1 }
+          if (Test-Path "assistant.py") { echo "✓ assistant.py found" } else { echo "✗ assistant.py missing"; exit 1 }
+          if (Test-Path "splash.png") { echo "✓ splash.png found" } else { echo "✗ splash.png missing"; exit 1 }
+          if (Test-Path "MistAI.spec") { echo "✓ MistAI.spec found" } else { echo "✗ MistAI.spec missing"; exit 1 }
+        shell: pwsh
+
       - name: Build with PyInstaller
         run: |
           python -m PyInstaller MistAI.spec --clean
+        shell: pwsh
+
+      - name: Verify build output
+        run: |
+          if (Test-Path "dist/MistAI.exe") {
+            echo "✓ MistAI.exe built successfully"
+            echo "File size: $((Get-Item dist/MistAI.exe).length / 1MB) MB"
+          } else {
+            echo "✗ Build failed - MistAI.exe not found"
+            exit 1
+          }
+        shell: pwsh
 
       - name: Create ZIP
         run: |
@@ -67,6 +89,15 @@ jobs:
           pip install pyinstaller
           pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow opencv-python numpy
 
+      - name: Verify file structure
+        run: |
+          echo "Checking for required files..."
+          ls -la
+          test -f launcher.py && echo "✓ launcher.py found" || (echo "✗ launcher.py missing" && exit 1)
+          test -f splash.py && echo "✓ splash.py found" || (echo "✗ splash.py missing" && exit 1)
+          test -f assistant.py && echo "✓ assistant.py found" || (echo "✗ assistant.py missing" && exit 1)
+          test -f splash.png && echo "✓ splash.png found" || (echo "✗ splash.png missing" && exit 1)
+
       - name: Build with PyInstaller
         run: |
           pyinstaller MistAI.spec --clean
@@ -74,6 +105,13 @@ jobs:
       - name: List dist contents
         run: |
           ls -la dist/
+          if [ -f "dist/MistAI" ]; then
+            echo "✓ MistAI built successfully"
+            ls -lh dist/MistAI
+          else
+            echo "✗ Build failed - MistAI not found"
+            exit 1
+          fi
 
       - name: Create ZIP
         run: |
@@ -109,6 +147,15 @@ jobs:
           pip install pyinstaller
           pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow opencv-python numpy
 
+      - name: Verify file structure
+        run: |
+          echo "Checking for required files..."
+          ls -la
+          test -f launcher.py && echo "✓ launcher.py found" || (echo "✗ launcher.py missing" && exit 1)
+          test -f splash.py && echo "✓ splash.py found" || (echo "✗ splash.py missing" && exit 1)
+          test -f assistant.py && echo "✓ assistant.py found" || (echo "✗ assistant.py missing" && exit 1)
+          test -f splash.png && echo "✓ splash.png found" || (echo "✗ splash.png missing" && exit 1)
+
       - name: Build with PyInstaller
         run: |
           pyinstaller MistAI.spec --clean
@@ -116,6 +163,13 @@ jobs:
       - name: List dist contents
         run: |
           ls -la dist/
+          if [ -f "dist/MistAI" ]; then
+            echo "✓ MistAI built successfully"
+            ls -lh dist/MistAI
+          else
+            echo "✗ Build failed - MistAI not found"
+            exit 1
+          fi
 
       - name: Create tarball
         run: |
@@ -157,6 +211,7 @@ jobs:
             **Windows:**
             1. Download `MistAI-Windows-x64.zip`
             2. Extract and run `MistAI.exe`
+            3. Splash screen will appear, then the assistant launches
             
             **macOS:**
             1. Download `MistAI-macOS.zip`
@@ -173,6 +228,7 @@ jobs:
             - ✨ Professional splash screen with fade-in animation
             - 🌍 Multi-platform support (Windows, macOS, Linux)
             - 🔧 Improved stability and error handling
+            - 🎯 Smart launcher with display detection
             
             ### Features
             - 🎤 Wake word detection ("Hey Mist")
