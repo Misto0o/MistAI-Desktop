@@ -91,7 +91,7 @@
                         Your Jarvis-like AI companion powered by Nova, Sage, and Flux
                     </h2>
                     <div class="hero-badges" data-aos="fade-up" data-aos-delay="300">
-                        <span class="badge">🚀 Beta 1.0</span>
+                        <span class="badge">🚀 Beta 1.5</span>
                         <span class="badge">🎤 Voice Control</span>
                         <span class="badge">👁️ Screen Vision</span>
                         <span class="badge">🧠 3 AI Personalities</span>
@@ -214,40 +214,55 @@
                 <h2 class="section-title-center"><i class="fas fa-download"></i> Installation</h2>
                 <div class="grid-2">
                     <div class="content-card">
-                        <h3>Download MistAI Desktop!</h3>
+                        <h3>Download MistAI Desktop</h3>
                         <p>
-                            MistAI Desktop is available as a standalone executable for Windows. No Python installation
-                            required—just download and run!
+                            MistAI Desktop is available as a standalone executable for Windows, macOS, and Linux.
+                            No Python installation required—just download and run!
                         </p>
                         <div class="download-box-compact">
                             <a href="https://github.com/Misto0o/MistAI-Desktop/releases" class="btn-download"
                                 target="_blank">
                                 <i class="fab fa-github"></i> Download Latest Release
                             </a>
-                            <p class="download-note">Windows 10/11 • ~50MB • Built with PyInstaller</p>
+                            <p class="download-note">Windows • macOS • Linux • ~50MB • Built with PyInstaller</p>
+                        </div>
+                        <div class="mt-4"
+                            style="padding: 1rem; background: rgba(255, 193, 7, 0.1); border-left: 4px solid #ffc107; border-radius: 4px;">
+                            <p style="margin: 0; color: #f39c12;">
+                                <i class="fas fa-exclamation-triangle"></i> <strong>OCR Limitation:</strong>
+                                The bundled Tesseract OCR (screen vision) only works on Windows. macOS and Linux
+                                builds will function normally but without OCR capabilities unless you install
+                                Tesseract separately on your system.
+                            </p>
                         </div>
                     </div>
 
                     <div class="content-card">
                         <h3>Requirements</h3>
                         <ul class="requirement-list">
-                            <li><i class="fab fa-windows"></i> <strong>Windows 10/11</strong> – Operating system</li>
+                            <li><i class="fab fa-windows"></i> <strong>Windows 10/11</strong> or <i
+                                    class="fab fa-apple"></i> <strong>macOS</strong> or <i class="fab fa-linux"></i>
+                                <strong>Linux</strong>
+                            </li>
                             <li><i class="fas fa-microphone"></i> <strong>Microphone</strong> – For voice control</li>
-                            <li><i class="fas fa-wifi"></i> <strong>Internet</strong> – Internet is currently required
-                                for AI processing</li>
+                            <li><i class="fas fa-wifi"></i> <strong>Internet Connection</strong> – Required for AI
+                                processing</li>
                             <li>
                                 <i class="fas fa-eye"></i>
-                                <strong>Vision OCR</strong> – Built-in. Optional <a
-                                    href="https://github.com/UB-Mannheim/tesseract/wiki" target="_blank">Tesseract
-                                    install</a>
+                                <strong>Vision OCR (Optional)</strong> – Windows: Built-in | macOS/Linux:
+                                <a href="https://github.com/tesseract-ocr/tesseract" target="_blank">Install
+                                    Tesseract</a>
                             </li>
-
                         </ul>
-                        <p class="mt-4">
-                            <strong>Note:</strong> MistAI Desktop comes bundled with pyterract for OCR. For any reason
-                            it fails to work, you can install Tesseract separately and MistAI will automatically use the
-                            system installation.
-                        </p>
+                        <div class="mt-4"
+                            style="padding: 1rem; background: rgba(52, 152, 219, 0.1); border-left: 4px solid #3498db; border-radius: 4px;">
+                            <p style="margin: 0 0 0.5rem 0;"><strong>About OCR (Screen Vision):</strong></p>
+                            <p style="margin: 0; font-size: 0.9rem;">
+                                Windows builds include Tesseract bundled. macOS/Linux users can install Tesseract
+                                separately to enable screen vision features. Without Tesseract, all other features
+                                (voice control, app automation, proactive mode, captions) work normally.
+                            </p>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -396,9 +411,12 @@
                             Can I use MistAI on Mac or Linux?
                         </div>
                         <div class="faq-answer">
-                            Currently, MistAI is designed for Windows only. The code uses Windows-specific libraries and
-                            may
-                            not work on other platforms without modifications.
+                            Yes! MistAI Desktop is available for Windows, macOS, and Linux. However, the bundled
+                            Tesseract
+                            OCR (screen vision) is Windows-only. macOS and Linux users can install Tesseract separately
+                            to
+                            enable OCR features. All other functionality (voice control, app automation, captions) works
+                            across all platforms.
                         </div>
                     </div>
 
@@ -461,9 +479,12 @@
                             </div>
                             <div class="trouble-item-compact">
                                 <h4><i class="fas fa-eye-slash"></i> OCR not finding text</h4>
-                                <p>OCR (Vision Mode)
-                                    MistAI supports on-screen text recognition. If OCR is unavailable, MistAI will
-                                    automatically fall back to recovery strategies and continue running normally.</p>
+                                <p><strong>Windows:</strong> OCR is bundled and should work automatically.
+                                    <strong>macOS/Linux:</strong> Install <a
+                                        href="https://github.com/tesseract-ocr/tesseract" target="_blank">Tesseract</a>
+                                    separately. MistAI will continue working without OCR—it just won't be able to see
+                                    screen text.
+                                </p>
                             </div>
                             <div class="trouble-item-compact">
                                 <h4><i class="fas fa-volume-mute"></i> No text-to-speech</h4>
@@ -481,7 +502,7 @@
                         <h2 class="card-title"><i class="fas fa-road"></i> Future Updates</h2>
                         <div class="roadmap-list">
                             <div class="roadmap-item">
-                                <strong>V 1.5</strong> – Enhanced proactive suggestions with smarter context awareness
+                                <strong>V 1.5 (Full)</strong> – Enhanced proactive suggestions with smarter context awareness
                             </div>
                             <div class="roadmap-item">
                                 <strong>V 2.0</strong> – Cross-application workflows (e.g., "Screenshot and email it")

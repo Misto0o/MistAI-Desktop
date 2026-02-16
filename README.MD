@@ -1,13 +1,33 @@
-☁️ MistAI Desktop Assistant – Beta V1.0
+# ☁️ MistAI Desktop Assistant – Beta V1.5
 
-MistAI Desktop is a Jarvis-style AI assistant that runs directly on Windows.  
+MistAI Desktop is a Jarvis-style AI assistant that runs directly on your computer.  
 It listens for wake words, automates your desktop, reads your screen, and provides live captions.
 
-🚀 Current Version: Beta V1.0  
-💻 Platform: Windows  
-🎤 Wake Word Support  
-👁️ Screen Vision (OCR)  
-📺 Live Caption Overlay  
+🚀 **Current Version:** Beta V1.5  
+💻 **Platform:** Windows, macOS, Linux  
+🎤 **Wake Word Support**  
+👁️ **Screen Vision (OCR)**  
+📺 **Live Caption Overlay**  
+🎨 **Splash Screen Loading**  
+
+---
+
+## 🆕 What's New in V1.5
+
+### ✨ Professional Splash Screen
+- Elegant fade-in animation on startup
+- Custom branded loading experience
+- Smooth transition to main window
+
+### 🌍 Multi-Platform Support
+- **Windows**: Full feature support with bundled Tesseract OCR
+- **macOS**: All features except OCR (install Tesseract separately)
+- **Linux**: All features except OCR (install Tesseract separately)
+
+### 🔧 Improved Stability
+- Enhanced error handling for missing dependencies
+- Better fallback mechanisms for OCR failures
+- Optimized build process with PyInstaller
 
 ---
 
@@ -15,55 +35,81 @@ It listens for wake words, automates your desktop, reads your screen, and provid
 
 ### 🎤 Wake Word Voice Assistant
 - Activate with "Mist", "Hey Mist", or "MistAI"
-- Natural speech commands
+- Natural speech commands with fuzzy matching
 - Always-on background listener
+- Continuous conversation mode (45-second timeout)
 
 ### 👁️ Vision Mode (Screen Understanding)
 - Reads on-screen text automatically
-- UI automation and smart clicking
-- Optional Tesseract OCR fallback
+- UI button detection and smart clicking
+- Multi-strategy OCR with fallback modes
+- AI-powered recovery when actions fail
+- **Note:** OCR bundled on Windows only
 
 ### 📺 Live Captions System
-- Real-time caption overlay
-- Color-coded assistant and system messages
-- Privacy-first (user speech not displayed)
+- Real-time caption overlay at screen bottom
+- Color-coded messages:
+  - 🟢 **Green** = Assistant responses
+  - 🟡 **Yellow** = System notifications  
+  - 🟣 **Purple** = Proactive suggestions
+- Privacy-first (user speech never displayed)
+
+### 💡 Proactive Mode
+- Screen monitoring with smart suggestions
+- Context-aware recommendations
+- Learns from your workflow
 
 ### ⚙️ Desktop Automation
-- Open apps, type, click, scroll, run commands
-- AI-powered system control
+- **App Control:** Open, focus, maximize applications
+- **Input:** Type text, press keys, click elements
+- **Navigation:** Scroll, fullscreen, window management
+- **Volume:** System audio control
+- **Multi-step:** Chain complex workflows
+
+### 🧠 Context Memory
+- Tracks conversation history
+- Remembers opened apps
+- Monitors active windows
+- Session-aware actions
 
 ---
 
 ## 💻 System Requirements
-✔ Windows 10 / 11  
+
+### Windows
+✔ Windows 10 / 11 (64-bit)  
 ✔ Microphone  
 ✔ Internet connection  
-✔ Vision OCR (built-in, optional manual install)
+✔ Vision OCR (bundled)  
+
+### macOS
+✔ macOS 10.15 or later  
+✔ Microphone  
+✔ Internet connection  
+⚠️ Vision OCR (requires [Tesseract](https://github.com/tesseract-ocr/tesseract) install)
+
+### Linux
+✔ Ubuntu 20.04+ / Debian / Fedora  
+✔ Microphone  
+✔ Internet connection  
+⚠️ Vision OCR (requires [Tesseract](https://github.com/tesseract-ocr/tesseract) install)
 
 ---
 
 ## 🚀 Installation
-1. Download the latest release  
-2. Run `MistAI.exe`  
-3. Complete setup  
-4. Say **"Hey Mist"**
 
----
+### Option 1: Download Pre-built Executable (Recommended)
 
-## 🛡️ Privacy
-- No user captions displayed  
-- No screen data stored by default  
-- Local automation processing when possible  
+1. Go to [Releases](https://github.com/Misto0o/MistAI-Desktop/releases)
+2. Download for your platform:
+   - `MistAI-Windows.zip` (Windows)
+   - `MistAI-macOS.zip` (macOS)
+   - `MistAI-Linux.tar.gz` (Linux)
+3. Extract and run:
+   - **Windows:** `MistAI.exe`
+   - **macOS:** `MistAI.app`
+   - **Linux:** `./MistAI`
+4. Say **"Hey Mist"** to start!
 
----
-
-## 🛠️ Future Plans
-- Local LLM mode  
-- Plugin system  
-- macOS & Linux support  
-- Custom voices  
-
----
-
-## 💡 Built by Kristian  
-https://builtbykristian.netlify.app
+### Option 2: Build from Source
+```bash

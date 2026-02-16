@@ -14,7 +14,6 @@ Requirements:
 # CRITICAL: UTF-8 SETUP MUST BE FIRST
 # ==========================================
 import sys
-import io
 # ==========================================
 # NOW IMPORT EVERYTHING ELSE
 # ==========================================
@@ -56,7 +55,7 @@ try:
 except:
     OCR_AVAILABLE = False
 
-VERSION = "1.0.0"
+VERSION = "1.5.0"
 
 def setup_bundled_tesseract():
     """Setup Tesseract - checks bundled version first, then system install"""
@@ -1811,16 +1810,16 @@ Be smart and practical. What's the best recovery strategy?"""
                         source, timeout=5, phrase_time_limit=10
                     )
                     text = self.recognizer.recognize_google(audio)
-                    window.evaluate_js(f'handleVoiceResult("{text}")')
+                    self.window.evaluate_js(f'handleVoiceResult("{text}")')
             except sr.WaitTimeoutError:
-                window.evaluate_js('handleVoiceError("No speech detected")')
+                self.window.evaluate_js('handleVoiceError("No speech detected")')
             except sr.UnknownValueError:
-                window.evaluate_js('handleVoiceError("Could not understand")')
+                self.window.evaluate_js('handleVoiceError("Could not understand")')
             except Exception as e:
-                window.evaluate_js(f'handleVoiceError("{str(e)}")')
+                self.window.evaluate_js(f'handleVoiceError("{str(e)}")')
             finally:
                 self.is_listening = False
-                window.evaluate_js("handleVoiceEnd()")
+                self.window.evaluate_js("handleVoiceEnd()")
 
         threading.Thread(target=listen_thread, daemon=True).start()
         return {"success": True}
@@ -2267,7 +2266,8 @@ HTML_CONTENT = """
 </html>
 """
 
-if __name__ == "__main__":
+def main():
+    """Main entry point for the assistant"""
     api = Api()
 
     window = webview.create_window(
@@ -2282,3 +2282,6 @@ if __name__ == "__main__":
 
     print(f"\n[Rocket] Starting MistAI v{VERSION}...")
     webview.start(debug=False, gui="edgechromium")
+
+if __name__ == "__main__":
+    main()
