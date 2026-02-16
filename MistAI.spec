@@ -49,16 +49,16 @@ for critical_file in critical_files:
 
 splash_image = os.path.join(SPEC_DIR, 'splash.png')
 if os.path.exists(splash_image):
-    print(f"✓ Found splash.png at {splash_image}")
+    print(f"Found splash.png at {splash_image}")
 else:
-    print(f"⚠ WARNING: splash.png not found at {splash_image}")
+    print(f"WARNING: splash.png not found at {splash_image}")
 
 # Add icon check
 icon_path = os.path.join(SPEC_DIR, 'mistaifaviocn', 'favicon.ico')
 if not os.path.exists(icon_path):
-    print(f"⚠ WARNING: icon not found at {icon_path}")
+    print(f"WARNING: icon not found at {icon_path}")
 else:
-    print(f"✓ Found favicon.ico")
+    print(f"Found favicon.ico")
 
 # Now create data_files list with splash image
 data_files = tesseract_files.copy()
