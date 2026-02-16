@@ -57,6 +57,59 @@ except:
 
 VERSION = "1.5.0"
 
+def show_splash_screen():
+    """Show splash screen before launching assistant"""
+    try:
+        from tkinter import Tk, Label
+        from PIL import Image, ImageTk
+        
+        root = Tk()
+        root.overrideredirect(True)
+        root.configure(bg="black")
+        
+        # Load splash image
+        try:
+            img_path = get_resource_path("splash.png")
+            img = Image.open(img_path)
+            image_width, image_height = img.size
+            photo = ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"[Splash] Could not load splash.png: {e}")
+            root.destroy()
+            return
+        
+        # Center window
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        x = (screen_width // 2) - (image_width // 2)
+        y = (screen_height // 2) - (image_height // 2)
+        root.geometry(f"{image_width}x{image_height}+{x}+{y}")
+        
+        # Display image
+        label = Label(root, image=photo, bg="black")
+        label.pack()
+        label.image = photo  # Keep reference
+        
+        # Fade in
+        root.attributes("-alpha", 0)
+        
+        def fade_in(alpha=0):
+            alpha += 0.05
+            if alpha > 1:
+                alpha = 1
+            root.attributes("-alpha", alpha)
+            if alpha < 1:
+                root.after(50, fade_in, alpha)
+            else:
+                root.after(3000, root.destroy)  # Close after 3 seconds
+        
+        fade_in()
+        root.mainloop()
+        
+    except Exception as e:
+        print(f"[Splash] Error: {e}")
+        # If splash fails, just continue
+
 def setup_bundled_tesseract():
     """Setup Tesseract - checks bundled version first, then system install"""
     if not OCR_AVAILABLE:
@@ -2268,6 +2321,13 @@ HTML_CONTENT = """
 
 def main():
     """Main entry point for the assistant"""
+    # Show splash screen first (only if display available)
+    if os.name == 'nt' or os.environ.get('DISPLAY'):
+        print("[Splash] Showing splash screen...")
+        show_splash_screen()
+    
+    print(f"\n[Rocket] Starting MistAI v{VERSION}...")
+    
     api = Api()
 
     window = webview.create_window(
@@ -2280,7 +2340,6 @@ def main():
     )
     api.window = window
 
-    print(f"\n[Rocket] Starting MistAI v{VERSION}...")
     webview.start(debug=False, gui="edgechromium")
 
 if __name__ == "__main__":

@@ -70,12 +70,11 @@ if os.path.exists(splash_image):
 # ==========================================
 
 a = Analysis(
-    ['launcher.py'],  # ← Changed from assistant.py to splash.py
+    ['assistant.py'],  # ← Changed from assistant.py to splash.py
     pathex=[],
     binaries=[],
     datas=data_files,
     hiddenimports=[
-        'assistant',  # ← Add this so assistant.py is included
         'webview',
         'pyautogui',
         'requests',

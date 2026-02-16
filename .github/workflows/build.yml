@@ -32,8 +32,6 @@ jobs:
       - name: Verify file structure
         run: |
           echo "Checking for required files..."
-          if (Test-Path "launcher.py") { echo "✓ launcher.py found" } else { echo "✗ launcher.py missing"; exit 1 }
-          if (Test-Path "splash.py") { echo "✓ splash.py found" } else { echo "✗ splash.py missing"; exit 1 }
           if (Test-Path "assistant.py") { echo "✓ assistant.py found" } else { echo "✗ assistant.py missing"; exit 1 }
           if (Test-Path "splash.png") { echo "✓ splash.png found" } else { echo "✗ splash.png missing"; exit 1 }
           if (Test-Path "MistAI.spec") { echo "✓ MistAI.spec found" } else { echo "✗ MistAI.spec missing"; exit 1 }
@@ -93,10 +91,9 @@ jobs:
         run: |
           echo "Checking for required files..."
           ls -la
-          test -f launcher.py && echo "✓ launcher.py found" || (echo "✗ launcher.py missing" && exit 1)
-          test -f splash.py && echo "✓ splash.py found" || (echo "✗ splash.py missing" && exit 1)
           test -f assistant.py && echo "✓ assistant.py found" || (echo "✗ assistant.py missing" && exit 1)
           test -f splash.png && echo "✓ splash.png found" || (echo "✗ splash.png missing" && exit 1)
+          test -f MistAI.spec && echo "✓ MistAI.spec found" || (echo "✗ MistAI.spec missing" && exit 1)
 
       - name: Build with PyInstaller
         run: |
@@ -151,10 +148,9 @@ jobs:
         run: |
           echo "Checking for required files..."
           ls -la
-          test -f launcher.py && echo "✓ launcher.py found" || (echo "✗ launcher.py missing" && exit 1)
-          test -f splash.py && echo "✓ splash.py found" || (echo "✗ splash.py missing" && exit 1)
           test -f assistant.py && echo "✓ assistant.py found" || (echo "✗ assistant.py missing" && exit 1)
           test -f splash.png && echo "✓ splash.png found" || (echo "✗ splash.png missing" && exit 1)
+          test -f MistAI.spec && echo "✓ MistAI.spec found" || (echo "✗ MistAI.spec missing" && exit 1)
 
       - name: Build with PyInstaller
         run: |
@@ -211,7 +207,7 @@ jobs:
             **Windows:**
             1. Download `MistAI-Windows-x64.zip`
             2. Extract and run `MistAI.exe`
-            3. Splash screen will appear, then the assistant launches
+            3. Enjoy the splash screen animation! 🎨
             
             **macOS:**
             1. Download `MistAI-macOS.zip`
@@ -225,10 +221,10 @@ jobs:
             4. Install Tesseract: `sudo apt install tesseract-ocr` (for OCR)
             
             ### What's New
-            - ✨ Professional splash screen with fade-in animation
-            - 🌍 Multi-platform support (Windows, macOS, Linux)
+            - ✨ Built-in splash screen with smooth fade animation
+            - 🎯 Simplified single-file architecture
             - 🔧 Improved stability and error handling
-            - 🎯 Smart launcher with display detection
+            - 🌍 Multi-platform support (Windows, macOS, Linux)
             
             ### Features
             - 🎤 Wake word detection ("Hey Mist")
