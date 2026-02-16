@@ -24,7 +24,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install pywebview pyautogui requests SpeechRecognition pyttsx3 psutil pytesseract Pillow opencv-python numpy pywin32
-          # Skip pyaudio on CI - it's optional for voice input
 
       - name: Build with PyInstaller
         run: |
@@ -68,10 +67,14 @@ jobs:
         run: |
           pyinstaller MistAI.spec --clean
 
+      - name: List dist contents
+        run: |
+          ls -la dist/
+
       - name: Create ZIP
         run: |
           cd dist
-          zip -r MistAI-macOS.zip MistAI.app
+          zip MistAI-macOS.zip MistAI
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -105,6 +108,10 @@ jobs:
       - name: Build with PyInstaller
         run: |
           pyinstaller MistAI.spec --clean
+
+      - name: List dist contents
+        run: |
+          ls -la dist/
 
       - name: Create tarball
         run: |
@@ -149,7 +156,7 @@ jobs:
             
             **macOS:**
             1. Download `MistAI-macOS.zip`
-            2. Extract and run `MistAI.app`
+            2. Extract and run `./MistAI`
             3. Install Tesseract: `brew install tesseract` (for OCR)
             
             **Linux:**
