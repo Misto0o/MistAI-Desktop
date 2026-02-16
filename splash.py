@@ -55,11 +55,9 @@ def fade_in(alpha=0):
 
 def close_splash():
     root.destroy()
-    # Import and start assistant AFTER splash is destroyed
     from assistant import main
     main()
 
 root.attributes("-alpha", 0)
 fade_in()
-
 root.mainloop()
