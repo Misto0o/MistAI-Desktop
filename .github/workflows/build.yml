@@ -27,7 +27,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          pip install pywebview pyautogui requests SpeechRecognition pyttsx3 psutil pytesseract Pillow opencv-python numpy pywin32
+          
+          # Install PyAudio FIRST with pipwin (includes DLLs)
+          pip install pipwin
+          pipwin install pyaudio
+          
+          # Then install SpeechRecognition
+          pip install SpeechRecognition
+          
+          # Then everything else
+          pip install pywebview pyautogui requests pyttsx3 psutil pytesseract Pillow opencv-python numpy pywin32
+        shell: pwsh
+
+      - name: Verify PyAudio installation
+        run: |
+          python -c "import pyaudio; print('✓ PyAudio installed:', pyaudio.__version__)"
+          python -c "import speech_recognition as sr; r = sr.Recognizer(); print('✓ SpeechRecognition can use PyAudio')"
+        shell: pwsh
 
       - name: Verify file structure
         run: |
@@ -85,7 +101,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow opencv-python numpy
+          
+          # Install PyAudio first (needs portaudio)
+          pip install pyaudio
+          python -c "import pyaudio; print('✓ PyAudio installed')"
+          
+          # Then SpeechRecognition
+          pip install SpeechRecognition
+          
+          # Then everything else
+          pip install pywebview pyautogui requests pyttsx3 psutil pytesseract Pillow opencv-python numpy
 
       - name: Verify file structure
         run: |
@@ -142,7 +167,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
-          pip install pywebview pyautogui requests SpeechRecognition pyttsx3 pyaudio psutil pytesseract Pillow opencv-python numpy
+          
+          # Install PyAudio (uses system portaudio)
+          pip install pyaudio
+          python -c "import pyaudio; print('✓ PyAudio installed')"
+          
+          # Then SpeechRecognition
+          pip install SpeechRecognition
+          
+          # Then everything else
+          pip install pywebview pyautogui requests pyttsx3 psutil pytesseract Pillow opencv-python numpy
 
       - name: Verify file structure
         run: |
@@ -207,7 +241,7 @@ jobs:
             **Windows:**
             1. Download `MistAI-Windows-x64.zip`
             2. Extract and run `MistAI.exe`
-            3. Enjoy the splash screen animation! 🎨
+            3. Enjoy the splash screen! 🎨
             
             **macOS:**
             1. Download `MistAI-macOS.zip`
@@ -222,13 +256,8 @@ jobs:
             
             ### What's New
             - ✨ Built-in splash screen with smooth fade animation
-            - 🎯 Simplified single-file architecture
-            - 🔧 Fixed PyAudio bundling for wake word detection
-            - 🌍 Multi-platform support (Windows, macOS, Linux)
-            
-            ### Features
             - 🎤 Wake word detection ("Hey Mist")
-            - 👁️ Screen vision with OCR (Windows bundled, others need Tesseract)
+            - 👁️ Screen vision with OCR
             - 📺 Live caption overlay
             - 💡 Proactive suggestions
             - 🧠 Context memory
