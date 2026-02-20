@@ -175,7 +175,7 @@ if OCR_AVAILABLE:
 # Configuration - PRODUCTION URLS
 API_URL = "https://mist-ai.fly.dev/api/chat"
 STATUS_URL = "https://mist-ai.fly.dev/api/status"
-MODEL = "gemini"
+MODEL = "mistral"
 DEBUG_MODE = False  # Set to False for production
 
 # Wake words with phonetic alternatives
@@ -2078,9 +2078,9 @@ HTML_CONTENT = """
                     <option value="female">Female (Ma'am)</option>
                 </select>
                 <select class="model-select" id="model-select">
-                    <option value="gemini" selected>Gemini</option>
+                    <option value="gemini">Gemini</option>
                     <option value="cohere">Cohere</option>
-                    <option value="mistral">Mistral</option>
+                    <option value="mistral" selected>Mistral</option>
                 </select>
             </div>
         </div>
