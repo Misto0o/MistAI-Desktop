@@ -7,13 +7,16 @@ on:
   workflow_dispatch:
 
 permissions:
-    contents: write
-    packages: write
+  contents: write
 
 jobs:
   build-windows:
+    # MistAI V2 deliberately uses Windows UI Automation, Win32 window APIs,
+    # and the Windows registry. README documents Windows as the supported
+    # release platform; publishing macOS/Linux artifacts from this code would
+    # be misleading and the old jobs could not build a usable application.
     runs-on: windows-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,66 +24,51 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install runtime and test dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
-          
-          # Try pipwin first (includes pre-built PyAudio with DLLs)
-          pip install pipwin
+          python -m pip install pipwin
           pipwin install pyaudio
-          
-          # Fallback: try direct pip install if pipwin fails
           if (-not (python -c "import pyaudio" 2>$null)) {
-            Write-Host "pipwin failed, trying direct pip install..."
-            pip install pyaudio
+            python -m pip install pyaudio
           }
-          
-          # Install SpeechRecognition
-          pip install SpeechRecognition
-          
-          # Install everything else
-          pip install pywebview pyautogui requests pyttsx3 psutil pytesseract Pillow opencv-python numpy pywin32
-        shell: pwsh
+          python -m pip install -r requirements.txt pyinstaller pytest
 
-      - name: Verify PyAudio installation
-        run: |
-          python -c "import pyaudio; print('PyAudio version:', pyaudio.__version__)"
-          python -c "import speech_recognition as sr; r = sr.Recognizer(); print('SpeechRecognition works with PyAudio')"
+      - name: Install bundled Playwright Firefox
         shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = "0"
+          python -m playwright install firefox
 
-      - name: Verify file structure
-        run: |
-          Write-Host "Checking for required files..."
-          if (Test-Path "assistant.py") { Write-Host "OK: assistant.py found" } else { Write-Host "ERROR: assistant.py missing"; exit 1 }
-          if (Test-Path "splash.png") { Write-Host "OK: splash.png found" } else { Write-Host "ERROR: splash.png missing"; exit 1 }
-          if (Test-Path "MistAI.spec") { Write-Host "OK: MistAI.spec found" } else { Write-Host "ERROR: MistAI.spec missing"; exit 1 }
+      - name: Verify release inputs
         shell: pwsh
+        run: |
+          $required = @("assistant.py", "core/api.py", "core/agent.py", "ui/html.py", "splash.png", "MistAI.spec")
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Required release input missing: $path" }
+          }
+          git ls-files --error-unmatch core/api.py core/agent.py ui/html.py | Out-Null
+          python -m compileall -q core ui assistant.py
+          python -c "import core.agent, core.api, core.executor, core.planner; print('V2 imports: OK')"
+
+      - name: Run focused tests
+        shell: pwsh
+        run: python -m pytest -q
 
       - name: Build with PyInstaller
-        run: |
-          python -m PyInstaller MistAI.spec --clean
         shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = "0"
+          python -m PyInstaller MistAI.spec --clean --noconfirm
 
-      - name: Verify build output
-        run: |
-          if (Test-Path "dist/MistAI.exe") {
-            Write-Host "SUCCESS: MistAI.exe built successfully"
-            $size = [math]::Round((Get-Item dist/MistAI.exe).length / 1MB, 2)
-            Write-Host "File size: $size MB"
-          } else {
-            Write-Host "ERROR: Build failed - MistAI.exe not found"
-            exit 1
-          }
+      - name: Package artifact
         shell: pwsh
-
-      - name: Create ZIP
         run: |
-          cd dist
-          Compress-Archive -Path MistAI.exe -DestinationPath MistAI-Windows-x64.zip
-        shell: pwsh
+          if (-not (Test-Path "dist/MistAI.exe")) { throw "Build failed: dist/MistAI.exe not found" }
+          Compress-Archive -Path dist/MistAI.exe -DestinationPath dist/MistAI-Windows-x64.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,185 +76,25 @@ jobs:
           name: MistAI-Windows
           path: dist/MistAI-Windows-x64.zip
 
-  build-macos:
-    runs-on: macos-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install system dependencies
-        run: |
-          brew install portaudio tesseract
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          
-          # Install PyAudio (needs portaudio from brew)
-          pip install pyaudio
-          python -c "import pyaudio; print('PyAudio installed')"
-          
-          # Install SpeechRecognition
-          pip install SpeechRecognition
-          
-          # Install everything else
-          pip install pywebview pyautogui requests pyttsx3 psutil pytesseract Pillow opencv-python numpy
-
-      - name: Verify file structure
-        run: |
-          echo "Checking for required files..."
-          test -f assistant.py && echo "OK: assistant.py found" || (echo "ERROR: assistant.py missing" && exit 1)
-          test -f splash.png && echo "OK: splash.png found" || (echo "ERROR: splash.png missing" && exit 1)
-          test -f MistAI.spec && echo "OK: MistAI.spec found" || (echo "ERROR: MistAI.spec missing" && exit 1)
-
-      - name: Build with PyInstaller
-        run: |
-          pyinstaller MistAI.spec --clean
-
-      - name: List dist contents
-        run: |
-          ls -la dist/
-          if [ -f "dist/MistAI" ]; then
-            echo "SUCCESS: MistAI built successfully"
-            ls -lh dist/MistAI
-          else
-            echo "ERROR: Build failed - MistAI not found"
-            exit 1
-          fi
-
-      - name: Create ZIP
-        run: |
-          cd dist
-          zip MistAI-macOS.zip MistAI
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MistAI-macOS
-          path: dist/MistAI-macOS.zip
-
-  build-linux:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk portaudio19-dev tesseract-ocr libtesseract-dev
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          
-          # Install PyAudio (uses system portaudio)
-          pip install pyaudio
-          python -c "import pyaudio; print('PyAudio installed')"
-          
-          # Install SpeechRecognition
-          pip install SpeechRecognition
-          
-          # Install everything else
-          pip install pywebview pyautogui requests pyttsx3 psutil pytesseract Pillow opencv-python numpy
-
-      - name: Verify file structure
-        run: |
-          echo "Checking for required files..."
-          test -f assistant.py && echo "OK: assistant.py found" || (echo "ERROR: assistant.py missing" && exit 1)
-          test -f splash.png && echo "OK: splash.png found" || (echo "ERROR: splash.png missing" && exit 1)
-          test -f MistAI.spec && echo "OK: MistAI.spec found" || (echo "ERROR: MistAI.spec missing" && exit 1)
-
-      - name: Build with PyInstaller
-        run: |
-          pyinstaller MistAI.spec --clean
-
-      - name: List dist contents
-        run: |
-          ls -la dist/
-          if [ -f "dist/MistAI" ]; then
-            echo "SUCCESS: MistAI built successfully"
-            ls -lh dist/MistAI
-          else
-            echo "ERROR: Build failed - MistAI not found"
-            exit 1
-          fi
-
-      - name: Create tarball
-        run: |
-          cd dist
-          tar -czf MistAI-Linux.tar.gz MistAI
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MistAI-Linux
-          path: dist/MistAI-Linux.tar.gz
-
   release:
-    needs: [build-windows, build-macos, build-linux]
+    needs: build-windows
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    
+
     steps:
-      - name: Download all artifacts
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
+          name: MistAI-Windows
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/MistAI-Windows/MistAI-Windows-x64.zip
-            artifacts/MistAI-macOS/MistAI-macOS.zip
-            artifacts/MistAI-Linux/MistAI-Linux.tar.gz
-          draft: false
-          prerelease: false
+          files: artifacts/MistAI-Windows-x64.zip
           generate_release_notes: true
           body: |
-            ## MistAI Desktop Assistant v${{ github.ref_name }}
-            
-            ### Installation
-            
-            **Windows:**
-            1. Download `MistAI-Windows-x64.zip`
-            2. Extract and run `MistAI.exe`
-            3. Enjoy the splash screen!
-            
-            **macOS:**
-            1. Download `MistAI-macOS.zip`
-            2. Extract and run `./MistAI`
-            3. Install Tesseract: `brew install tesseract` (for OCR)
-            
-            **Linux:**
-            1. Download `MistAI-Linux.tar.gz`
-            2. Extract: `tar -xzf MistAI-Linux.tar.gz`
-            3. Run: `./MistAI`
-            4. Install Tesseract: `sudo apt install tesseract-ocr` (for OCR)
-            
-            ### Features
-            - Wake word detection ("Hey Mist")
-            - Screen vision with OCR
-            - Live caption overlay
-            - Proactive suggestions
-            - Context memory
-            - Splash screen animation
-            
-            **Requirements:** Microphone • Internet connection
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ## MistAI Desktop ${{ github.ref_name }}
+
+            Windows 10/11 (64-bit) release. Extract `MistAI-Windows-x64.zip`
+            and run `MistAI.exe`.
