@@ -1,8 +1,41 @@
-*.manifest
+# Secrets
+.env
+.env.*
+
+# Local data (memory db, logs, debug output, browser profiles)
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+ocr_debug/
+browser_profile*/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.benchmarks/
+venv/
+.venv/
+env/
+
+# Build output (PyInstaller)
 build/
 dist/
+*.manifest
 
-# MistAI Specific
-# Keep your cleaned Tesseract-OCR folder if it's custom
-# MistAI_OCREngine/ 
-# Uncomment above if you want to ignore it
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# Claude Code (local only; CLAUDE.md and shared .claude/ settings stay tracked)
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Moved out of the repo
+handtracking/
+node_modules/
