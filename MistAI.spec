@@ -2,6 +2,7 @@
 import os
 import site
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
@@ -34,14 +35,22 @@ if os.path.exists(splash_image):
     data_files.append((splash_image, '.'))
     print(f"Found splash.png")
 
+# BrowserSession uses Playwright's bundled driver and Firefox binary at
+# runtime. With PLAYWRIGHT_BROWSERS_PATH=0 in CI, collect_all includes the
+# package-local browser payload instead of producing an EXE that launches but
+# cannot perform any browser action on a clean machine.
+playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all(
+    "playwright"
+)
+
 # ==========================================
 # PYINSTALLER ANALYSIS
 # ==========================================
 a = Analysis(
     ['assistant.py'],
     pathex=[],
-    binaries=[],
-    datas=data_files,
+    binaries=playwright_binaries,
+    datas=data_files + playwright_datas,
     hiddenimports=[
         'webview',
         'pyautogui',
@@ -70,7 +79,10 @@ a = Analysis(
         'datetime',
         'json',
         'difflib',
-    ],
+        'pycaw.pycaw',
+        'comtypes',
+        'browser_cookie3',
+    ] + playwright_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

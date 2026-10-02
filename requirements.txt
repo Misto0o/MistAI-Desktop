@@ -1,12 +1,48 @@
-pywebview>=4.0
-pyautogui>=0.9.54
-requests>=2.31.0
-SpeechRecognition>=3.10.0
-pyttsx3>=2.90
-pyaudio>=0.2.13
-psutil>=5.9.0
-pytesseract>=0.3.10
-Pillow>=10.0.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-pywin32>=305; sys_platform == 'win32'
+# MistAI requirements
+# Core (required)
+pywebview
+pyautogui
+requests
+psutil
+SpeechRecognition
+pyaudio          # needed by SpeechRecognition for microphone input
+
+# TTS
+edge-tts
+sounddevice
+soundfile
+pyttsx3           # fallback if edge-tts unavailable
+
+# Vision / LLM
+cohere
+
+# OCR / screen understanding
+opencv-python
+numpy
+Pillow
+pytesseract
+
+# Windows automation (Windows only)
+pywinauto
+pygetwindow
+pywin32
+keyboard
+
+# ── Enhanced utilities (optional — each guarded individually in
+#    core/enhanced_utils.py, so the app still runs without them) ──
+pynput
+mouse
+selenium
+playwright
+browser-cookie3
+APScheduler
+schedule
+watchdog
+pystray
+mss
+screen-brightness-control
+beautifulsoup4
+toml
+uiautomation       # Windows only
+pycaw
+websockets
