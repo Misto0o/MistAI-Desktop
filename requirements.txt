@@ -4,6 +4,7 @@ pywebview
 pyautogui
 requests
 psutil
+python-dotenv     # loads MISTAI_API_KEY / COHERE_API_KEY from .env
 SpeechRecognition
 pyaudio          # needed by SpeechRecognition for microphone input
 
