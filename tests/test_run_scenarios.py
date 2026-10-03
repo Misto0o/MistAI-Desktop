@@ -142,7 +142,7 @@ class _FakeApi:
         return {"busy": False}
 
 
-def test_compare_mode_runs_each_desktop_scenario_in_all_four_modes(tmp_path, capsys):
+def test_compare_mode_runs_each_desktop_scenario_in_every_compare_mode(tmp_path, capsys):
     scen = tmp_path / "s.json"
     scen.write_text(json.dumps({"scenarios": [
         {"name": "q", "prompt": "Is X open?", "expect": {"success": True}},
@@ -162,23 +162,27 @@ def test_compare_mode_runs_each_desktop_scenario_in_all_four_modes(tmp_path, cap
     )
     out = capsys.readouterr().out
     assert code == 0, out
-    modes = [("0", "0"), ("1", "0"), ("1", "1"), ("1", "2")]
+    # gating+lazy1 is not in the default --compare set (its UIA walk timed out
+    # in nearly every real run); it stays reachable through --mode.
+    assert rs.COMPARE_MODES == ("baseline", "gating", "gating+lazy2")
+    modes = [("0", "0"), ("1", "0"), ("1", "2")]
     assert [e for _, e in fake.calls] == modes * 2
-    assert fake.resets == 8  # workspace reset before every desktop run
+    assert fake.resets == 6  # workspace reset before every desktop run
     row = next(l for l in out.splitlines() if l.startswith("q "))
     cells = row.split("|")
-    assert "reads=3" in cells[1] and "reads=2" in cells[2] and "reads=1" in cells[3]
-    assert "reads=0" in cells[4]
+    assert "reads=3" in cells[1] and "reads=2" in cells[2] and "reads=0" in cells[3]
     assert all("esc=1" in c for c in cells[1:])
     assert "typing" in out and "SKIP" in out
+    assert "Timing over repeated runs" not in out  # only with --repeat
     (log_dir,) = list((tmp_path / "logs").iterdir())
-    assert (log_dir / "q--gating-lazy1.log").exists()
+    assert not (log_dir / "q--gating-lazy1.log").exists()
     assert (log_dir / "q--gating-lazy2.log").exists()
     summary = json.loads((log_dir / "summary.json").read_text())
     assert {(r["name"], r["mode"], r["status"]) for r in summary} >= {
-        ("q", "baseline", "PASS"), ("q", "gating", "PASS"), ("q", "gating+lazy1", "PASS"), ("q", "gating+lazy2", "PASS"),
+        ("q", "baseline", "PASS"), ("q", "gating", "PASS"), ("q", "gating+lazy2", "PASS"),
         ("del", "gating", "PASS"), ("plan", None, "PASS"),
     }
+    assert not any(r["mode"] == "gating+lazy1" for r in summary)
     assert summary[1]["escalations"] == ["switch_app -> open_app"] or any(
         r.get("escalations") == ["switch_app -> open_app"] for r in summary
     )
@@ -189,6 +193,69 @@ def test_compare_mode_runs_each_desktop_scenario_in_all_four_modes(tmp_path, cap
     assert core.agent.requests.__name__ == "requests"
     assert core.planner._llm.__name__ == "_llm"
     assert {k: os.environ.get(k) for k in rs.MODE_ENV_KEYS} == before
+
+
+def test_lazy1_still_runs_through_mode(tmp_path):
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [{"name": "q", "prompt": "Is X open?"}]}))
+    fake = _FakeApi()
+    assert rs.main(["--stub", "--mode", "gating+lazy1", "--yes", "--scenarios", str(scen),
+                    "--log-root", str(tmp_path / "logs")], api_factory=lambda: fake) == 0
+    assert [e for _, e in fake.calls] == [("1", "1")]
+
+
+def test_repeat_runs_every_mode_n_times_and_reports_timing(tmp_path, capsys):
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [
+        {"name": "q", "prompt": "Is X open?", "expect": {"success": True}},
+        {"name": "plan", "type": "plan", "prompt": "check my notifications now please",
+         "stub_plan": {"nodes": [{"id": "a", "desc": "Check notifications"}]},
+         "expect": {"nodes_count": 1}},
+    ]}))
+    fake = _FakeApi()
+    code = rs.main(
+        ["--stub", "--compare", "--repeat", "2", "--only", "q,plan", "--yes",
+         "--scenarios", str(scen), "--log-root", str(tmp_path / "logs")],
+        api_factory=lambda: fake,
+    )
+    out = capsys.readouterr().out
+    assert code == 0, out
+    # Modes interleave within each round.
+    assert [e for _, e in fake.calls] == [("0", "0"), ("1", "0"), ("1", "2")] * 2
+    (log_dir,) = list((tmp_path / "logs").iterdir())
+    for name in ("q--gating--r1.log", "q--gating--r2.log", "plan--r1.log", "plan--r2.log"):
+        assert (log_dir / name).exists(), name
+    summary = json.loads((log_dir / "summary.json").read_text())
+    assert len(summary) == 8 and all(r["repeat"] in (1, 2) for r in summary)
+    assert "Timing over repeated runs" in out
+    timing_row = next(l for l in out.splitlines() if l.startswith("q ") and "gating+lazy2" in l)
+    assert "2/2" in timing_row
+
+
+def test_timing_stats_min_median_max_and_skips():
+    records = [
+        {"name": "a", "mode": "gating", "status": "PASS", "seconds": 1.0, "repeat": 1},
+        {"name": "a", "mode": "gating", "status": "FAIL", "seconds": 5.0, "repeat": 2},
+        {"name": "a", "mode": "gating", "status": "PASS", "seconds": 3.0, "repeat": 3},
+        {"name": "a", "mode": "gating", "status": "SKIP", "failures": ["notepad restored"], "repeat": 4},
+        {"name": "b", "mode": None, "status": "SKIP", "failures": ["x"], "repeat": 1},
+    ]
+    stats = rs.timing_stats(records)
+    assert stats[("a", "gating")] == {"n": 4, "passed": 2, "skipped": 1,
+                                      "min": 1.0, "median": 3.0, "max": 5.0}
+    assert stats[("b", None)]["min"] is None and stats[("b", None)]["skipped"] == 1
+    text = "\n".join(rs.format_timing(records))
+    assert "1.0 / 3.0 / 5.0" in text
+    b_row = next(l for l in text.splitlines() if l.startswith("b "))
+    assert b_row.rstrip().endswith("-")
+
+
+def test_repeat_must_be_positive():
+    import pytest
+
+    with pytest.raises(SystemExit):
+        rs.parse_args(["--repeat", "0"])
+    assert rs.parse_args([]).repeat == 1
 
 
 def test_end_state_checks_and_unverified_window_text():

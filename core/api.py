@@ -2263,11 +2263,17 @@ class Api:
             )
             stdout = (result.stdout or "").strip()
             stderr = (result.stderr or "").strip()
-            success = result.returncode == 0
+            # PowerShell exits 1 when an error was suppressed (-ErrorAction
+            # SilentlyContinue): with no output at all that is "nothing found",
+            # not a failure. Any other code, or any output, is a real result.
+            no_results = result.returncode == 1 and not stdout and not stderr
+            success = result.returncode == 0 or no_results
             warning_text = "\n".join(part for part in (stdout, stderr) if part)
             has_warnings = bool(re.search(r"(?im)^\s*(?:warning\b|warn\b)", warning_text))
             status = (
-                "COMMAND COMPLETED SUCCESSFULLY"
+                "COMMAND RETURNED NO RESULTS"
+                if no_results
+                else "COMMAND COMPLETED SUCCESSFULLY"
                 if success and not has_warnings
                 else "COMMAND COMPLETED WITH WARNINGS"
                 if success
@@ -2282,9 +2288,14 @@ class Api:
                 "stdout": stdout,
                 "stderr": stderr,
                 "has_warnings": has_warnings,
+                "no_results": no_results,
                 "status": status,
             }
-            details = [f"{status} (exit code {result.returncode})."]
+            details = [
+                f"{status} (exit code {result.returncode}, no stdout, no stderr)."
+                if no_results
+                else f"{status} (exit code {result.returncode})."
+            ]
             withheld = secret_output_reason(param, f"{stdout}\n{stderr}")
             if withheld:
                 self.last_command_result["stdout"] = ""
@@ -2295,7 +2306,7 @@ class Api:
                     details.append(f"STDOUT: {stdout}")
                 if stderr:
                     details.append(f"STDERR: {stderr}")
-                if not stdout and not stderr:
+                if not stdout and not stderr and not no_results:
                     details.append("OUTPUT: (no output)")
             self.last_result_text = "\n".join(details)[:_RESULT_MEMORY_CHARS]
             return success

@@ -542,3 +542,47 @@ def test_command_result_handles_nonzero_timeout_and_empty_output(monkeypatch, tm
     assert Api._act_run_command(api, "quiet-command")
     assert api.last_command_result["success"]
     assert "OUTPUT: (no output)" in api.last_result_text
+
+
+def _fake_run(monkeypatch, code, stdout="", stderr=""):
+    monkeypatch.setattr(
+        "core.api.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(_args[0], code, stdout, stderr),
+    )
+
+
+def test_suppressed_error_with_no_output_is_no_results_not_failure(monkeypatch, tmp_path):
+    # Get-Process -Name msedge -ErrorAction SilentlyContinue: exit 1, nothing printed.
+    api = _api_with_workspace(tmp_path)
+    _fake_run(monkeypatch, 1)
+    assert Api._act_run_command(api, "Get-Process -Name msedge -ErrorAction SilentlyContinue")
+    result = api.last_command_result
+    assert result["no_results"] and result["success"] and result["exit_code"] == 1
+    assert "COMMAND RETURNED NO RESULTS (exit code 1, no stdout, no stderr)" in api.last_result_text
+    assert "COMMAND FAILED" not in api.last_result_text
+
+
+def test_real_errors_still_fail(monkeypatch, tmp_path):
+    api = _api_with_workspace(tmp_path)
+    for code, stdout, stderr in ((1, "", "Cannot find a process"), (1, "partial", ""),
+                                 (7, "", ""), (3, "", "")):
+        _fake_run(monkeypatch, code, stdout, stderr)
+        assert not Api._act_run_command(api, "cmd"), (code, stdout, stderr)
+        assert not api.last_command_result["no_results"]
+        assert api.last_command_result["exit_code"] == code
+        assert f"COMMAND FAILED (exit code {code})" in api.last_result_text
+
+
+def test_executor_records_no_results_as_ok(monkeypatch, tmp_path):
+    api = _api_with_workspace(tmp_path)
+    api.tools = ToolRegistry(":memory:")
+    api._exec_sync = lambda _action, param: Api._act_run_command(api, param)
+    monkeypatch.setattr("core.executor.time.sleep", lambda _seconds: None)
+    _fake_run(monkeypatch, 1)
+    res = Executor(api).run("run_command", "Get-Process -Name msedge -ErrorAction SilentlyContinue")
+    assert res.success and res.confidence > 0.2
+    assert "NO RESULTS" in res.detail
+
+    _fake_run(monkeypatch, 7)
+    res = Executor(api).run("run_command", "failing-command")
+    assert not res.success and res.confidence <= 0.2

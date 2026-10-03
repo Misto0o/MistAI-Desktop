@@ -3,15 +3,23 @@ tools/run_scenarios.py — run MistAI prompts unattended and summarize them.
 
     python tools/run_scenarios.py --stub                # scripted LLM, vision off, no backend
     python tools/run_scenarios.py --compare --yes       # real backend: each desktop scenario
-                                                        # in all four modes (below)
-Modes (--compare runs all four; --mode picks one; default = the app's own defaults):
+                                                        # in each --compare mode (below)
+Modes (--compare runs COMPARE_MODES; --mode picks any one; default = the app's own defaults):
     baseline      MISTAI_VISION_GATING=0  MISTAI_LAZY_VISION=0
     gating        MISTAI_VISION_GATING=1  MISTAI_LAZY_VISION=0
-    gating+lazy1  MISTAI_VISION_GATING=1  MISTAI_LAZY_VISION=1  (title + apps + 1.5s UIA)
+    gating+lazy1  MISTAI_VISION_GATING=1  MISTAI_LAZY_VISION=1  (title + apps + 1.5s UIA;
+                  not in --compare: the UIA walk hit its cap with VS Code in front in
+                  nearly every real run, so it added 1.5s for lazy2's information)
     gating+lazy2  MISTAI_VISION_GATING=1  MISTAI_LAZY_VISION=2  (title + apps only)
 Options:
     --scenarios PATH     scenario file (default: tools/scenarios.json)
     --only a,b           run only these scenario names
+    --repeat N           run every scenario (in every mode) N times, interleaving
+                         modes per round; the summary adds min/median/max seconds.
+                         Notepad scenarios may SKIP on later rounds: Win11 Notepad
+                         restores the tab typed in round 1. Fix it on the machine
+                         (Notepad > Settings > "When Notepad starts" > "Open a new
+                         window"), not in the harness
     --stub               scripted model replies from the scenario file; implies
                          --no-vision and blocks requests to the MistAI backend/Cohere
     --no-vision          force vision off (no screenshots leave the machine)
@@ -38,6 +46,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import sys
 import tempfile
 import threading
@@ -59,6 +68,7 @@ MODES = {
     "gating+lazy1": {"MISTAI_VISION_GATING": "1", "MISTAI_LAZY_VISION": "1"},
     "gating+lazy2": {"MISTAI_VISION_GATING": "1", "MISTAI_LAZY_VISION": "2"},
 }
+COMPARE_MODES = ("baseline", "gating", "gating+lazy2")
 MODE_ENV_KEYS = ("MISTAI_VISION_GATING", "MISTAI_LAZY_VISION")
 
 
@@ -648,12 +658,15 @@ class Runner:
             return None, box["error"], False
         return box["result"], None, False
 
-    def run_desktop(self, sc, mode):
-        name = sc["name"] + (f"--{mode.replace('+', '-')}" if mode else "")
+    def run_desktop(self, sc, mode, rep=None):
+        name = (sc["name"] + (f"--{mode.replace('+', '-')}" if mode else "")
+                + (f"--r{rep}" if rep else ""))
         tmp = make_scenario_dir()
         sc = expand(sc, tmp)
         record = {"name": sc["name"], "type": "desktop", "mode": mode, "status": "PASS",
                   "failures": [], "log": os.path.join(self.log_dir, f"{name}.log")}
+        if rep:
+            record["repeat"] = rep
         if mode:
             os.environ.update(MODES[mode])
         self._session += 1
@@ -746,15 +759,18 @@ class Runner:
         remove_scenario_dir(tmp)
         return record, stuck
 
-    def run_plan(self, sc):
+    def run_plan(self, sc, rep=None):
         from core import planner
         from core.api_manager import APIKeyManager
         from core.config import AGENT_MODEL
         from core.events import EventBus
         from core.workspace import Workspace
 
+        log_name = sc["name"] + (f"--r{rep}" if rep else "")
         record = {"name": sc["name"], "type": "plan", "mode": None, "status": "PASS",
-                  "failures": [], "log": os.path.join(self.log_dir, f"{sc['name']}.log")}
+                  "failures": [], "log": os.path.join(self.log_dir, f"{log_name}.log")}
+        if rep:
+            record["repeat"] = rep
         if self.stub:
             self.plan_reply[0] = json.dumps(sc["stub_plan"]) if sc.get("stub_plan") else ""
         plan_api = SimpleNamespace(api_manager=APIKeyManager(), workspace=Workspace(EventBus()))
@@ -792,15 +808,49 @@ def _cell(r):
             f"esc={len(r.get('escalations', []))}")
 
 
+def timing_stats(records):
+    """{(name, mode): {n, passed, skipped, min, median, max}} over repeated
+    runs. Skipped runs are counted but have no time; min/median/max are None
+    when no run of that scenario+mode produced a time."""
+    groups = {}
+    for r in records:
+        groups.setdefault((r["name"], r.get("mode")), []).append(r)
+    stats = {}
+    for key, runs in groups.items():
+        secs = [r["seconds"] for r in runs if r["status"] != "SKIP" and "seconds" in r]
+        stats[key] = {
+            "n": len(runs),
+            "passed": sum(r["status"] == "PASS" for r in runs),
+            "skipped": sum(r["status"] == "SKIP" for r in runs),
+            "min": min(secs) if secs else None,
+            "median": round(statistics.median(secs), 2) if secs else None,
+            "max": max(secs) if secs else None,
+        }
+    return stats
+
+
+def format_timing(records):
+    lines = ["Timing over repeated runs (seconds)",
+             f"{'scenario':<26} | {'mode':<13} | {'pass':<6} | {'skip':<4} | min / median / max"]
+    lines.append("-" * 80)
+    for (name, mode), s in timing_stats(records).items():
+        t = ("-" if s["min"] is None
+             else f"{s['min']:.1f} / {s['median']:.1f} / {s['max']:.1f}")
+        passed = f"{s['passed']}/{s['n']}"
+        lines.append(f"{name:<26} | {mode or '-':<13} | {passed:<6} | {s['skipped']:<4} | {t}")
+    return lines
+
+
 def format_summary(records, compare):
     lines = []
     if compare:
-        modes = list(MODES)
+        modes = list(COMPARE_MODES)
         lines.append(f"{'scenario':<26} | " + " | ".join(f"{m:<44}" for m in modes))
         lines.append("-" * (29 + 47 * len(modes)))
         by_name = {}
         for r in records:
-            by_name.setdefault(r["name"], {})[r.get("mode")] = r
+            # With --repeat, the grid shows round 1; the timing table covers all rounds.
+            by_name.setdefault(r["name"], {}).setdefault(r.get("mode"), r)
         for name, runs in by_name.items():
             if None in runs:  # run once: plan scenario, or a skipped desktop one
                 r = runs[None]
@@ -819,13 +869,16 @@ def format_summary(records, compare):
     problems = [r for r in records if r["status"] not in ("PASS", "SKIP")]
     skipped = [r for r in records if r["status"] == "SKIP"]
     for r in problems + skipped:
-        tag = f" ({r['mode']})" if r.get("mode") else ""
+        parts = [p for p in (r.get("mode"), f"run {r['repeat']}" if r.get("repeat") else "") if p]
+        tag = f" ({', '.join(parts)})" if parts else ""
         lines.append(f"  {r['status']} {r['name']}{tag}: " + "; ".join(r["failures"]))
         for reason in r.get("reasons", [])[:5]:
             lines.append(f"      reason: {reason[:200]}")
     for r in records:
         for note in r.get("notes", []):
             lines.append(f"  NOTE {r['name']} ({r.get('mode') or 'default'}): {note}")
+    if any(r.get("repeat") for r in records):
+        lines += [""] + format_timing(records)
     passed = sum(r["status"] == "PASS" for r in records)
     lines.append(f"{passed}/{len(records)} passed, {len(skipped)} skipped")
     return "\n".join(lines)
@@ -855,6 +908,7 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Run MistAI scenarios unattended.")
     ap.add_argument("--scenarios", default=DEFAULT_SCENARIOS)
     ap.add_argument("--only", default="")
+    ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--stub", action="store_true")
     ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--compare", action="store_true")
@@ -863,6 +917,8 @@ def parse_args(argv=None):
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--log-root", default=os.path.join(os.path.expanduser("~"), "MistAI", "logs"))
     args = ap.parse_args(argv)
+    if args.repeat < 1:
+        ap.error("--repeat must be at least 1")
     if args.stub:
         args.no_vision = True
     return args
@@ -915,22 +971,26 @@ def main(argv=None, api_factory=None):
         records.append({"name": sc["name"], "type": "desktop", "mode": None, "status": "SKIP",
                         "failures": ["tagged ui_input; pass --allow-ui-input to run"]})
     try:
+        if args.compare:
+            modes = COMPARE_MODES
+        elif args.mode:
+            modes = (args.mode,)
+        else:
+            modes = (None,)
         for sc in scenarios:
-            if sc["type"] == "plan":
-                records.append(runner.run_plan(sc))
-            elif sc in desktop:
-                if args.compare:
-                    modes = tuple(MODES)
-                elif args.mode:
-                    modes = (args.mode,)
-                else:
-                    modes = (None,)
-                for m in modes:
-                    record, stuck = runner.run_desktop(sc, m)
-                    records.append(record)
-                    if stuck:
-                        print("[Harness] Agent did not stop after a timeout -- aborting the run.")
-                        raise SystemExit(2)
+            # Modes interleave within each round so backend-latency drift
+            # spreads across modes instead of landing on one of them.
+            for rep in range(1, args.repeat + 1):
+                tag = rep if args.repeat > 1 else None
+                if sc["type"] == "plan":
+                    records.append(runner.run_plan(sc, tag))
+                elif sc in desktop:
+                    for m in modes:
+                        record, stuck = runner.run_desktop(sc, m, tag)
+                        records.append(record)
+                        if stuck:
+                            print("[Harness] Agent did not stop after a timeout -- aborting the run.")
+                            raise SystemExit(2)
     finally:
         check_secrets_across_logs(records, log_dir)
         with open(os.path.join(log_dir, "summary.json"), "w", encoding="utf-8") as f:

@@ -87,6 +87,10 @@ def test_agent_prompt_has_grounding_rules():
     assert "add -ErrorAction SilentlyContinue" in system
     assert "got there by another route, say so in the final speech" in system
     assert "content VISIBLE on screen" in system
+    # What a window shows is read from it, never computed and reported as read.
+    assert "must come from an observation of that window" in system
+    assert "fix the state or report what it actually shows" in system
+    assert "never present your own computation" in system
 
 
 # -- read_screen_text vision prompt -------------------------------------------
