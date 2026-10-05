@@ -375,9 +375,13 @@ class ImprovedClickHandler:
             print(f"[UIA] Nth error: {e}")
             return None
 
+    def _vision_frame(self, label):
+        get = getattr(self.screen, "frame_for_read", None)
+        return get(label) if callable(get) else self.screen.frame
+
     def _try_vision_click(self, query: str):
         try:
-            frame = self.screen.frame
+            frame = self._vision_frame("vision click")
             if frame is None:
                 print("[Vision] ScreenBuffer.frame is None -- Vision has "
                      "nothing to look at, coordinates would be pure guesses")
@@ -396,7 +400,7 @@ class ImprovedClickHandler:
 
     def _try_vision_nth(self, item_type: str, n: int):
         try:
-            frame = self.screen.frame
+            frame = self._vision_frame("vision click_nth")
             if frame is None:
                 return None
             sw, sh = pyautogui.size()

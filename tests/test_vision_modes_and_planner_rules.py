@@ -169,6 +169,7 @@ def test_apps_without_a_visible_window_are_marked_background(monkeypatch):
     tracker = live_state.LiveStateTracker.__new__(live_state.LiveStateTracker)
     tracker._state, tracker._lock = {}, threading.Lock()
     monkeypatch.setattr(live_state, "_visible_window_pids", lambda: {101, 103})
+    monkeypatch.setattr(live_state, "_uwp_frame_apps", lambda: [])
     monkeypatch.setattr(
         live_state.psutil, "process_iter",
         lambda _attrs: [
@@ -194,6 +195,7 @@ def test_unknown_window_state_marks_nothing_background(monkeypatch):
         raise OSError("no desktop")
 
     monkeypatch.setattr(live_state, "_visible_window_pids", boom)
+    monkeypatch.setattr(live_state, "_uwp_frame_apps", lambda: [])
     monkeypatch.setattr(live_state.psutil, "process_iter",
                         lambda _a: [SimpleNamespace(info={"name": "Discord.exe", "pid": 1})])
     tracker._update()

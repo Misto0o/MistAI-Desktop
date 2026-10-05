@@ -177,3 +177,112 @@ def test_no_fallback_can_resend_refused_input():
         assert SPECS[name].fallback_tools == (), name
     for name, spec in SPECS.items():
         assert not set(spec.fallback_tools) & key_senders, name
+
+
+# -- Open apps: Store/UWP frames ------------------------------------------------------
+
+
+def test_leftover_uwp_frame_counts_as_an_open_app(monkeypatch):
+    """A visible Calculator frame whose app process is gone (child detached)
+    was missing from Open apps; the frame title now puts it there."""
+    import threading
+
+    from core import live_state
+
+    _fake_desktop(monkeypatch, {
+        10: (1, "ApplicationFrameWindow", "Calculator", [1]),
+        11: (1, "ApplicationFrameWindow", "", [1]),            # untitled: ignored
+        12: (3, "MozillaWindowClass", "Calculator - Search", []),
+    })
+    monkeypatch.setattr(live_state.psutil, "process_iter",
+                        lambda _a: [SimpleNamespace(info={"name": "firefox.exe", "pid": 3})])
+    monkeypatch.setattr(live_state, "_visible_window_pids", lambda: {1, 3})
+    assert live_state._uwp_frame_apps() == ["calculator"]
+
+    tracker = live_state.LiveStateTracker.__new__(live_state.LiveStateTracker)
+    tracker._state, tracker._lock = {}, threading.Lock()
+    tracker._update()
+    assert tracker._state["open_apps"] == ["firefox", "calculator"]
+    assert tracker._state["background_apps"] == []
+
+
+def test_running_uwp_app_is_not_listed_twice(monkeypatch):
+    import threading
+
+    from core import live_state
+
+    _fake_desktop(monkeypatch, {10: (1, "ApplicationFrameWindow", "Calculator", [1, 2])})
+    monkeypatch.setattr(live_state.psutil, "process_iter",
+                        lambda _a: [SimpleNamespace(info={"name": "CalculatorApp.exe", "pid": 2})])
+    monkeypatch.setattr(live_state, "_visible_window_pids", lambda: {1, 2})
+    tracker = live_state.LiveStateTracker.__new__(live_state.LiveStateTracker)
+    tracker._state, tracker._lock = {}, threading.Lock()
+    tracker._update()
+    assert tracker._state["open_apps"] == ["calculatorapp"]
+
+
+# -- No established target: append only, never into a terminal -------------------------
+
+
+def _no_target_api(monkeypatch, fg, console_hwnd=0, target=None):
+    import ctypes
+
+    monkeypatch.setitem(PROCS, 6, "powershell.exe")
+    monkeypatch.setitem(PROCS, 7, "WindowsTerminal.exe")
+    monkeypatch.setitem(PROCS, 8, "python.exe")
+    windows = {
+        20: (4, "Notepad", "Untitled - Notepad", []),
+        30: (6, "ConsoleWindowClass", "Administrator: Windows PowerShell", []),
+        31: (7, "CASCADIA_HOSTING_WINDOW_CLASS", "PowerShell", []),
+        32: (8, "PseudoConsoleWindow", "C:\Python313\python.exe", []),
+    }
+    _fake_desktop(monkeypatch, windows, foreground=fg)
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetConsoleWindow", lambda: console_hwnd)
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(snapshot={"foreground_window": "stale"})
+    api._last_opened_app = target
+    api.switch_to_app = lambda _a: False
+    api.get_clipboard = lambda: "old"
+    api._clipboard_text_full = lambda: "old"
+    api.set_clipboard = lambda _t: True
+    api.last_result_text = ""
+    events = []
+    monkeypatch.setattr("core.api.time.sleep", lambda _s: None)
+    monkeypatch.setattr("core.api.pyautogui.hotkey", lambda *k: events.append(k))
+    monkeypatch.setattr("core.api.pyautogui.press", lambda k: events.append(k))
+    return api, events
+
+
+def test_no_target_appends_and_never_clears(monkeypatch):
+    api, events = _no_target_api(monkeypatch, 20)
+    assert Api._act_type_text(api, "hello") is True
+    assert events == [("ctrl", "v")]  # no Ctrl+A / Delete
+    assert "appended; nothing was cleared" in api.last_result_text
+
+
+@pytest.mark.parametrize("fg, console", [(30, 0), (31, 0), (32, 32)])
+@pytest.mark.parametrize("action, param", [("type_text", "Get-ChildItem"),
+                                           ("press_key", "enter"), ("hotkey", "ctrl+v")])
+def test_no_target_never_sends_input_to_a_terminal(monkeypatch, fg, console, action, param):
+    api, events = _no_target_api(monkeypatch, fg, console_hwnd=console)
+    assert Api._exec_sync(api, action, param) is False
+    assert events == []
+    assert api.last_result_text.startswith("NOT SENT:")
+    assert "is a terminal" in api.last_result_text and "run_command" in api.last_result_text
+
+
+def test_a_terminal_the_phase_opened_still_gets_input(monkeypatch):
+    api, events = _no_target_api(monkeypatch, 30, target="powershell")
+    assert Api._exec_sync(api, "type_text", "Get-Date") is True
+    assert events == [("ctrl", "a"), "delete", ("ctrl", "v")]
+
+
+def test_type_text_menu_says_it_does_not_submit():
+    from core.agent import AgentLoop
+
+    api = SimpleNamespace(workspace=SimpleNamespace(context_block=lambda: ""),
+                          _resolve_path_placeholders=lambda p: p)
+    system = AgentLoop(api, None)._build_system("none", {"open_apps": []}, "screen", "", [])
+    line = next(l for l in system.splitlines() if "- type_text " in l)
+    assert "does NOT submit" in line and "press_key('enter')" in line
+    assert "only appends" in line

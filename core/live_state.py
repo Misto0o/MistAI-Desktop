@@ -2,6 +2,7 @@
 core/live_state.py — tracks foreground window, open apps, clipboard, CPU/RAM.
 """
 
+import re
 import subprocess
 import threading
 import time
@@ -9,7 +10,13 @@ import time
 import psutil
 import pyautogui
 
-from .config import TRACKED_PROCESS_NAMES, is_self_process, normalize_process_name
+from .config import (
+    TRACKED_APPS,
+    TRACKED_PROCESS_NAMES,
+    is_self_process,
+    normalize_process_name,
+    process_matches,
+)
 
 
 def describe_open_apps(snap, limit=20):
@@ -19,6 +26,70 @@ def describe_open_apps(snap, limit=20):
     background = set(snap.get("background_apps", []))
     apps = snap.get("open_apps", [])[:limit]
     return ", ".join(f"{a} (background)" if a in background else a for a in apps)
+
+
+def window_belongs_to(hwnd, app_lower):
+    """Does this top-level window belong to the app? By owning process;
+    UWP/Store apps (Calculator, Settings) are drawn inside an
+    ApplicationFrameHost window, so there the app's process owns a CHILD
+    window -- and while the app is suspended (or gone, leaving the frame
+    behind) even that child is detached, leaving only the frame's title
+    ("Calculator") to go by."""
+    import win32gui
+    import win32process
+
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    name = psutil.Process(pid).name()
+    if is_self_process(name, pid):
+        return False
+    if process_matches(app_lower, name):
+        return True
+    if win32gui.GetClassName(hwnd) != "ApplicationFrameWindow":
+        return False
+    child_pids = set()
+
+    def _child(c, _):
+        child_pids.add(win32process.GetWindowThreadProcessId(c)[1])
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _child, None)
+    except Exception:
+        pass
+    for cpid in child_pids - {pid}:
+        try:
+            if process_matches(app_lower, psutil.Process(cpid).name()):
+                return True
+        except Exception:
+            pass
+    title = win32gui.GetWindowText(hwnd).lower()
+    return bool(app_lower) and re.search(rf"\b{re.escape(app_lower)}\b", title) is not None
+
+
+def _uwp_frame_apps():
+    """Tracked apps that have a visible Store/UWP frame window. The process
+    scan misses a frame whose app process is suspended or already gone, yet
+    the window is on screen (a leftover Calculator)."""
+    import win32gui
+
+    frames = []
+
+    def _cb(h, _):
+        if (win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h).strip()
+                and win32gui.GetClassName(h) == "ApplicationFrameWindow"):
+            frames.append(h)
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    found = []
+    for h in frames:
+        for app in TRACKED_APPS:
+            try:
+                if app not in found and window_belongs_to(h, app):
+                    found.append(app)
+            except Exception:
+                pass
+    return found
 
 
 def _visible_window_pids():
@@ -114,6 +185,13 @@ class LiveStateTracker:
                         apps.append(n)
                     if visible is None or p.info["pid"] in visible:
                         windowed.add(n)
+        except Exception:
+            pass
+        try:
+            for app in _uwp_frame_apps():
+                if not any(process_matches(app, a) for a in apps):
+                    apps.append(app)
+                windowed.update(a for a in apps if process_matches(app, a))
         except Exception:
             pass
         s["running_processes"] = procs

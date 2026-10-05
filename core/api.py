@@ -26,12 +26,15 @@ from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler
 from .config import (
     AGENT_MODEL,
+    ENTER_CONFIRM_APPS,
     STATUS_URL,
+    TRACKED_APPS,
     WAKE_WORDS,
     esc,
     fuzzy_wake,
     is_secret_file,
     is_self_process,
+    normalize_process_name,
     process_matches,
     secret_output_reason,
     strip_wake_prefix,
@@ -39,7 +42,7 @@ from .config import (
 from . import file_search
 from .events import EventBus
 from .executor import Executor
-from .live_state import LiveStateTracker
+from .live_state import LiveStateTracker, window_belongs_to
 from .memory import Memory
 from .screen import ScreenBuffer
 from .task_store import TaskStore
@@ -1305,40 +1308,9 @@ class Api:
 
     @staticmethod
     def _window_belongs_to(hwnd, app_lower):
-        """Does this top-level window belong to the app? By owning process;
-        UWP/Store apps (Calculator, Settings) are drawn inside an
-        ApplicationFrameHost window, so there the app's process owns a CHILD
-        window -- and while the app is suspended even that child is detached,
-        leaving only the frame's title ("Calculator") to go by."""
-        import win32gui
-        import win32process
-
-        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-        name = psutil.Process(pid).name()
-        if is_self_process(name, pid):
-            return False
-        if process_matches(app_lower, name):
-            return True
-        if win32gui.GetClassName(hwnd) != "ApplicationFrameWindow":
-            return False
-        child_pids = set()
-
-        def _child(c, _):
-            child_pids.add(win32process.GetWindowThreadProcessId(c)[1])
-            return True
-
-        try:
-            win32gui.EnumChildWindows(hwnd, _child, None)
-        except Exception:
-            pass
-        for cpid in child_pids - {pid}:
-            try:
-                if process_matches(app_lower, psutil.Process(cpid).name()):
-                    return True
-            except Exception:
-                pass
-        title = win32gui.GetWindowText(hwnd).lower()
-        return bool(app_lower) and re.search(rf"\b{re.escape(app_lower)}\b", title) is not None
+        """core.live_state.window_belongs_to: process identity, plus the
+        UWP frame-host case (child window, or the frame title)."""
+        return window_belongs_to(hwnd, app_lower)
 
     def _find_hwnd_by_process_name(self, app_lower):
         """Find a visible window belonging to the app (_window_belongs_to:
@@ -1850,6 +1822,11 @@ class Api:
             self.last_result_text = report
             print(f"[TypeText] {report}")
             return False
+        # Replace the field only in an app this phase opened/switched to;
+        # anywhere else, never select-all + delete someone's content.
+        replace = bool(getattr(self, "_last_opened_app", None))
+        if not replace:
+            report += " No app was opened or switched to, so the text was appended; nothing was cleared."
         prev_clipboard = None
         clipboard_staged = False
         try:
@@ -1870,10 +1847,11 @@ class Api:
             clipboard_staged = True
 
             time.sleep(0.2)
-            pyautogui.hotkey("ctrl", "a")
-            time.sleep(0.05)
-            pyautogui.press("delete")
-            time.sleep(0.2)
+            if replace:
+                pyautogui.hotkey("ctrl", "a")
+                time.sleep(0.05)
+                pyautogui.press("delete")
+                time.sleep(0.2)
             pyautogui.hotkey("ctrl", "v")
             time.sleep(0.15)
             self.last_result_text = report
@@ -2125,13 +2103,86 @@ class Api:
             return None
         return win32gui.GetWindowRect(hwnd), win32gui.GetWindowText(hwnd)
 
+    # Shells never receive input without an explicit target: a stray paste
+    # plus Enter there runs a command (seen: text landing in an Administrator
+    # PowerShell).
+    _TERMINAL_PROCESSES = frozenset(
+        {"windowsterminal", "openconsole", "conhost", "cmd", "powershell", "pwsh"}
+    )
+
+    def enter_target_is_safe(self):
+        """May press_key('enter') skip confirmation? Only for the app this
+        phase opened or switched to, while it is in front, and only when it
+        is not a browser, messaging, mail or terminal app (ENTER_CONFIRM_APPS)
+        nor MistAI itself. Anything unknown asks."""
+        from .executor import BROWSER_HINTS
+
+        target = getattr(self, "_last_opened_app", None)
+        if not target:
+            return False
+        try:
+            import win32gui
+            import win32process
+
+            hwnd = win32gui.GetForegroundWindow()
+            if not hwnd or not self._window_belongs_to(hwnd, target):
+                return False
+            if win32gui.GetClassName(hwnd) in ("ConsoleWindowClass",
+                                               "CASCADIA_HOSTING_WINDOW_CLASS"):
+                return False
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            name = psutil.Process(pid).name()
+            title = win32gui.GetWindowText(hwnd).lower()
+        except Exception:
+            return False
+        if is_self_process(name, pid):
+            return False
+        if any(process_matches(app, name) or process_matches(app, target)
+               or process_matches(target, app) for app in ENTER_CONFIRM_APPS):
+            return False
+        return not any(h in title for h in BROWSER_HINTS)
+
+    def _foreground_terminal(self):
+        """Title of the foreground window if it is a terminal/shell or
+        MistAI's own console, else None."""
+        try:
+            import ctypes
+
+            import win32gui
+            import win32process
+
+            hwnd = win32gui.GetForegroundWindow()
+            if not hwnd:
+                return None
+            title = win32gui.GetWindowText(hwnd) or "(untitled console)"
+            if hwnd == ctypes.windll.kernel32.GetConsoleWindow():
+                return title
+            if win32gui.GetClassName(hwnd) in ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"):
+                return title
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            if normalize_process_name(psutil.Process(pid).name()) in self._TERMINAL_PROCESSES:
+                return title
+        except Exception:
+            return None
+        return None
+
     def _ensure_input_target(self, what):
         """(report, on_target) for input about to be sent. When this phase
         opened/switched to an app that is not in front, try one switch back;
         if it is still not in front, on_target is False and the caller must
         send NOTHING. No known target (no open_app/switch_app this phase):
-        input goes to whatever is in front, as before."""
+        input goes to whatever is in front -- except a terminal/shell."""
         target = getattr(self, "_last_opened_app", None)
+        if not target:
+            shell = self._foreground_terminal()
+            if shell:
+                return (
+                    f"NOT SENT: the {what} was not sent because the window in front is a "
+                    f"terminal ('{shell[:60]}') and no app was opened or switched to. "
+                    "Nothing was typed; use run_command for shell work, or open_app / "
+                    "switch_app to the intended app first.",
+                    False,
+                )
         if target and not self._foreground_process_matches(target):
             self.switch_to_app(target)
             time.sleep(0.4)
@@ -2569,6 +2620,12 @@ class Api:
         except Exception:
             return False
 
+    def _vision_frame(self, label):
+        """Frame for a vision read: captured after the last UI action
+        (ScreenBuffer.frame_for_read), falling back to .frame for stand-ins."""
+        get = getattr(self.screen, "frame_for_read", None)
+        return get(label) if callable(get) else self.screen.frame
+
     def analyze_screen(self):
         snap = self.live.snapshot
         fw = snap.get("foreground_window", "Unknown")
@@ -2576,7 +2633,7 @@ class Api:
         description = None
         if self.vision.ready:
             try:
-                frame = self.screen.frame
+                frame = self._vision_frame("analyze_screen")
                 if frame:
                     description = self.vision.understand_screen(frame, use_cache=False)
             except Exception as e:
@@ -2598,36 +2655,64 @@ class Api:
     _NUMBER_RX = re.compile(r"\d+(?:[.,]\d+)*")
     _read_trace_warned = False
 
-    def _exact_ui_text(self, include_browser=False):
-        """(text, title, native) from the foreground window's accessibility
-        tree. Skipped ("") in MistAI's own window, and in browsers unless
+    def _asked_app(self, query):
+        """The app a screen read is about: one open app the query names (the
+        phase's target wins if the query names several), else the app this
+        phase opened or switched to, else None."""
+        target = getattr(self, "_last_opened_app", None)
+        try:
+            open_apps = list(self.live.snapshot.get("open_apps", []))
+        except Exception:
+            open_apps = []
+        q = str(query or "").lower()
+        named = [a for a in TRACKED_APPS
+                 if re.search(rf"\b{re.escape(a)}\b", q)
+                 and any(process_matches(a, o) for o in open_apps)]
+        if target and any(process_matches(target, a) or process_matches(a, target)
+                          for a in named):
+            return target
+        if len(named) == 1:
+            return named[0]
+        return target
+
+    def _exact_ui_text(self, query="", include_browser=False):
+        """(text, title, native, kind, asked) from a window's accessibility
+        tree. The window is the one the read is about (_asked_app) when it
+        exists, else the foreground one. kind: "exact" (the asked/foreground
+        window, in front), "background" (the asked window, NOT in front) or
+        "other" (only the foreground window, which is not the one asked
+        about). Skipped ("") in MistAI's own window, and in browsers unless
         include_browser (the page DOM is the browser_* tools' job)."""
         from .executor import BROWSER_HINTS
         from .uia_text import foreground_uia_text
 
+        asked = self._asked_app(query)
         try:
             import win32gui
             import win32process
 
-            hwnd = win32gui.GetForegroundWindow()
+            hwnd, kind = win32gui.GetForegroundWindow(), "exact"
+            if asked and not self._window_belongs_to(hwnd, asked):
+                other = self._find_hwnd_by_process_name(asked)
+                hwnd, kind = (other, "background") if other else (hwnd, "other")
             title = win32gui.GetWindowText(hwnd)
             pid = win32process.GetWindowThreadProcessId(hwnd)[1]
             if is_self_process(psutil.Process(pid).name(), pid):
-                return "", title, False
+                return "", title, False, kind, asked
         except Exception:
-            return "", "", False
+            return "", "", False, "exact", asked
         native = not any(h in title.lower() for h in BROWSER_HINTS)
         if not native and not include_browser:
-            return "", title, False
+            return "", title, False, kind, asked
         text, _ = foreground_uia_text(hwnd)
-        return text, title, native
+        return text, title, native, kind, asked
 
     def _vision_read(self, query):
         """(answer, ok): the vision model's literal reading of the screen."""
         if not self.vision.ready:
             return "Vision isn't configured, so I can't read on-screen text.", False
         try:
-            frame = self.screen.frame
+            frame = self._vision_frame("read_screen_text")
             if not frame:
                 return "No screen frame available.", False
             prompt = (
@@ -2652,14 +2737,21 @@ class Api:
         window does not contain. MISTAI_TRACE_READS=1 logs both side by side."""
         trace = os.environ.get("MISTAI_TRACE_READS") == "1"
         # UIA first: it is closer in time to the screenshot than the slow vision call.
-        exact, title, native = self._exact_ui_text(include_browser=trace)
+        exact, title, native, kind, asked = self._exact_ui_text(query, include_browser=trace)
         answer, ok = self._vision_read(query)
         result = answer
-        if native and exact:
+        if native and exact and kind == "other":
+            # Only some other window could be read: label it, never call it exact.
+            result = (f"Vision: {answer}\nUI TEXT of the foreground window '{title[:60]}', "
+                      f"not the {asked} window asked about (no {asked} window was found): "
+                      f"{exact}")
+        elif native and exact:
             if ok and NOT_VISIBLE_ON_SCREEN in answer:
                 answer = "vision could not see it; use the EXACT UI TEXT below"
-            result = (f"Vision: {answer}\nEXACT UI TEXT of '{title[:60]}' "
-                      f"(accessibility tree, exact): {exact}")
+            where = ("accessibility tree, exact" if kind == "exact" else
+                     "accessibility tree, exact; this window is NOT in front, so the "
+                     "screenshot shows a different window")
+            result = f"Vision: {answer}\nEXACT UI TEXT of '{title[:60]}' ({where}): {exact}"
             if ok:
                 have = {n.replace(",", "") for n in self._NUMBER_RX.findall(exact)}
                 missing = [n for n in dict.fromkeys(self._NUMBER_RX.findall(answer))

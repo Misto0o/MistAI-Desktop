@@ -84,6 +84,9 @@ def test_agent_prompt_has_grounding_rules():
     assert "not merely because an action returned ok" in system
     assert "never from read_screen_text or" in system and "analyze_screen" in system
     assert "confirm absence with Get-Process" in system
+    # A screen description of an app that Open apps does not list is not proof it is open.
+    assert "The Open apps list outranks the screen description for which apps" in system
+    assert "if an app isn't listed, don't assume it's open; use open_app." in system
     assert "add -ErrorAction SilentlyContinue" in system
     assert "got there by another route, say so in the final speech" in system
     assert "content VISIBLE on screen" in system
@@ -110,7 +113,7 @@ def _vision_api(reply):
     api.vision = SimpleNamespace(ready=True, _call=call)
     api.screen = SimpleNamespace(frame=object())
     api.last_result_text = ""
-    api._exact_ui_text = lambda include_browser=False: ("", "", False)
+    api._exact_ui_text = lambda query="", include_browser=False: ("", "", False, "exact", None)
     return api, prompts
 
 
@@ -140,8 +143,8 @@ def test_not_visible_on_screen_sends_the_agent_to_another_source(monkeypatch):
         [
             json.dumps({"action": "read_screen_text", "parameter": "is Edge running?"}),
             json.dumps({"action": "run_command", "parameter": "Get-Process msedge"}),
-            json.dumps({"action": "done", "speech": "Edge is not running."}),
-            # The phase read the screen, so the first done gets one check.
+            # No numbers to contradict the read and no unsubmitted typing:
+            # the first done finishes without the done-time check.
             json.dumps({"action": "done", "speech": "Edge is not running."}),
         ]
     )
@@ -194,8 +197,7 @@ def test_not_visible_on_screen_sends_the_agent_to_another_source(monkeypatch):
     assert "NOT VISIBLE ON SCREEN" in obs_after_screen
     assert "Get it from another source" in obs_after_screen
     assert "do not call done" in obs_after_screen
-    done_check = sent[3][-2]["content"]
-    assert 'The last screen read returned: "NOT VISIBLE ON SCREEN"' in done_check
+    assert len(sent) == 3
 
 
 def test_open_apps_are_printed_once_per_phase(monkeypatch, capsys):

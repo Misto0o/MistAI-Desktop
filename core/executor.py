@@ -129,6 +129,12 @@ class Executor:
         # Settle from tool metadata (replaces AgentLoop._smart_settle) --
         # the UI must catch up BEFORE verification looks at ground truth.
         time.sleep(reg.settle(action))
+        # Anything but a read may have changed the screen: later vision reads
+        # must use a frame captured after this point.
+        if not set(spec.categories) & {"perception", "info"}:
+            mark = getattr(getattr(api, "screen", None), "mark_action", None)
+            if callable(mark):
+                mark()
 
         verified, vnote = (None, "")
         if spec.verifier:

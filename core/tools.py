@@ -571,9 +571,11 @@ class ToolRegistry:
     def fallbacks(self, name):
         return self.get(name).fallback_tools
 
-    def is_destructive(self, action, parameter="", resolve_path=None):
+    def is_destructive(self, action, parameter="", resolve_path=None, enter_safe=False):
         """Single source of truth for the confirmation gate. Mirrors (and
-        can replace) AgentLoop._is_destructive."""
+        can replace) AgentLoop._is_destructive. enter_safe: press_key Enter
+        goes to an app this phase opened, in front, outside the
+        browser/messaging/mail/terminal categories (Api.enter_target_is_safe)."""
         if action == "run_command":
             return command_is_mutating(parameter)
         if action in ("write_file", "patch_json", "patch_file"):
@@ -594,6 +596,8 @@ class ToolRegistry:
         if action == "hotkey":
             return normalized_key in _DANGEROUS_HOTKEYS
         if action in ("press_key", "browser_press_key"):
+            if action == "press_key" and enter_safe and normalized_key in {"enter", "return"}:
+                return False
             return normalized_key in {"enter", "return", "delete"}
         if action == "click_coords":
             # Raw pixels provide no semantic label from which to distinguish
@@ -607,7 +611,7 @@ class ToolRegistry:
             return bool(_DANGEROUS_CLICK_TEXT_RX.search(text))
         return self.get(action).destructive
 
-    def requires_confirmation(self, action, parameter="", resolve_path=None):
+    def requires_confirmation(self, action, parameter="", resolve_path=None, enter_safe=False):
         """Whether AgentLoop must ask before running this action.
 
         Most confirmation-worthy operations are destructive dynamically (for
@@ -617,7 +621,7 @@ class ToolRegistry:
         """
         spec = self.get(action)
         return spec.requires_confirmation or self.is_destructive(
-            action, parameter, resolve_path=resolve_path
+            action, parameter, resolve_path=resolve_path, enter_safe=enter_safe
         )
 
     # -- Learned reliability (design doc #7: statistics, not ML) -------------

@@ -43,7 +43,7 @@ class _Tools:
         "browser_search": object(),
     }
 
-    def requires_confirmation(self, action, parameter="", resolve_path=None):
+    def requires_confirmation(self, action, parameter="", resolve_path=None, enter_safe=False):
         return action in {"quick_message", "window_close"}
 
     def get(self, action):

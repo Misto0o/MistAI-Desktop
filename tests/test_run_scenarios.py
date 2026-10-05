@@ -434,3 +434,65 @@ def test_uia_after_read_must_name_a_process(tmp_path):
     bad.write_text(json.dumps([{"name": "a", "prompt": "x", "uia_after_read": ["calculator"]}]))
     with pytest.raises(ValueError, match="uia_after_read"):
         rs.load_scenarios(str(bad))
+
+
+# -- Leftover windows and elevation ---------------------------------------------------
+
+
+def _app_scenario(tmp_path):
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [
+        {"name": "calc", "prompt": "Open Calculator", "cleanup": {"close_new_processes": ["calculator"]}},
+    ]}))
+    return scen
+
+
+def test_scenario_skips_when_an_app_window_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(rs, "app_window_handles",
+                        lambda n: [(10, "Calculator")] if n == "calculator" else [])
+    closed = []
+    monkeypatch.setattr(rs, "close_windows", closed.extend)
+    fake = _FakeApi()
+    assert rs.main(["--stub", "--yes", "--scenarios", str(_app_scenario(tmp_path)),
+                    "--log-root", str(tmp_path / "logs")], api_factory=lambda: fake) == 0
+    (log_dir,) = list((tmp_path / "logs").iterdir())
+    (rec,) = json.loads((log_dir / "summary.json").read_text())
+    assert rec["status"] == "SKIP"
+    assert "a calculator window is already open ('Calculator')" in rec["failures"][0]
+    assert fake.calls == [] and closed == []  # never ran, never touched the window
+
+
+def test_lingering_window_is_closed_after_cleanup(tmp_path, monkeypatch, capsys):
+    # No window before; after the run the frame lingers once, then is gone.
+    states = iter([[], [(10, "Calculator")], [(10, "Calculator")], [(10, "Calculator")], []])
+    monkeypatch.setattr(rs, "app_window_handles", lambda n: next(states, []))
+    real_wait = rs.wait_pumping
+    # Real wait for the scenario turn; one look for the short cleanup waits.
+    monkeypatch.setattr(rs, "wait_pumping",
+                        lambda done, timeout: real_wait(done, timeout) if timeout > 10 else done())
+    closed = []
+    monkeypatch.setattr(rs, "close_windows", closed.extend)
+    fake = _FakeApi()
+    assert rs.main(["--stub", "--yes", "--mode", "gating", "--scenarios",
+                    str(_app_scenario(tmp_path)), "--log-root", str(tmp_path / "logs")],
+                   api_factory=lambda: fake) == 0
+    assert closed == [10]
+    out = capsys.readouterr().out
+    assert "calculator window(s) still open after cleanup: ['Calculator']; closing them" in out
+    assert "WARNING: window(s) still open" not in out
+
+
+def test_window_that_will_not_close_is_reported(monkeypatch):
+    monkeypatch.setattr(rs, "app_window_handles", lambda n: [(10, "Calculator")])
+    monkeypatch.setattr(rs, "wait_pumping", lambda done, timeout: done())
+    monkeypatch.setattr(rs, "close_windows", lambda hs: None)
+    assert rs.ensure_windows_gone(["calculator"]) == ["Calculator"]
+
+
+def test_elevated_runs_are_warned_about(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rs, "running_elevated", lambda: True)
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [{"name": "q", "prompt": "x"}]}))
+    rs.main(["--stub", "--yes", "--scenarios", str(scen), "--log-root", str(tmp_path / "logs")],
+            api_factory=lambda: _FakeApi())
+    assert "WARNING: running elevated (Administrator)" in capsys.readouterr().out

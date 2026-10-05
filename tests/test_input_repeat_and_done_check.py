@@ -27,7 +27,9 @@ def _run(monkeypatch, replies, results=None, foreground=None):
     def run(action, param):
         calls.append((action, param))
         r = results.get(action, _result(action))
-        return r(param) if callable(r) else r
+        r = r(param) if callable(r) else r
+        r.parameter = r.parameter or param  # the real Executor reports what it ran
+        return r
 
     api = SimpleNamespace(
         task_memory=SimpleNamespace(get_hints_for_task=lambda _t: []),
@@ -139,8 +141,9 @@ def test_plain_phase_finishes_on_the_first_done(monkeypatch):
     assert not any("Before finishing" in o for o in obs)
 
 
-def test_screen_read_gets_one_check_quoting_the_read(monkeypatch):
-    read = "Vision: 851\nEXACT UI TEXT of 'Calculator' (accessibility tree, exact): Display is 23"
+def test_screen_read_gets_one_check_when_the_speech_states_unseen_numbers(monkeypatch):
+    read = ("Vision: 851\nEXACT UI TEXT of 'Calculator' (accessibility tree, exact): "
+            "Display is 23")
     read += " | x" * 200
     out, _, _, obs, spoken = _run(monkeypatch, [
         {"action": "read_screen_text", "parameter": "what number?"},
@@ -151,19 +154,77 @@ def test_screen_read_gets_one_check_quoting_the_read(monkeypatch):
     assert check.startswith("[OBSERVATION] Before finishing")
     assert "The last screen read returned: \"Vision: 851" in check
     assert "Display is 23" in check and "[truncated," in check
+    # Vision's 851 does not count: only the EXACT UI TEXT does.
+    assert "Your draft speech states 851, which that read does not show." in check
+    assert "continue and finish it" in check and "failure report only if you cannot" in check
     assert "never a value you worked out yourself" in check
+    # The closing line always leaves an honest-failure way out.
+    assert check.endswith("Then call done again with the corrected (or unchanged) speech, "
+                          "or with an honest report of what you could not do.")
     assert out["success"] and out["speech"] == "It shows 23."
     assert spoken == ["It shows 23."]  # the first done was never spoken
+
+
+def test_speech_that_matches_the_read_costs_no_extra_call(monkeypatch):
+    read = ("Vision: 851\nEXACT UI TEXT of 'Calculator' (accessibility tree, exact): "
+            "Display is 851 | Expression is 37 × 23=")
+    out, _, _, obs, _ = _run(monkeypatch, [
+        {"action": "type_text", "parameter": "37*23"},
+        {"action": "press_key", "parameter": "enter"},
+        {"action": "read_screen_text", "parameter": "what number?"},
+        {"action": "done", "speech": "37 times 23 is 851."},
+    ], results={"read_screen_text": _result("read_screen_text", read)})
+    assert out["success"] and out["speech"] == "37 times 23 is 851."
+    assert not any("Before finishing" in o for o in obs)
+
+
+def test_unsubmitted_typing_gets_23_then_submits_and_gets_851(monkeypatch):
+    """The real failure: '37*23' typed without submitting reads back 23. The
+    speech matches the read, but the read followed unsubmitted typing, so
+    the check tells the model to finish the task; it presses Enter, reads
+    851 and finishes with that."""
+    reads = iter([
+        "Vision: 23\nEXACT UI TEXT of 'Calculator' (accessibility tree, exact): "
+        "Display is 23 | Expression is 37 ×",
+        "Vision: 851\nEXACT UI TEXT of 'Calculator' (accessibility tree, exact): "
+        "Display is 851 | Expression is 37 × 23=",
+    ])
+    out, _, calls, obs, spoken = _run(monkeypatch, [
+        {"action": "open_app", "parameter": "calculator"},
+        {"action": "type_text", "parameter": "37*23"},
+        {"action": "read_screen_text", "parameter": "what number is shown?"},
+        {"action": "done", "speech": "Calculator shows 23."},
+        {"action": "press_key", "parameter": "enter"},
+        {"action": "read_screen_text", "parameter": "what number is shown?"},
+        {"action": "done", "speech": "Calculator shows 851."},
+    ], results={"read_screen_text": lambda _p: _result("read_screen_text", next(reads))})
+    check = next(o for o in obs if "Before finishing" in o)
+    assert "never submitted (no Enter or submit key after it)" in check
+    assert "pending expression or unsubmitted input), continue and finish it" in check
+    assert [c[0] for c in calls] == ["open_app", "type_text", "read_screen_text",
+                                     "press_key", "read_screen_text"]
+    assert out["speech"] == "Calculator shows 851." and spoken == ["Calculator shows 851."]
+
+
+def test_typing_that_ends_in_a_newline_counts_as_submitted(monkeypatch):
+    read = "EXACT UI TEXT of 'Terminal' (accessibility tree, exact): 42"
+    out, _, _, obs, _ = _run(monkeypatch, [
+        {"action": "type_text", "parameter": "echo 42\n"},
+        {"action": "read_screen_text", "parameter": "output?"},
+        {"action": "done", "speech": "It printed 42."},
+    ], results={"read_screen_text": _result("read_screen_text", read)})
+    assert out["speech"] == "It printed 42."
+    assert not any("Before finishing" in o for o in obs)
 
 
 def test_the_second_done_always_finishes(monkeypatch):
     out, _, _, obs, _ = _run(monkeypatch, [
         {"action": "read_screen_text", "parameter": "q"},
-        {"action": "done", "speech": "A"},
+        {"action": "done", "speech": "It is 5."},
         {"action": "read_screen_text", "parameter": "q2"},
-        {"action": "done", "speech": "B"},
+        {"action": "done", "speech": "It is 7."},
     ], results={"read_screen_text": _result("read_screen_text", "Display is 23")})
-    assert out["speech"] == "B"
+    assert out["speech"] == "It is 7."
     assert sum("Before finishing" in o for o in obs) == 1
 
 

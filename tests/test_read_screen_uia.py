@@ -28,7 +28,10 @@ def _api(vision_reply, exact=("", "", False), ready=True):
     api.last_result_text = ""
     seen = []
 
-    def exact_ui_text(include_browser=False):
+    if len(exact) == 3:
+        exact = tuple(exact) + ("exact", None)
+
+    def exact_ui_text(query="", include_browser=False):
         seen.append(include_browser)
         return exact
 
@@ -101,6 +104,83 @@ def test_trace_logs_both_readers_capped_and_text_only(monkeypatch, capsys):
     line = [ln for ln in out.splitlines() if ln.startswith("[ReadTrace] query='what number?'")][0]
     assert "vision='851'" in line
     assert "uia='" + "x" * 300 + "'" in line and "x" * 301 not in line
+
+
+def test_asked_window_not_in_front_is_read_and_labelled(monkeypatch):
+    api, _, _ = _api("12", ("Display is 851", "Calculator", True, "background", "calculator"))
+    out = Api.read_screen_text(api, "what does Calculator show?")
+    assert ("EXACT UI TEXT of 'Calculator' (accessibility tree, exact; this window is NOT "
+            "in front, so the screenshot shows a different window): Display is 851") in out
+    assert "NOTE: the vision answer's number(s) 12" in out
+
+
+def test_only_another_window_is_labelled_not_exact(monkeypatch):
+    api, _, _ = _api("NOT VISIBLE ON SCREEN",
+                     ("PS C:\> 851", "Windows PowerShell", True, "other", "calculator"))
+    out = Api.read_screen_text(api, "what does Calculator show?")
+    assert "EXACT" not in out and "NOTE" not in out
+    assert ("UI TEXT of the foreground window 'Windows PowerShell', not the calculator "
+            "window asked about (no calculator window was found): PS C:\> 851") in out
+    assert out.startswith("Vision: NOT VISIBLE ON SCREEN")
+
+
+# -- Which window is read ----------------------------------------------------------------
+
+
+def _window_api(monkeypatch, foreground, owners, open_apps, target=None, query_hwnd=None):
+    """owners: {hwnd: app}; the asked window lookup returns query_hwnd."""
+    import sys
+
+    titles = {1: "main.py - Visual Studio Code", 2: "Calculator", 3: "Untitled - Notepad"}
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        GetForegroundWindow=lambda: foreground, GetWindowText=lambda h: titles[h]))
+    monkeypatch.setitem(sys.modules, "win32process",
+                        SimpleNamespace(GetWindowThreadProcessId=lambda h: (0, h)))
+    monkeypatch.setattr("core.api.psutil.Process",
+                        lambda pid: SimpleNamespace(name=lambda: "app.exe"))
+    walked = []
+    monkeypatch.setattr(uia_text, "foreground_uia_text",
+                        lambda hwnd=None, **k: walked.append(hwnd) or (f"text of {hwnd}", ""))
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(snapshot={"open_apps": open_apps})
+    api._last_opened_app = target
+    api._window_belongs_to = lambda h, app: owners.get(h) == app
+    api._find_hwnd_by_process_name = lambda app: next(
+        (h for h, a in owners.items() if a == app), None)
+    return api, walked
+
+
+def test_reads_the_asked_app_window_even_when_another_is_in_front(monkeypatch):
+    api, walked = _window_api(monkeypatch, 1, {1: "code", 2: "calculator"},
+                              ["code", "calculator"], target="calculator")
+    text, title, native, kind, asked = Api._exact_ui_text(api, "what number is shown?")
+    assert (walked, title, kind, asked) == ([2], "Calculator", "background", "calculator")
+
+
+def test_query_naming_an_open_app_picks_its_window(monkeypatch):
+    api, walked = _window_api(monkeypatch, 1, {1: "code", 3: "notepad"}, ["code", "notepad"])
+    assert Api._exact_ui_text(api, "what does Notepad say?")[3:] == ("background", "notepad")
+    assert walked == [3]
+
+
+def test_target_wins_when_the_query_names_several_apps(monkeypatch):
+    api, walked = _window_api(monkeypatch, 2, {1: "code", 2: "calculator"},
+                              ["code", "calculator"], target="calculator")
+    assert Api._exact_ui_text(api, "what code is shown in calculator?")[3:] == (
+        "exact", "calculator")
+    assert walked == [2]
+
+
+def test_missing_asked_window_reads_the_foreground_labelled_other(monkeypatch):
+    api, walked = _window_api(monkeypatch, 1, {1: "code"}, ["code"], target="calculator")
+    assert Api._exact_ui_text(api, "what number?")[3:] == ("other", "calculator")
+    assert walked == [1]
+
+
+def test_no_asked_app_reads_the_foreground(monkeypatch):
+    api, walked = _window_api(monkeypatch, 3, {3: "notepad"}, ["notepad"])
+    assert Api._exact_ui_text(api, "what is written here?")[3:] == ("exact", None)
+    assert walked == [3]
 
 
 # -- core/uia_text.py ---------------------------------------------------------------

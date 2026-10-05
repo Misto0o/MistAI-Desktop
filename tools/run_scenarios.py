@@ -381,6 +381,72 @@ def close_new_processes(names, before):
     return closed
 
 
+def app_window_handles(name):
+    """[(hwnd, title)] of visible, titled top-level windows that belong to
+    ``name`` -- by process, or for Store/UWP apps by their frame's title, so a
+    frame left behind after its process exited (a leftover Calculator) counts."""
+    try:
+        import win32gui
+
+        from core.live_state import window_belongs_to
+    except ImportError:
+        return []
+    found = []
+
+    def _cb(h, _):
+        try:
+            title = win32gui.GetWindowText(h)
+            if win32gui.IsWindowVisible(h) and title.strip() and window_belongs_to(h, name):
+                found.append((h, title))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return []
+    return found
+
+
+def close_windows(hwnds):
+    """Ask windows to close (WM_CLOSE), the way their own X button does."""
+    import win32con
+    import win32gui
+
+    for h in hwnds:
+        try:
+            win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+
+
+def ensure_windows_gone(names, wait=3.0):
+    """After cleanup: wait for ``names``' windows to disappear, close any
+    that linger (a UWP frame can outlive its process), and return the
+    titles still open afterwards. Only called for scenarios that started
+    with no such window, so whatever is left came from the scenario."""
+    lingering = []
+    for name in names:
+        if not wait_pumping(lambda: not app_window_handles(name), wait):
+            left = app_window_handles(name)
+            print(f"[Harness] {name} window(s) still open after cleanup: "
+                  f"{[t for _, t in left]}; closing them")
+            close_windows([h for h, _ in left])
+            if not wait_pumping(lambda: not app_window_handles(name), wait):
+                lingering += [t for _, t in app_window_handles(name)]
+    return lingering
+
+
+def running_elevated():
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def make_scenario_dir():
     return tempfile.mkdtemp(prefix=TMP_PREFIX)
 
@@ -718,7 +784,12 @@ class Runner:
         stuck = False
         undo_reads = None
         try:
-            skip = run_setup(sc.get("setup"))
+            # Scenarios that open an app need it closed: a window left over
+            # from an earlier run (by title too, for UWP frames) is not ours.
+            skip = next((f"a {n} window is already open ({t[0][1]!r}); close it first "
+                         "(the harness never closes windows it did not open)"
+                         for n in watched for t in [app_window_handles(n)] if t), None)
+            skip = skip or run_setup(sc.get("setup"))
             if skip:
                 record.update(status="SKIP", failures=[skip])
                 remove_scenario_dir(tmp)
@@ -760,6 +831,11 @@ class Runner:
                 closed = close_new_processes(cleanup.get("close_new_processes", []), before)
                 if closed:
                     print(f"[Harness] Closed processes started by {name}: {closed}")
+                if record["status"] != "SKIP":
+                    left = ensure_windows_gone(cleanup.get("close_new_processes", []))
+                    if left:
+                        print(f"[Harness] WARNING: window(s) still open after cleanup: {left}")
+                        record.setdefault("cleanup_left", left)
             except Exception as e:
                 print(f"[Harness] Cleanup of processes failed: {e}")
         log = tee.text
@@ -991,6 +1067,10 @@ def main(argv=None, api_factory=None):
     skipped_ui = [s for s in desktop if "ui_input" in s.get("tags", []) and not args.allow_ui_input]
     desktop = [s for s in desktop if s not in skipped_ui]
     print(f"[Harness] {len(scenarios)} scenario(s); logs -> {log_dir}")
+    if running_elevated():
+        print("[Harness] WARNING: running elevated (Administrator). Typed input can land in "
+              "elevated windows such as an Administrator PowerShell; run the harness from a "
+              "normal, non-elevated shell.")
     print(f"[Harness] mode: {'STUB (scripted LLM, no backend)' if args.stub else 'REAL backend'}, "
           f"vision {'off' if args.no_vision else 'on'}, compare={args.compare}")
     if desktop and not args.yes:

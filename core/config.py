@@ -153,6 +153,17 @@ TRACKED_APPS = [
     "paint",
 ]
 
+# Apps where Enter can send, post, submit or run something the user cannot
+# take back: browsers, messaging, mail, terminals. press_key('enter') there
+# always asks first, even in an app the phase opened (ToolRegistry).
+ENTER_CONFIRM_APPS = (
+    "chrome", "firefox", "edge", "msedge", "opera", "brave", "vivaldi", "iexplore", "browser",
+    "discord", "slack", "teams", "telegram", "zoom", "whatsapp", "signal", "skype",
+    "messenger", "phonelink",
+    "outlook", "thunderbird", "mail", "hxoutlook", "mailspring",
+    "windowsterminal", "terminal", "wt", "openconsole", "conhost", "cmd", "powershell", "pwsh",
+)
+
 # MistAI's own UI host (pywebview -> WebView2) and this process are never
 # "user apps"; "edge" substring-matches msedgewebview2.
 _SELF_PROCESS_NAMES = {"msedgewebview2"}

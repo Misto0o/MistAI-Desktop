@@ -208,6 +208,22 @@ class AgentLoop:
             )
         return "It already ran without error. Do not run it again -- move on or call 'done'."
 
+    def _enter_safe(self, action, param):
+        """press_key Enter/Return only: may it skip confirmation? Asks the
+        Api (target this phase opened, in front, not a risky app category)."""
+        if action != "press_key" or str(param or "").strip().lower() not in ("enter", "return"):
+            return False
+        check = getattr(self.api, "enter_target_is_safe", None)
+        try:
+            return bool(check()) if callable(check) else False
+        except Exception:
+            return False
+
+    def _vision_frame(self, label):
+        screen = self.api.screen
+        get = getattr(screen, "frame_for_read", None)
+        return get(label) if callable(get) else screen.frame
+
     def _categories(self, action):
         try:
             return set(self.api.tools.get(action).categories)
@@ -225,9 +241,25 @@ class AgentLoop:
         except Exception:
             return self._foreground_key(getattr(self.api.live, "snapshot", {}) or {})
 
-    def _done_reminder(self, route_notes, last_read):
-        """The one observation shown at the first 'done' of a phase that
-        read the screen or did not go the way it was asked."""
+    _NUMBER_RX = re.compile(r"\d+(?:[.,]\d+)*")
+
+    @classmethod
+    def _unseen_numbers(cls, speech, read):
+        """Numbers in the draft speech that the last read does not contain.
+        When the read has EXACT UI TEXT, only that part counts: it is what
+        the window contains, and vision has reported values never shown.
+        Only digits are compared (not number words or other values)."""
+        read = str(read or "")
+        if "EXACT UI TEXT of " in read:
+            read = read.split("EXACT UI TEXT of ", 1)[1].split("\nNOTE:", 1)[0]
+        have = {n.replace(",", "") for n in cls._NUMBER_RX.findall(read)}
+        return [n for n in dict.fromkeys(cls._NUMBER_RX.findall(str(speech or "")))
+                if n.replace(",", "") not in have]
+
+    def _done_reminder(self, route_notes, last_read, unseen=(), unsubmitted=False):
+        """The one observation shown at the first 'done' of a phase whose
+        draft speech states values its last read does not show, whose last
+        read followed unsubmitted typing, or whose route did not go as asked."""
         parts = ["Before finishing, check your final speech against what actually happened."]
         if route_notes:
             parts.append(
@@ -238,12 +270,23 @@ class AgentLoop:
         if last_read is not None:
             parts.append(
                 "The last screen read returned: "
-                f'"{self._clip_result(last_read, self.DONE_CHECK_READ_CHARS)}". '
-                "Your speech must state only what that read shows (where it has EXACT UI "
-                "TEXT, that is what the window contains), never a value you worked out "
-                "yourself. If it does not show the answer, say so."
+                f'"{self._clip_result(last_read, self.DONE_CHECK_READ_CHARS)}".'
             )
-        parts.append("Then call done again with the corrected (or unchanged) speech.")
+            if unseen:
+                parts.append(f"Your draft speech states {', '.join(unseen)}, which that "
+                             "read does not show.")
+            if unsubmitted:
+                parts.append("The text you typed last was never submitted (no Enter or "
+                             "submit key after it) before that read.")
+            parts.append(
+                "If the screen shows the task is not finished (for example a pending "
+                "expression or unsubmitted input), continue and finish it, then read the "
+                "result again; call done with a failure report only if you cannot finish "
+                "it. Otherwise state only what the read shows (where it has EXACT UI TEXT, "
+                "that is what the window contains), never a value you worked out yourself."
+            )
+        parts.append("Then call done again with the corrected (or unchanged) speech, or with "
+                     "an honest report of what you could not do.")
         return " ".join(parts)
 
     @staticmethod
@@ -463,9 +506,16 @@ class AgentLoop:
             self.api._last_opened_app = None
         except Exception:
             pass
+        # The first vision read of a phase must not reuse a frame from before
+        # it (e.g. the previous task's last screen).
+        mark = getattr(getattr(self.api, "screen", None), "mark_action", None)
+        if callable(mark):
+            mark()
         input_streak = (None, None, 0)  # (sig, foreground key, count) of identical inputs
         route_notes = []  # off-target input, cross-category fallbacks (for the done check)
         last_read = None  # result of the phase's last read_screen_text
+        unsubmitted = False  # type_text ran and no key/click submitted it yet
+        read_after_unsubmitted = False  # the last read happened in that state
         done_reminded = False
 
         print(f"\n[AgentLoop] Task: {task}")
@@ -782,6 +832,7 @@ class AgentLoop:
                 action,
                 param,
                 resolve_path=self.api._resolve_path_placeholders,
+                enter_safe=self._enter_safe(action, param),
             ):
                 confirm_q = self._confirmation_question(action, param)
                 if input_mode == "voice":
@@ -854,17 +905,20 @@ class AgentLoop:
                 return {"success": False, "error": "Stopped by user"}
 
             # --- DONE-TIME CHECK (once per phase) ------------------------------
-            # One extra model turn, only in a phase that read the screen or
-            # whose input/route did not go as asked: the speech is checked
-            # against the last read and the route actually taken.
+            # One extra model turn, only when the draft speech states numbers
+            # the last read does not show, when that read followed typing that
+            # was never submitted, or when input/route did not go as asked.
+            # A speech that matches its read costs nothing extra.
+            unseen = self._unseen_numbers(speech, last_read) if last_read is not None else []
             if (
                 action == "done"
                 and not done_reminded
-                and (route_notes or last_read is not None)
+                and (route_notes or unseen or (last_read is not None and read_after_unsubmitted))
                 and steps_taken < self.MAX_STEPS
             ):
                 done_reminded = True
-                reminder = self._done_reminder(route_notes, last_read)
+                reminder = self._done_reminder(route_notes, last_read, unseen,
+                                               read_after_unsubmitted)
                 print(f"  [DoneCheck] {reminder}")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append({"role": "user", "content": f"[OBSERVATION] {reminder}"})
@@ -1067,6 +1121,11 @@ class AgentLoop:
                 )
             if executed_action == "read_screen_text":
                 last_read = result_str
+                read_after_unsubmitted = unsubmitted
+            elif success and executed_action == "type_text":
+                unsubmitted = not str(executed_param).endswith(("\n", "\r"))
+            elif success and is_input:
+                unsubmitted = False  # a key, hotkey or click after the typing
 
             # Repetition guard: without this the model re-ran clicks it had
             # already landed (each 'maybe it didn't work' costs a step and, on
@@ -1148,7 +1207,7 @@ class AgentLoop:
             )
         if self.api.vision.ready:
             try:
-                frame = self.api.screen.frame
+                frame = self._vision_frame("screen context")
                 if frame:
                     description = self.api.vision.understand_screen(
                         frame, use_cache=False
@@ -1364,7 +1423,9 @@ class AgentLoop:
             screen (a header name, an error message, a value). It is not a success-checker.
             Facts about the machine (running apps, processes, files) come from the Open apps
             list or commands like Get-Process / Test-Path, never from read_screen_text or
-            analyze_screen. Open apps lists tracked apps only: confirm absence with Get-Process;
+            analyze_screen. The Open apps list outranks the screen description for which apps
+            are running: if an app isn't listed, don't assume it's open; use open_app.
+            Open apps lists tracked apps only: confirm absence with Get-Process;
             for lookups that may legitimately find nothing (Get-Process, Get-Item,
             Get-ChildItem on a path) add -ErrorAction SilentlyContinue, so "not found"
             is an empty result instead of a failed command.
@@ -1445,7 +1506,7 @@ class AgentLoop:
         AVAILABLE ACTIONS:
         - open_app          : Open app (parameter = app name). Automatically switches to it if already running.
         - open_url          : Open website (parameter = url).
-        - type_text         : Type text (parameter = text). Clears the targeted field first.
+        - type_text         : Enter text (parameter = text) into the app you opened/switched to, replacing the field's content (with no such app it only appends). It does NOT submit: for a command, expression, or form, follow it with press_key('enter') or end the text with the app's submit key.
         - type_search       : Type text and press Enter (parameter = text).
         - click_coords      : Click raw pixels (parameter = "x,y"). LAST RESORT ONLY.
         - click_on_text     : Find and click text via OCR/Vision (parameter = text).
