@@ -93,6 +93,8 @@ def load_scenarios(path, only=None):
             raise ValueError(f"{sc['name']}: desktop scenarios need prompt or turns")
         if sc["type"] == "plan" and not sc.get("prompt"):
             raise ValueError(f"{sc['name']}: plan scenarios need a prompt")
+        if "uia_after_read" in sc and not isinstance(sc["uia_after_read"], str):
+            raise ValueError(f"{sc['name']}: uia_after_read must be a process name")
     if only:
         wanted = set(only)
         missing = wanted - names
@@ -469,6 +471,36 @@ def window_texts(name):
     return texts or None
 
 
+def wrap_reads_with_uia(api, process):
+    """Scenario key "uia_after_read": after every read_screen_text, log what
+    UIA says ``process``'s window contains, so a vision answer that disagrees
+    with the window shows up in the log. Returns an undo function."""
+    from core.config import secret_text_reason
+
+    had_own = "read_screen_text" in vars(api)
+    original = api.read_screen_text
+
+    def traced(query=""):
+        result = original(query)
+        texts = window_texts(process)
+        shown = "(could not read)" if texts is None else " | ".join(texts)[:300]
+        reason = secret_text_reason(shown)
+        if reason:
+            shown = f"(withheld: {reason})"
+        print(f"[Harness] UIA after read_screen_text ({process}): {shown}")
+        return result
+
+    api.read_screen_text = traced
+
+    def undo():
+        if had_own:
+            api.read_screen_text = original
+        else:
+            del api.read_screen_text
+
+    return undo
+
+
 NOTEPAD_SESSION_HINT = (
     r"Win11 Notepad restores unsaved tabs from %LOCALAPPDATA%\Packages"
     r"\Microsoft.WindowsNotepad_8wekyb3d8bbwe\LocalState\TabState; close those tabs "
@@ -684,6 +716,7 @@ class Runner:
         console = sys.stdout
         tee = Tee(record["log"], console)
         stuck = False
+        undo_reads = None
         try:
             skip = run_setup(sc.get("setup"))
             if skip:
@@ -692,6 +725,8 @@ class Runner:
                 return record, False
             self.questions, self.spoken = [], []
             self.answers = list(sc.get("answers", []))
+            if sc.get("uia_after_read"):
+                undo_reads = wrap_reads_with_uia(self.api(), sc["uia_after_read"])
             sys.stdout = tee
             print(f"[Harness] Scenario {name} (mode={mode or 'app default'}, tmp={tmp})")
             started = time.monotonic()
@@ -709,6 +744,8 @@ class Runner:
         except Exception as e:
             error, result = f"harness error: {e!r}", None
         finally:
+            if undo_reads:
+                undo_reads()
             sys.stdout = console
             tee.close()
             # End state is judged BEFORE cleanup closes anything.

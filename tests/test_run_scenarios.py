@@ -377,3 +377,60 @@ def test_memory_db_path_override(monkeypatch, tmp_path):
     assert memory_db_path() == str(tmp_path / "x.db")
     TaskStore().conn.close()
     assert (tmp_path / "x.db").exists()
+
+
+class _ReadingApi(_FakeApi):
+    """Calls read_screen_text the way _exec_sync does (through the instance)."""
+
+    def read_screen_text(self, query=""):
+        print(f"  [vision] {query}")
+        return "851"
+
+    def ask_mistai(self, prompt, input_mode="text"):
+        print("  Step 1: read_screen_text('what number?')")
+        self.read_screen_text("what number?")
+        return {"success": True, "command": {"speech": "It shows 23."}}
+
+
+def test_uia_after_read_logs_the_window_text_after_each_read(tmp_path, monkeypatch):
+    scenarios = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)}
+    assert scenarios["calculator"]["uia_after_read"] == "calculator"
+
+    seen = []
+    texts = iter([["Calculator", "Display is 23"], None])
+    monkeypatch.setattr(rs, "window_texts", lambda name: seen.append(name) or next(texts))
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [
+        {"name": "calc", "prompt": "x", "uia_after_read": "calculator"},
+        {"name": "calc2", "prompt": "x", "uia_after_read": "calculator"},
+        {"name": "plain", "prompt": "x"},
+    ]}))
+    fake = _ReadingApi()
+    assert rs.main(["--stub", "--yes", "--scenarios", str(scen),
+                    "--log-root", str(tmp_path / "logs")], api_factory=lambda: fake) == 0
+    (log_dir,) = list((tmp_path / "logs").iterdir())
+    log = (log_dir / "calc.log").read_text(encoding="utf-8")
+    assert log.index("[vision] what number?") < log.index(
+        "[Harness] UIA after read_screen_text (calculator): Calculator | Display is 23")
+    assert "(calculator): (could not read)" in (log_dir / "calc2.log").read_text(encoding="utf-8")
+    assert "[Harness] UIA after" not in (log_dir / "plain.log").read_text(encoding="utf-8")
+    assert seen == ["calculator", "calculator"]
+    assert "read_screen_text" not in vars(fake)  # wrapper removed after each scenario
+
+
+def test_uia_after_read_withholds_secret_looking_text(monkeypatch, capsys):
+    api = SimpleNamespace(read_screen_text=lambda q="": "ok")
+    monkeypatch.setattr(rs, "window_texts", lambda _n: ["password: hunter2hunter2"])
+    undo = rs.wrap_reads_with_uia(api, "notepad")
+    assert api.read_screen_text("q") == "ok"
+    out = capsys.readouterr().out
+    assert "(withheld: contains a credential-looking token)" in out and "hunter2" not in out
+    undo()
+    assert api.read_screen_text("q") == "ok"
+
+
+def test_uia_after_read_must_name_a_process(tmp_path):
+    bad = tmp_path / "s.json"
+    bad.write_text(json.dumps([{"name": "a", "prompt": "x", "uia_after_read": ["calculator"]}]))
+    with pytest.raises(ValueError, match="uia_after_read"):
+        rs.load_scenarios(str(bad))

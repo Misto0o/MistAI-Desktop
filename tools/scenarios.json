@@ -236,6 +236,10 @@
           {
             "action": "done",
             "speech": "The Notepad window says 42."
+          },
+          {
+            "action": "done",
+            "speech": "The Notepad window says 42."
           }
         ]
       ],
@@ -271,6 +275,7 @@
       ],
       "prompt": "Open Calculator, calculate 37 times 23 in it, and tell me the number it shows.",
       "timeout": 150,
+      "uia_after_read": "calculator",
       "setup": [
         {
           "require_process_absent": "calculator"
@@ -292,6 +297,10 @@
             "action": "read_screen_text",
             "parameter": "What number does the Calculator display show?",
             "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Calculator shows 851."
           },
           {
             "action": "done",
