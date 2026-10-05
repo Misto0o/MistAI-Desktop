@@ -86,7 +86,7 @@ def test_open_app_by_aumid_fails_fast_without_start_menu_typing(monkeypatch):
 # -- Input target reporting ----------------------------------------------------------
 
 
-def _input_api(monkeypatch, target, foreground_hwnd):
+def _input_api(monkeypatch, target, foreground_hwnd, clipboard="old"):
     _fake_desktop(monkeypatch, {
         20: (4, "Notepad", "Untitled - Notepad", []),
         21: (5, "Chrome_WidgetWin_1", "main.py - Visual Studio Code", []),
@@ -96,7 +96,10 @@ def _input_api(monkeypatch, target, foreground_hwnd):
     api._last_opened_app = target
     api.switch_to_app = lambda _a: False  # no Notepad window to switch to
     api.get_clipboard = lambda: "old"
-    api.set_clipboard = lambda _t: True
+    api._clipboard_text_full = lambda: clipboard
+    clip_sets = []
+    api.set_clipboard = lambda t: clip_sets.append(t) or True
+    api.clip_sets = clip_sets
     api.last_result_text = ""
     events = []
     monkeypatch.setattr("core.api.time.sleep", lambda _s: None)
@@ -112,30 +115,65 @@ def test_type_text_on_target_reports_the_window_and_clears_the_field(monkeypatch
     assert events == [("ctrl", "a"), "delete", ("ctrl", "v")]
 
 
-def test_type_text_off_target_warns_and_never_clears_the_wrong_window(monkeypatch):
-    api, events = _input_api(monkeypatch, "notepad", 21)
+def test_type_text_restores_the_whole_clipboard_not_a_truncated_copy(monkeypatch):
+    long_clip = "x" * 50_000
+    api, _ = _input_api(monkeypatch, "notepad", 20, clipboard=long_clip)
     assert Api._act_type_text(api, "hello") is True
+    assert api.clip_sets == ["hello", long_clip]
+
+
+def test_type_text_off_target_sends_nothing_and_fails(monkeypatch):
+    api, events = _input_api(monkeypatch, "notepad", 21)
+    switched = []
+    api.switch_to_app = lambda a: switched.append(a) or False
+    assert Api._act_type_text(api, "hello") is False
     text = api.last_result_text
-    assert text.startswith("WARNING: the text went to 'main.py - Visual Studio Code', NOT to notepad")
-    assert "NOT cleared" in text
-    assert events == [("ctrl", "v")]  # no Ctrl+A / Delete in VS Code
+    assert text.startswith("NOT SENT: the text was not sent because notepad is not in front")
+    assert "'main.py - Visual Studio Code' is" in text and "Nothing was typed" in text
+    assert events == [] and api.clip_sets == []  # no keys, clipboard untouched
+    assert switched == ["notepad"]  # one switch attempt first
 
 
 @pytest.mark.parametrize("action, param", [("press_key", "enter"), ("hotkey", "ctrl+s")])
-def test_keys_report_the_receiving_window_and_warn_off_target(monkeypatch, action, param):
-    api, _ = _input_api(monkeypatch, "notepad", 21)
-    Api._exec_sync(api, action, param)
-    assert api.last_result_text.startswith("WARNING:")
+def test_keys_off_target_send_nothing_and_on_target_report_the_window(
+        monkeypatch, action, param):
+    api, events = _input_api(monkeypatch, "notepad", 21)
+    assert Api._exec_sync(api, action, param) is False
+    assert api.last_result_text.startswith("NOT SENT:")
     assert "Visual Studio Code" in api.last_result_text
-    api, _ = _input_api(monkeypatch, "notepad", 20)
-    Api._exec_sync(api, action, param)
+    assert events == []
+    api, events = _input_api(monkeypatch, "notepad", 20)
+    assert Api._exec_sync(api, action, param) is True
     kind = "hotkey" if action == "hotkey" else "key"
     assert api.last_result_text == f"The {kind} '{param}' went to 'Untitled - Notepad'."
+    assert events
+
+
+@pytest.mark.parametrize("action, param", [("type_text", "hi"), ("press_key", "a"),
+                                           ("hotkey", "ctrl+s")])
+def test_no_known_target_does_not_interfere(monkeypatch, action, param):
+    api, events = _input_api(monkeypatch, None, 21)
+    assert Api._exec_sync(api, action, param) is True
+    assert events
+    assert "NOT SENT" not in api.last_result_text
 
 
 def test_failed_switch_app_still_records_the_intended_target(monkeypatch):
-    api, _ = _input_api(monkeypatch, None, 21)
+    api, events = _input_api(monkeypatch, None, 21)
     assert Api._exec_sync(api, "switch_app", "Notepad") is False
     assert api._last_opened_app == "notepad"
-    Api._act_press_key(api, "a")
-    assert "NOT to notepad" in api.last_result_text
+    assert Api._act_press_key(api, "a") is False
+    assert "notepad is not in front" in api.last_result_text
+    assert events == []
+
+
+def test_no_fallback_can_resend_refused_input():
+    """A refused type_text/press_key/hotkey must not be retried by the
+    Executor through some other tool that sends keys anyway."""
+    from core.tools import SPECS
+
+    key_senders = {"type_text", "type_search", "press_key", "hotkey", "quick_message"}
+    for name in ("type_text", "press_key", "hotkey"):
+        assert SPECS[name].fallback_tools == (), name
+    for name, spec in SPECS.items():
+        assert not set(spec.fallback_tools) & key_senders, name

@@ -54,6 +54,8 @@ OCR_UPSCALE = 2.5
 MAX_OCR_DIMENSION = 4000  # hard cap on the upscaled image's longest side
 OCR_MIN_CONF = 25       # was 40 -- too strict for small anti-aliased UI text
 OCR_MATCH_SCORE = 65    # slightly loosened alongside the lower conf floor
+# Clicks must land inside the target window's rectangle plus this margin.
+TARGET_RECT_MARGIN = 8
 OCR_PSM_MODES = ("--oem 3 --psm 11",)  # trimmed from 2 modes -- wasn't finding
                                         # anything psm 11 didn't, and was
                                         # roughly doubling every OCR call's time
@@ -114,55 +116,79 @@ class ImprovedClickHandler:
         self.last_method = None
         self.last_query = ""            # what we searched for (for verification)
         self.last_found_text = ""       # the actual word tesseract/UIA matched
+        # () -> ((left, top, right, bottom), title) of the window clicks must
+        # land in, or None for no check (no known target app, or it is not in
+        # front). Set by Api; None = guard off.
+        self.target_rect_fn = None
+        self.last_refusal = ""          # why the last click was not made, if refused
+        self._refused = False
 
     def click_on_text(self, query: str) -> bool:
-        """Find and click text: OCR -> UIA -> Vision"""
+        """Find and click text: OCR -> UIA -> Vision. A match outside the
+        target window is refused and the next method is tried."""
         print(f"[Click] Searching for: '{query}'")
         self.last_query = query
-
-        coords = self._try_ocr_click(query)
-        if coords:
-            self.last_method = "OCR"
-            return self._execute_click(coords)
-
-        coords = self._try_uia_click(query)
-        if coords:
-            self.last_method = "UIA"
-            return self._execute_click(coords)
-
+        self.last_refusal = ""
+        finders = [("OCR", lambda: self._try_ocr_click(query)),
+                   ("UIA", lambda: self._try_uia_click(query))]
         if self.vision.ready:
-            coords = self._try_vision_click(query)
-            if coords:
-                self.last_method = "Vision"
-                self.last_found_text = query  # Vision doesn't give us the exact word
-                return self._execute_click(coords)
-
-        print(f"[Click] FAILED: Could not find '{query}'")
-        return False
+            finders.append(("Vision", lambda: self._try_vision_click(query)))
+        return self._click_first(finders, f"'{query}'", vision_text=query)
 
     def click_nth_element(self, item_type: str, n: int = 1) -> bool:
         """Find and click Nth element - OCR/UIA first, Vision last"""
         print(f"[Click] Looking for #{n} {item_type}")
         self.last_query = item_type
-
-        coords = self._try_ocr_nth(item_type, n)
-        if coords:
-            self.last_method = "OCR"
-            return self._execute_click(coords)
-
-        coords = self._try_uia_nth(item_type, n)
-        if coords:
-            self.last_method = "UIA"
-            return self._execute_click(coords)
-
+        self.last_refusal = ""
+        finders = [("OCR", lambda: self._try_ocr_nth(item_type, n)),
+                   ("UIA", lambda: self._try_uia_nth(item_type, n))]
         if self.vision.ready:
-            coords = self._try_vision_nth(item_type, n)
-            if coords:
-                self.last_method = "Vision"
-                return self._execute_click(coords)
+            finders.append(("Vision", lambda: self._try_vision_nth(item_type, n)))
+        return self._click_first(finders, f"#{n} {item_type}")
 
-        print(f"[Click] FAILED: Could not find #{n} {item_type}")
+    def _click_first(self, finders, label, vision_text=None):
+        """Click the first method's match that the target-window guard
+        accepts. A refused match falls through to the next method."""
+        for method, find in finders:
+            coords = find()
+            if not coords:
+                continue
+            self.last_method = method
+            if method == "Vision" and vision_text is not None:
+                self.last_found_text = vision_text  # Vision doesn't give us the exact word
+            ok = self._execute_click(coords)
+            if ok or not self._refused:
+                return ok
+        if self.last_refusal:
+            print(f"[Click] FAILED: every match for {label} was outside the target window")
+        else:
+            print(f"[Click] FAILED: Could not find {label}")
         return False
+
+    def outside_target(self, x, y, method="direct"):
+        """Refusal text if (x, y) is outside the target window's rectangle
+        (+TARGET_RECT_MARGIN), else "". Fails open: no target_rect_fn, no
+        known/in-front target, or an unreadable rect means no check."""
+        if self.target_rect_fn is None:
+            return ""
+        try:
+            target = self.target_rect_fn()
+        except Exception as e:
+            print(f"[Click] target window rect unavailable ({e}); not checking")
+            return ""
+        if not target:
+            return ""
+        (left, top, right, bottom), title = target
+        m = TARGET_RECT_MARGIN
+        if left - m <= x <= right + m and top - m <= y <= bottom + m:
+            return ""
+        what = self.last_query or "the target"
+        print(f"[Click] REFUSED {method} click on '{what}' at ({x}, {y}): outside "
+              f"'{title[:60]}' rect ({left}, {top}, {right}, {bottom}) +{m}px")
+        return (f"The click on '{what}' at ({x}, {y}) (found by {method}) was NOT made: "
+                f"it is outside the '{title[:60]}' window ({left}, {top}, {right}, "
+                f"{bottom}). Nothing was clicked. Prefer type_text / press_key, or "
+                f"uia_click on the control's name.")
 
     def recheck_text_near_last_click(self, radius=60):
         """Re-run OCR in a small box around the last click point, right now.
@@ -698,6 +724,7 @@ class ImprovedClickHandler:
             return None
 
     def _execute_click(self, coords, wait_before: float = 0.15) -> bool:
+        self._refused = False
         try:
             x, y = coords
             self.last_coords = coords
@@ -709,6 +736,12 @@ class ImprovedClickHandler:
 
             if self.last_method == "Vision" and y < 80:
                 y = min(y + 30, sh - 20)
+
+            refusal = self.outside_target(x, y, self.last_method or "direct")
+            if refusal:
+                self._refused = True
+                self.last_refusal = refusal
+                return False
 
             self._show_debug_marker(x, y)
 

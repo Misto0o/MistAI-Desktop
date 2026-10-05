@@ -194,7 +194,8 @@ def test_repeat_advice_depends_on_the_tool_kind():
         assert "different parameters, a narrower query, or an absolute path" in text
         assert "browser_get_text" not in text
     assert "browser_get_text" in _advice("browser_search")
-    assert "did take effect" in _advice("open_app")
+    assert "already ran without error" in _advice("open_app")
+    assert "did take effect" not in _advice("open_app")
 
 
 def test_repeated_run_command_is_refused_with_search_advice(monkeypatch):

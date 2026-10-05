@@ -56,6 +56,13 @@ class AgentLoop:
     # An action+parameter that has FAILED this many times consecutively is not
     # run again in this phase; the model is told so and must change approach.
     MAX_IDENTICAL_FAILURES = 3
+    # Typing/clicking the same thing again is often intended (digits, keys),
+    # so input actions are never refused for having succeeded before -- only
+    # after this many identical calls in a row with the foreground unchanged.
+    MAX_IDENTICAL_INPUTS = 3
+    INPUT_CATEGORIES = {"type", "click"}
+    # The done-time reminder quotes this much of the last screen read.
+    DONE_CHECK_READ_CHARS = 300
     # READ-type results (run_command, inspect_file, ...) kept in full in the
     # resent history; older ones shrink to 300 chars.
     KEEP_FULL_READS = 2
@@ -199,7 +206,45 @@ class AgentLoop:
                 "OBSERVATION -- use it. If you need something else, use different "
                 "parameters, a narrower query, or an absolute path."
             )
-        return "It did take effect. Do not run it again -- move on or call 'done'."
+        return "It already ran without error. Do not run it again -- move on or call 'done'."
+
+    def _categories(self, action):
+        try:
+            return set(self.api.tools.get(action).categories)
+        except Exception:
+            return set()
+
+    def _current_foreground_key(self):
+        """(hwnd, title) of the window in front right now (the live snapshot
+        can lag), for the identical-input cap."""
+        try:
+            import win32gui
+
+            hwnd = win32gui.GetForegroundWindow()
+            return (hwnd, win32gui.GetWindowText(hwnd))
+        except Exception:
+            return self._foreground_key(getattr(self.api.live, "snapshot", {}) or {})
+
+    def _done_reminder(self, route_notes, last_read):
+        """The one observation shown at the first 'done' of a phase that
+        read the screen or did not go the way it was asked."""
+        parts = ["Before finishing, check your final speech against what actually happened."]
+        if route_notes:
+            parts.append(
+                "These steps did not go as asked: " + "; ".join(route_notes[-4:])
+                + ". If the result came by a different route than the user asked for "
+                "(or the requested app was never used), say so in the speech."
+            )
+        if last_read is not None:
+            parts.append(
+                "The last screen read returned: "
+                f'"{self._clip_result(last_read, self.DONE_CHECK_READ_CHARS)}". '
+                "Your speech must state only what that read shows (where it has EXACT UI "
+                "TEXT, that is what the window contains), never a value you worked out "
+                "yourself. If it does not show the answer, say so."
+            )
+        parts.append("Then call done again with the corrected (or unchanged) speech.")
+        return " ".join(parts)
 
     @staticmethod
     def _clip_result(text, limit):
@@ -412,6 +457,16 @@ class AgentLoop:
         last_failed_sig = None  # "action|param" of the most recent failure
         consecutive_failures = 0  # how many times in a row that same sig failed
         declined_signatures = set()
+        # Input guards (type_text/press_key/hotkey) only enforce a target that
+        # THIS phase opened or switched to.
+        try:
+            self.api._last_opened_app = None
+        except Exception:
+            pass
+        input_streak = (None, None, 0)  # (sig, foreground key, count) of identical inputs
+        route_notes = []  # off-target input, cross-category fallbacks (for the done check)
+        last_read = None  # result of the phase's last read_screen_text
+        done_reminded = False
 
         print(f"\n[AgentLoop] Task: {task}")
         if self.api.caption_window and self.api.captions_enabled:
@@ -665,9 +720,31 @@ class AgentLoop:
                 history.append({"role": "user", "content": f"[OBSERVATION] {refuse}"})
                 continue
 
+            # --- IDENTICAL-INPUT CAP -------------------------------------------
+            is_input = bool(self._categories(action) & self.INPUT_CATEGORIES)
+            if (
+                is_input
+                and input_streak[0] == sig
+                and input_streak[2] >= self.MAX_IDENTICAL_INPUTS
+                and input_streak[1] == self._current_foreground_key()
+            ):
+                refuse = (
+                    f"REFUSED: '{action}({str(param)[:60]})' already ran "
+                    f"{input_streak[2]} times in a row and the window in front has not "
+                    "changed. Check the result (or the exact UI text) before sending "
+                    "more of the same input."
+                )
+                print(f"  [Refused] {refuse}")
+                if on_step:
+                    on_step(steps_taken, "refused", str(param), "")
+                history.append({"role": "assistant", "content": json.dumps(cmd)})
+                history.append({"role": "user", "content": f"[OBSERVATION] {refuse}"})
+                continue
+
             # --- IDENTICAL-SUCCESS GUARD (side-effect actions only) ------------
-            if sig in succeeded_actions and action not in self.META_ACTIONS:
-                cats = set(self.api.tools.get(action).categories)
+            # Input actions are exempt: the same digit or key twice is normal.
+            if sig in succeeded_actions and action not in self.META_ACTIONS and not is_input:
+                cats = self._categories(action)
                 if (
                     not (cats & {"perception", "info"})
                     and action != "scroll"
@@ -775,6 +852,23 @@ class AgentLoop:
             # before dispatch.  Check again at the last safe boundary.
             if self.api._stop_requested.is_set():
                 return {"success": False, "error": "Stopped by user"}
+
+            # --- DONE-TIME CHECK (once per phase) ------------------------------
+            # One extra model turn, only in a phase that read the screen or
+            # whose input/route did not go as asked: the speech is checked
+            # against the last read and the route actually taken.
+            if (
+                action == "done"
+                and not done_reminded
+                and (route_notes or last_read is not None)
+                and steps_taken < self.MAX_STEPS
+            ):
+                done_reminded = True
+                reminder = self._done_reminder(route_notes, last_read)
+                print(f"  [DoneCheck] {reminder}")
+                history.append({"role": "assistant", "content": json.dumps(cmd)})
+                history.append({"role": "user", "content": f"[OBSERVATION] {reminder}"})
+                continue
 
             if on_step:
                 on_step(steps_taken, action, param, speech)
@@ -949,21 +1043,50 @@ class AgentLoop:
                     "-- do not call done on the strength of the screen alone."
                 )
 
+            # --- Facts for the identical-input cap and the done-time check ---
+            if is_input:
+                fg_now = self._current_foreground_key()
+                if input_streak[0] == sig and input_streak[1] == fg_now:
+                    input_streak = (sig, fg_now, input_streak[2] + 1)
+                else:
+                    input_streak = (sig, fg_now, 1)
+            else:
+                input_streak = (None, None, 0)
+            result_str = str(result_text or "")
+            if not success and result_str.startswith("NOT SENT"):
+                route_notes.append(f"{action} was not sent ({self._clip_result(result_str, 160)})")
+            escalated_from = getattr(res, "escalated_from", "") or ""
+            if (
+                success
+                and escalated_from
+                and escalated_from != executed_action
+                and not (self._categories(escalated_from) & self._categories(executed_action))
+            ):
+                route_notes.append(
+                    f"{executed_action} ran as an automatic fallback for {escalated_from}"
+                )
+            if executed_action == "read_screen_text":
+                last_read = result_str
+
             # Repetition guard: without this the model re-ran clicks it had
             # already landed (each 'maybe it didn't work' costs a step and, on
             # a toggle, reverses the previous one).
             if success:
                 if sig in succeeded_actions:
                     obs += (
-                        f" NOTE: '{action}' with this exact parameter ALREADY "
-                        f"succeeded earlier in this phase. "
-                        + self._repeat_advice(action)
+                        " NOTE: this exact call already ran earlier in this phase; "
+                        "repeat it only if you mean to (e.g. the same digit or key "
+                        "again), never to make sure a toggle worked."
+                        if is_input
+                        else f" NOTE: '{action}' with this exact parameter ALREADY "
+                        f"succeeded earlier in this phase. " + self._repeat_advice(action)
                     )
-                succeeded_actions.add(sig)
-                # Executor may reroute UIA clicks in browsers or return a
-                # successful fallback action.  Remember both identities so
-                # the model cannot double-toggle via the alternate spelling.
-                succeeded_actions.add(f"{executed_action}|{executed_param}")
+                if not result_str.startswith(("WARNING", "NOT SENT")):
+                    succeeded_actions.add(sig)
+                    # Executor may reroute UIA clicks in browsers or return a
+                    # successful fallback action.  Remember both identities so
+                    # the model cannot double-toggle via the alternate spelling.
+                    succeeded_actions.add(f"{executed_action}|{executed_param}")
                 last_failed_sig = None
                 consecutive_failures = 0
             else:
@@ -1188,11 +1311,11 @@ class AgentLoop:
            screenshot -- they either find the actual element or tell you honestly that
            they couldn't. NEVER use click_on_text, uia_click, or read_screen_text for
            anything inside a browser page -- those are for NATIVE WINDOWS APPS ONLY.
-        4. In a NATIVE Windows app (Notepad, Explorer, Settings, Task Manager): use
-           uia_click / uia_find_input first -- the accessibility tree is reliable there.
-        5. click_on_text / click_nth (OCR+Vision) -- native apps as a fallback when UIA
-           fails, or the rare canvas-only page with no real DOM elements at all (a
-           genuine last resort, never a first choice).
+        4. In a focused NATIVE Windows app (Notepad, Explorer, Settings, Task Manager): enter
+           text and keys with type_text / press_key / hotkey before any clicking; for
+           controls use uia_click / uia_find_input -- the accessibility tree is reliable there.
+        5. click_on_text / click_nth (OCR+Vision) -- the last resort: native apps when
+           keys and UIA cannot do it, or the rare canvas-only page with no real DOM elements.
         6. click_coords -- LAST RESORT ONLY, using exact coordinates verified via read_screen_text.
 
         OPERATING RULES:

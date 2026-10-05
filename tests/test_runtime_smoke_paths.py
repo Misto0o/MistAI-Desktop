@@ -291,6 +291,7 @@ def test_type_text_does_not_clear_a_field_when_clipboard_staging_fails(monkeypat
     api = Api.__new__(Api)
     api.live = SimpleNamespace(snapshot={"foreground_window": "Notepad"})
     api.get_clipboard = lambda: "existing clipboard"
+    api._clipboard_text_full = lambda: None
     api.set_clipboard = lambda _text: False
     api.last_result_text = ""
     input_events = []
