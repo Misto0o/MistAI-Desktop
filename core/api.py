@@ -20,7 +20,7 @@ import pyautogui
 import requests
 import speech_recognition as sr
 
-from .agent import AgentLoop
+from .agent import NOT_VISIBLE_ON_SCREEN, AgentLoop
 from .api_manager import APIKeyManager
 from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler
@@ -141,6 +141,7 @@ class Api:
         self.click_handler = ImprovedClickHandler(
             live_state=self.live, vision_engine=self.vision, screen_buffer=self.screen
         )
+        self.click_handler.target_rect_fn = self._click_target_rect
         self.uia_nav = EnhancedUIANavigator()
         self.agent = AgentLoop(self, self.uia_nav)
 
@@ -1044,7 +1045,7 @@ class Api:
             elif action == "click_coords":
                 return self._act_click_coords(param)
             elif action == "click_on_text":
-                return self.click_handler.click_on_text(param)
+                return self._handler_click(self.click_handler.click_on_text, param)
             elif action == "click_nth":
                 return self._act_click_nth(param)
             elif action == "uia_click":
@@ -1844,18 +1845,22 @@ class Api:
         typing character-by-character -- faster, and avoids per-character
         edge cases (special chars, autocomplete interference, dropped
         keystrokes on slow-rendering apps like Electron chat clients)."""
-        target = getattr(self, "_last_opened_app", None)
-        if target and not self._foreground_process_matches(target):
-            self.switch_to_app(target)
-            time.sleep(0.4)
-        report, on_target = self._input_target_report("text")
+        report, on_target = self._ensure_input_target("text")
+        if not on_target:
+            self.last_result_text = report
+            print(f"[TypeText] {report}")
+            return False
         prev_clipboard = None
         clipboard_staged = False
         try:
             # Stage text on the clipboard BEFORE changing the target field.
             # The old order cleared a draft with Ctrl+A/Delete and only then
             # discovered that another app had locked the clipboard.
-            prev_clipboard = self.get_clipboard()
+            prev_clipboard = self._clipboard_text_full()
+            if prev_clipboard is None:
+                prev_clipboard = self.get_clipboard()
+                if prev_clipboard == "Clipboard is empty":
+                    prev_clipboard = ""
             if not self.set_clipboard(param):
                 self.last_result_text = (
                     "Could not set the clipboard (locked by another app); "
@@ -1865,15 +1870,10 @@ class Api:
             clipboard_staged = True
 
             time.sleep(0.2)
-            if on_target:
-                pyautogui.hotkey("ctrl", "a")
-                time.sleep(0.05)
-                pyautogui.press("delete")
-                time.sleep(0.1)
-            else:
-                # Never select-all + delete inside a window we didn't mean to type into.
-                report += " The window's existing content was NOT cleared."
-            time.sleep(0.1)
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.05)
+            pyautogui.press("delete")
+            time.sleep(0.2)
             pyautogui.hotkey("ctrl", "v")
             time.sleep(0.15)
             self.last_result_text = report
@@ -1885,9 +1885,7 @@ class Api:
         finally:
             # Preserve the user's clipboard even if UI input itself fails.
             if clipboard_staged:
-                self.set_clipboard(
-                    "" if prev_clipboard == "Clipboard is empty" else prev_clipboard
-                )
+                self.set_clipboard(prev_clipboard)
 
     def _get_app_search_hotkey(self, app):
         """Look up (and permanently cache) an app's quick-switch/search
@@ -2010,10 +2008,12 @@ class Api:
         # Confirm the quick-switcher actually resolved to this person BEFORE
         # committing. Require ONLY the exact visible name: accepting prose,
         # prefixes (Ann/Anna), or an uncertain answer would make this a guess.
-        seen = self.read_screen_text(
+        # Vision only: these answers are compared to the name exactly, so the
+        # appended accessibility-tree text of read_screen_text must not be in them.
+        seen, _ = self._vision_read(
             "The quick-switcher/search box is open. Reply with ONLY the exact "
             f"name of the top highlighted conversation result. Expected: {recipient}"
-        ) or ""
+        )
         if self._normalize_app_name(seen) != self._normalize_app_name(recipient):
             pyautogui.press("escape")
             self.last_result_text = (
@@ -2027,10 +2027,10 @@ class Api:
         time.sleep(0.8)
 
         # -- Verify the open conversation before typing the message ---------
-        header = self.read_screen_text(
+        header, _ = self._vision_read(
             "Reply with ONLY the exact name shown in the header of the currently "
             f"open chat. Expected: {recipient}"
-        ) or ""
+        )
         rn = self._normalize_app_name(recipient)
         hn = self._normalize_app_name(header)
         if not rn or rn != hn:
@@ -2071,6 +2071,11 @@ class Api:
             if len(parts) >= 2:
                 x, y = int(parts[0]), int(parts[1])
                 if CoordinateValidator.is_valid(x, y, *pyautogui.size()):
+                    self.click_handler.last_query = ""
+                    refusal = self.click_handler.outside_target(x, y, "coords")
+                    if refusal:
+                        self.last_result_text = refusal
+                        return False
                     try:
                         from .click_indicator import get_indicator
 
@@ -2094,11 +2099,47 @@ class Api:
         except Exception:
             n = 1
         item_type = parts[1].strip() if len(parts) > 1 else "item"
-        return self.click_handler.click_nth_element(item_type, n)
+        return self._handler_click(self.click_handler.click_nth_element, item_type, n)
+
+    def _handler_click(self, click, *args):
+        """Run a ClickHandler click; a target-window refusal becomes the result text."""
+        ok = click(*args)
+        refusal = getattr(self.click_handler, "last_refusal", "")
+        if not ok and refusal:
+            self.last_result_text = refusal
+        return ok
+
+    def _click_target_rect(self):
+        """((l, t, r, b), title) of the window clicks must land in: the app
+        this phase opened or switched to, while it is in front. None = no
+        check (no known target, so taskbar/Start clicks stay possible; or the
+        target is not in front, which type/key input already refuses)."""
+        target = getattr(self, "_last_opened_app", None)
+        if not target:
+            return None
+        import win32gui
+
+        hwnd = win32gui.GetForegroundWindow()
+        if not self._window_belongs_to(hwnd, target):
+            print(f"[Click] {target} is not in front; window guard not applied")
+            return None
+        return win32gui.GetWindowRect(hwnd), win32gui.GetWindowText(hwnd)
+
+    def _ensure_input_target(self, what):
+        """(report, on_target) for input about to be sent. When this phase
+        opened/switched to an app that is not in front, try one switch back;
+        if it is still not in front, on_target is False and the caller must
+        send NOTHING. No known target (no open_app/switch_app this phase):
+        input goes to whatever is in front, as before."""
+        target = getattr(self, "_last_opened_app", None)
+        if target and not self._foreground_process_matches(target):
+            self.switch_to_app(target)
+            time.sleep(0.4)
+        return self._input_target_report(what)
 
     def _input_target_report(self, what):
         """(report, on_target): which window is in front -- i.e. about to
-        receive ``what`` -- and a WARNING when that is not the app the agent
+        receive ``what`` -- and NOT SENT when that is not the app the agent
         last opened or switched to (the switch may have silently failed)."""
         target = getattr(self, "_last_opened_app", None)
         try:
@@ -2110,16 +2151,19 @@ class Api:
         title = (title or "(untitled window)")[:60]
         if target and not self._foreground_process_matches(target):
             return (
-                f"WARNING: the {what} went to '{title}', NOT to {target} ({target} is "
-                f"not in front). Check where it landed before continuing.",
+                f"NOT SENT: the {what} was not sent because {target} is not in front "
+                f"('{title}' is). Nothing was typed; bring {target} to the front "
+                f"(switch_app) before retrying.",
                 False,
             )
         return f"The {what} went to '{title}'.", True
 
     def _act_press_key(self, param):
-        report, _ = self._input_target_report(f"key '{param}'")
-        pyautogui.press(param)
+        report, on_target = self._ensure_input_target(f"key '{param}'")
         self.last_result_text = report
+        if not on_target:
+            return False
+        pyautogui.press(param)
         return True
 
     def _act_hotkey(self, param):
@@ -2127,10 +2171,12 @@ class Api:
             keys = [k.strip().lower() for k in param.split("+") if k.strip()]
             if not keys:
                 return False
-            report, _ = self._input_target_report(f"hotkey '{param}'")
+            report, on_target = self._ensure_input_target(f"hotkey '{param}'")
+            self.last_result_text = report
+            if not on_target:
+                return False
             pyautogui.hotkey(*keys)
             time.sleep(0.3)
-            self.last_result_text = report
             return True
         except Exception as e:
             print(f"[Hotkey] Error with {param}: {e}")
@@ -2472,6 +2518,23 @@ class Api:
             print(f"[Screenshot] Error: {e}")
             return False
 
+    def _clipboard_text_full(self):
+        """The whole clipboard text ("" when it holds no text), or None when
+        it cannot be read. get_clipboard() truncates; restoring from it would
+        cut a long clipboard short."""
+        try:
+            import win32clipboard
+
+            win32clipboard.OpenClipboard()
+            try:
+                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                    return str(win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT))
+                return ""
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            return None
+
     def get_clipboard(self):
         """Live clipboard text; the LiveState snapshot (300 chars, may be
         stale) is only a fallback."""
@@ -2532,32 +2595,88 @@ class Api:
             "description": description,
         }
 
-    def read_screen_text(self, query=""):
+    _NUMBER_RX = re.compile(r"\d+(?:[.,]\d+)*")
+    _read_trace_warned = False
+
+    def _exact_ui_text(self, include_browser=False):
+        """(text, title, native) from the foreground window's accessibility
+        tree. Skipped ("") in MistAI's own window, and in browsers unless
+        include_browser (the page DOM is the browser_* tools' job)."""
+        from .executor import BROWSER_HINTS
+        from .uia_text import foreground_uia_text
+
+        try:
+            import win32gui
+            import win32process
+
+            hwnd = win32gui.GetForegroundWindow()
+            title = win32gui.GetWindowText(hwnd)
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            if is_self_process(psutil.Process(pid).name(), pid):
+                return "", title, False
+        except Exception:
+            return "", "", False
+        native = not any(h in title.lower() for h in BROWSER_HINTS)
+        if not native and not include_browser:
+            return "", title, False
+        text, _ = foreground_uia_text(hwnd)
+        return text, title, native
+
+    def _vision_read(self, query):
+        """(answer, ok): the vision model's literal reading of the screen."""
         if not self.vision.ready:
-            self.last_result_text = (
-                "Vision isn't configured, so I can't read on-screen text."
-            )
-            return self.last_result_text
+            return "Vision isn't configured, so I can't read on-screen text.", False
         try:
             frame = self.screen.frame
             if not frame:
-                self.last_result_text = "No screen frame available."
-                return self.last_result_text
+                return "No screen frame available.", False
             prompt = (
                 f"Look at this screenshot and answer precisely: {query}\n"
-                "Answer ONLY from what is visible in the screenshot. If the answer "
-                "is not visible, reply exactly: NOT VISIBLE ON SCREEN"
+                "Answer ONLY from what is visible in the screenshot: transcribe text "
+                "and numbers exactly as displayed. Never calculate, complete, or infer "
+                "a value that is not shown (a pending expression is not its result). "
+                "If the answer is not visible, reply exactly: NOT VISIBLE ON SCREEN"
                 if query
                 else "Describe the visible text and content on this screen in detail."
             )
             result = self.vision._call(prompt, frame)
-            self.last_result_text = (
-                result or "Could not read anything meaningful from the screen."
-            )[:_RESULT_MEMORY_CHARS]
-            return self.last_result_text
+            if not result:
+                return "Could not read anything meaningful from the screen.", False
+            return result, True
         except Exception as e:
-            self.last_result_text = f"Error reading screen: {e}"
-            return self.last_result_text
+            return f"Error reading screen: {e}", False
+
+    def read_screen_text(self, query=""):
+        """Vision's reading of the screen; in a native window also the exact
+        accessibility-tree text, and a NOTE when vision reports numbers the
+        window does not contain. MISTAI_TRACE_READS=1 logs both side by side."""
+        trace = os.environ.get("MISTAI_TRACE_READS") == "1"
+        # UIA first: it is closer in time to the screenshot than the slow vision call.
+        exact, title, native = self._exact_ui_text(include_browser=trace)
+        answer, ok = self._vision_read(query)
+        result = answer
+        if native and exact:
+            if ok and NOT_VISIBLE_ON_SCREEN in answer:
+                answer = "vision could not see it; use the EXACT UI TEXT below"
+            result = (f"Vision: {answer}\nEXACT UI TEXT of '{title[:60]}' "
+                      f"(accessibility tree, exact): {exact}")
+            if ok:
+                have = {n.replace(",", "") for n in self._NUMBER_RX.findall(exact)}
+                missing = [n for n in dict.fromkeys(self._NUMBER_RX.findall(answer))
+                           if n.replace(",", "") not in have]
+                if missing:
+                    result += (f"\nNOTE: the vision answer's number(s) {', '.join(missing)} "
+                               "do not appear in the exact UI text; the exact UI text is "
+                               "what the window contains.")
+        if trace:
+            if not Api._read_trace_warned:
+                Api._read_trace_warned = True
+                print("[ReadTrace] MISTAI_TRACE_READS=1: each screen read logs on-screen "
+                      "text; skim these logs before sharing them.")
+            print(f"[ReadTrace] query={query[:80]!r} | vision={answer[:200]!r} | "
+                  f"uia={exact[:300]!r}")
+        self.last_result_text = result[:_RESULT_MEMORY_CHARS]
+        return self.last_result_text
 
     def list_open_apps(self):
         from .live_state import describe_open_apps

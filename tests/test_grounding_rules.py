@@ -91,6 +91,9 @@ def test_agent_prompt_has_grounding_rules():
     assert "must come from an observation of that window" in system
     assert "fix the state or report what it actually shows" in system
     assert "never present your own computation" in system
+    # Keys before clicks in native apps; OCR/vision clicks are the last resort.
+    assert "type_text / press_key / hotkey before any clicking" in system
+    assert "click_on_text / click_nth (OCR+Vision) -- the last resort" in system
 
 
 # -- read_screen_text vision prompt -------------------------------------------
@@ -107,6 +110,7 @@ def _vision_api(reply):
     api.vision = SimpleNamespace(ready=True, _call=call)
     api.screen = SimpleNamespace(frame=object())
     api.last_result_text = ""
+    api._exact_ui_text = lambda include_browser=False: ("", "", False)
     return api, prompts
 
 
@@ -126,6 +130,9 @@ def test_specific_question_is_limited_to_what_is_visible():
     Api.read_screen_text(api, "is Edge running?")
     assert "ONLY from what is visible" in prompts[0]
     assert "NOT VISIBLE ON SCREEN" in prompts[0]
+    # Transcribe, never compute: a pending 37*23 must not be read back as 851.
+    assert "exactly as displayed" in prompts[0]
+    assert "Never calculate, complete, or infer" in prompts[0]
 
 
 def test_not_visible_on_screen_sends_the_agent_to_another_source(monkeypatch):
@@ -133,6 +140,8 @@ def test_not_visible_on_screen_sends_the_agent_to_another_source(monkeypatch):
         [
             json.dumps({"action": "read_screen_text", "parameter": "is Edge running?"}),
             json.dumps({"action": "run_command", "parameter": "Get-Process msedge"}),
+            json.dumps({"action": "done", "speech": "Edge is not running."}),
+            # The phase read the screen, so the first done gets one check.
             json.dumps({"action": "done", "speech": "Edge is not running."}),
         ]
     )
@@ -185,6 +194,8 @@ def test_not_visible_on_screen_sends_the_agent_to_another_source(monkeypatch):
     assert "NOT VISIBLE ON SCREEN" in obs_after_screen
     assert "Get it from another source" in obs_after_screen
     assert "do not call done" in obs_after_screen
+    done_check = sent[3][-2]["content"]
+    assert 'The last screen read returned: "NOT VISIBLE ON SCREEN"' in done_check
 
 
 def test_open_apps_are_printed_once_per_phase(monkeypatch, capsys):

@@ -310,6 +310,19 @@ _ENV_REF_RX = re.compile(
     """
 )
 _PRIVATE_KEY_RX = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+# Well-known credential shapes, plus "<secret word> = <long value>".
+_SECRET_TOKEN_RX = re.compile(
+    r"""(?x)
+    \b(?:sk|pk|rk)-[A-Za-z0-9_-]{20,}
+    | \bgh[pousr]_[A-Za-z0-9]{30,}
+    | \bgithub_pat_[A-Za-z0-9_]{30,}
+    | \b(?:AKIA|ASIA)[A-Z0-9]{16}\b
+    | \bxox[abposr]-[A-Za-z0-9-]{10,}
+    | \bAIza[0-9A-Za-z_-]{35}
+    | \beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
+    | (?i:\b[a-z_]*(?:api_?key|token|secret|passw(?:or)?d)[a-z_]*\b\s*[:=]\s*['"]?[^\s'"]{8,})
+    """
+)
 
 
 def is_secret_file(name):
@@ -346,6 +359,17 @@ def secret_output_reason(command, output=""):
             return f"command references secret environment variable '{name}'"
     if _PRIVATE_KEY_RX.search(str(output or "")):
         return "output contains a private key block"
+    return None
+
+
+def secret_text_reason(text):
+    """Why on-screen text (e.g. a UIA snapshot) must be withheld, or None:
+    a private key block or a credential-looking token. Textual, not airtight."""
+    text = str(text or "")
+    if _PRIVATE_KEY_RX.search(text):
+        return "contains a private key block"
+    if _SECRET_TOKEN_RX.search(text):
+        return "contains a credential-looking token"
     return None
 
 
