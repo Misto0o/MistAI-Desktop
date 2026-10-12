@@ -97,6 +97,8 @@ def test_agent_prompt_has_grounding_rules():
     # Keys before clicks in native apps; OCR/vision clicks are the last resort.
     assert "type_text / press_key / hotkey before any clicking" in system
     assert "click_on_text / click_nth (OCR+Vision) -- the last resort" in system
+    assert "not from web APIs called with run_command" in system
+    assert "Never ask the user for API keys, tokens or passwords" in system
 
 
 # -- read_screen_text vision prompt -------------------------------------------
