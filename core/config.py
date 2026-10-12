@@ -23,6 +23,11 @@ API_MODE = "backend"  # "direct_api" or "backend"
 # UI all read this; nothing hardcodes "mistral"/"cohere" anymore. Mistral's
 # free tier is currently disabled upstream (429s), so: cohere.
 AGENT_MODEL = "cohere"
+# Conversation layer (core/conversation.py): model and timeout of the
+# chat-or-task routing call (primary URL only, no fallback). Any failure
+# routes to the agent.
+CHAT_MODEL = AGENT_MODEL
+CHAT_TIMEOUT = 5
 
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]
 

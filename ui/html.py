@@ -434,10 +434,6 @@ async function send() {
     return;
   }
 
-  try {
-    await pywebview.api.minimize_window();
-  } catch(e) {}
-
   inp.value = '';
   setBusy(true);
   sendInFlight = true;

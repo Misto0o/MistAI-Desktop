@@ -21,7 +21,7 @@ pip install -r requirements.txt
 python -m playwright install firefox
 python assistant.py                      # run the app (entry point is assistant.py)
 
-python -m pytest -q                      # all tests (what CI runs; ~259 tests)
+python -m pytest -q                      # all tests (what CI runs; ~400+ tests)
 python -m pytest tests/test_planner_and_tools.py::test_name -q   # single test
 
 python -m compileall -q core ui tools assistant.py               # CI sanity check
@@ -40,9 +40,10 @@ $env:PLAYWRIGHT_BROWSERS_PATH = "0"; python -m PyInstaller MistAI.spec --clean -
 
 **Entry and UI.** `assistant.py` creates `core.api.Api` and passes it to pywebview as `js_api`. The UI is one HTML string in `ui/html.py` that calls `Api` methods from JS. `Api` (`core/api.py`, very large) wires every subsystem together: wake-word loop (Google STT), TTS, and all `_act_*` action handlers.
 
-**LLM backend.** All LLM calls go over HTTP to MistAI's own backend (`mist-ai.fly.dev` / `api.mistai.org`), not a provider SDK. `core/api_manager.py` picks the URL and fallback. `core/config.py` holds `AGENT_MODEL`, the single place the model is chosen. Vision uses Cohere directly (`core/vision.py`).
+**LLM backend.** All LLM calls go over HTTP to MistAI's own backend (`mist-ai.fly.dev` / `api.mistai.org`), not a provider SDK. `core/api_manager.py` picks the URL and fallback. `core/config.py` holds `AGENT_MODEL` (agent and planner) and `CHAT_MODEL` / `CHAT_TIMEOUT` (conversation router), the only places models are chosen. Vision uses Cohere directly (`core/vision.py`).
 
-**Request flow:** `Api.ask_mistai` → `PlanRunner` (`core/planner.py`) → `AgentLoop` (`core/agent.py`) → `Executor` (`core/executor.py`) → `Api._exec_sync` → `_act_*` handler.
+**Request flow:** `Api.ask_mistai` → conversation layer → `PlanRunner` (`core/planner.py`) → `AgentLoop` (`core/agent.py`) → `Executor` (`core/executor.py`) → `Api._exec_sync` → `_act_*` handler.
+- `ask_mistai` handles typed stop, "resume X" and the fixed filler replies first. Then, unless an agent is busy or a resume matched, `core/conversation.py` `try_chat` makes one small `planner._llm` call that returns `{"route": "chat"|"task", "reply"}`. A chat reply skips the run gate, minimize, vision and planning, is stored with `memory.add_conversation`, and is spoken only in voice mode. Everything else goes to the agent unchanged. It logs `[Conversation] route=chat|task in X.XXs` (read router latency there).
 - `make_plan` sends simple goals (and questions) straight to the agent with no planning call. Other goals become a small DAG of phases (`PlanNode`). A failed phase blocks only its descendants. Progress persists via `core/task_store.py`, so tasks resume by name ("Mist, resume X").
 - `AgentLoop._loop` runs one phase step by step. The model returns one JSON object per step (`{"action", "parameter", "speech", "thinking"}`) parsed by `_parse_cmd` (malformed JSON → `parse_retry`). `_build_system` builds the prompt: action menu, `WORKSPACE` context, screen context, known folders, recent conversation.
 - `Executor.run` is the single execution path: it reroutes UIA actions to OCR when a browser has focus, calls `_exec_sync`, waits the tool's settle time, runs the ground-truth verifier, scores confidence, and escalates to `fallback_tools`. Handlers report detail text via `api.last_result_text`.
@@ -86,6 +87,8 @@ python tools/run_scenarios.py --compare --allow-ui-input --yes   # REAL run (see
 
 ## Gotchas
 
+- The conversation router fails closed: any error, timeout, unparsable or doubtful reply routes to the agent. It calls `planner._llm` through the module attribute, so the `--stub` fence covers it (in stub runs every turn logs `route=task`). Its routing rules live only in `conversation._PROMPT`, pinned by `tests/test_conversation_layer.py`; there are no phrase lists.
+- Only the Python `minimize_window()` in `ask_mistai` (agent path, after the run gate) minimizes MistAI. JS `send()` no longer does, so chat, filler and busy replies stay visible.
 - `handtracking/` was moved out of the repo (separate MediaPipe experiment). The app doesn't use it.
 - Tesseract (`MistAI_OCREngine/`, ~83 MB) is tracked on purpose because `MistAI.spec` bundles it; moving it to a CI download step is a separate task.
 - Windows 11 Notepad restores unsaved tabs from its `TabState` folder; a "fresh" Notepad may not be empty.

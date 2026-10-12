@@ -39,7 +39,7 @@ from .config import (
     secret_output_reason,
     strip_wake_prefix,
 )
-from . import file_search
+from . import conversation, file_search
 from .events import EventBus
 from .executor import Executor
 from .live_state import LiveStateTracker, window_belongs_to
@@ -887,6 +887,23 @@ class Api:
                     "steps": 0,
                     "error": "",
                 }
+
+            # -- Conversation layer: pure chat gets one small model call, with
+            # no gate, screen, planning or tools. Any doubt or failure falls
+            # through to the agent unchanged. Skipped while an agent is busy.
+            if not resume_rec and not self._agent_lock.locked():
+                reply = conversation.try_chat(self, message, gender)
+                if reply:
+                    self.memory.add_conversation("user", message)
+                    self.memory.add_conversation("assistant", reply)
+                    if input_mode == "voice":
+                        self.speak(reply)
+                    return {
+                        "success": True,
+                        "command": {"action": "done", "parameter": "", "speech": reply},
+                        "steps": 0,
+                        "error": "",
+                    }
 
             # -- Run gate: refuse (don't queue) if a loop is already driving.
             # Take the state lock while changing the stop flag/generation so a

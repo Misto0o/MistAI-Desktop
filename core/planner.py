@@ -153,14 +153,14 @@ class Plan:
 # ── Planning (LLM call + validation) ─────────────────────────────────────────
 
 
-def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT):
+def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback=True):
     headers = api.api_manager.get_headers()
     urls = tuple(
         dict.fromkeys(
             u
             for u in (
                 api.api_manager.get_api_url(),
-                api.api_manager.get_fallback_url(),
+                api.api_manager.get_fallback_url() if fallback else None,
             )
             if u
         )
@@ -176,7 +176,7 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT):
             if r.ok:
                 return r.json().get("response", "")
         except Exception as e:
-            print(f"[Planner] LLM call via {url} failed: {e}")
+            print(f"[{label}] LLM call via {url} failed: {e}")
     return ""
 
 
