@@ -65,7 +65,7 @@ def main():
         height=700,
         resizable=True,
     )
-    api.window = window
+    api._window = window
     def _cleanup():
         # Signal all background loops to stop before interpreter teardown
         try:

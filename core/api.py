@@ -177,7 +177,7 @@ class Api:
         self._conversation_lock = threading.Lock()
         self.captions_enabled = False
         self.caption_window = None
-        self.window = None
+        self._window = None
         stats = self.memory.get_stats()
         print(
             f"[MistAI] Ready - {stats['conversations']} conversations in memory "
@@ -263,8 +263,8 @@ class Api:
 
     def minimize_window(self):
         try:
-            if self.window:
-                self.window.minimize()
+            if self._window:
+                self._window.minimize()
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -650,8 +650,8 @@ class Api:
             self._answer_event.clear()
             self._awaiting_text_answer.set()
         try:
-            if self.window:
-                self.window.restore()
+            if self._window:
+                self._window.restore()
             self._notify_js(f'showAskUserPrompt("{esc(question)}")')
             got = self._answer_event.wait(timeout=timeout)
             with self._answer_lock:
@@ -2531,8 +2531,8 @@ class Api:
 
     def _notify_js(self, js):
         try:
-            if self.window:
-                self.window.evaluate_js(js)
+            if self._window:
+                self._window.evaluate_js(js)
         except Exception:
             pass
 
