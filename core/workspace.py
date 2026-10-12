@@ -74,19 +74,26 @@ class Workspace:
         bus.subscribe(events.FILE_MODIFIED, self._on_file_touch)
         bus.subscribe(events.FILE_DELETED, self._on_file_gone)
 
+    def start_request(self):
+        """Forget the previous request's run (last command, action history,
+        phase outputs) so a new user request isn't planned around it. The
+        project, known files, file snapshots and browser URL are kept."""
+        with self._lock:
+            self.terminal = {"last_command": "", "last_output": "", "ok": None}
+            self.task_outputs.clear()
+            self.execution_history.clear()
+
     def reset_task_state(self):
         """Forget everything learned from earlier tasks (project, files,
         last command, history, snapshots). Live window/clipboard state is
         kept: watchers keep it current. Used between independent sessions,
         e.g. by the scenario harness."""
+        self.start_request()
         with self._lock:
             self.current_project = None
             self.project_root = None
             self.known_files.clear()
             self.browser = {"last_url": ""}
-            self.terminal = {"last_command": "", "last_output": "", "ok": None}
-            self.task_outputs.clear()
-            self.execution_history.clear()
             self.file_snapshots.clear()
 
     # -- Event handlers ------------------------------------------------------

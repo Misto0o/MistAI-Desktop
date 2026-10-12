@@ -924,6 +924,8 @@ class Api:
                 self._trusted_project_roots = set()
                 needs_workspace = self._task_needs_project_workspace(message)
                 workspace = getattr(self, "workspace", None)
+                if workspace is not None:
+                    workspace.start_request()
                 explicit_workspace = self._explicit_workspace_path(message)
                 established = (
                     self._establish_workspace_for_task(message)

@@ -273,3 +273,48 @@ def test_resume_never_calls_the_router(monkeypatch):
     assert api.rec["router"] == []
     assert [kind for kind, _ in api.agent.runs] == ["resume"]
     _finish(api)
+
+
+# -- Workspace state across requests -------------------------------------------
+
+
+class _Bus:
+    def subscribe(self, *_args):
+        return lambda: None
+
+    def publish(self, *_args):
+        pass
+
+
+def _api_after_failed_command(monkeypatch, tmp_path, llm_reply):
+    from core.workspace import Workspace
+
+    api = _routing_api(monkeypatch, llm_reply)
+    api.workspace = Workspace(_Bus())
+    api.workspace.set_project("site", str(tmp_path))
+    api.workspace.record_execution(
+        "run_command", "Invoke-RestMethod https://api.example.test/weather",
+        False, 0.0, "401 Unauthorized")
+    assert "Last command (FAILED)" in api.workspace.context_block()
+    return api
+
+
+def test_new_agent_request_forgets_the_previous_run_but_keeps_the_project(
+        monkeypatch, tmp_path):
+    api = _api_after_failed_command(monkeypatch, tmp_path, '{"route": "task", "reply": ""}')
+    Api.ask_mistai(api, "hey its too loud")
+
+    context = api.workspace.context_block()
+    assert [kind for kind, _ in api.agent.runs] == ["run"]
+    assert "Last command" not in context and "Recent actions" not in context
+    assert "Project: site" in context and api.workspace.project_root == str(tmp_path)
+    _finish(api)
+
+
+def test_chat_routed_turn_leaves_the_workspace_alone(monkeypatch, tmp_path):
+    api = _api_after_failed_command(monkeypatch, tmp_path, CHAT)
+    Api.ask_mistai(api, "tell me a joke")
+
+    context = api.workspace.context_block()
+    assert api.agent.runs == []
+    assert "Last command (FAILED)" in context and "Recent actions" in context
