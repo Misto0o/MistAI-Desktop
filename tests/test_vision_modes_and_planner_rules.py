@@ -253,7 +253,7 @@ def test_withheld_output_tells_the_model_not_to_show_or_offer_it(monkeypatch, tm
     "is Edge open?", "Are there any PDFs in my Downloads?", "what time is it in Tokyo",
     "Which app is using the most memory?", "how many files are on my desktop",
     "does my Documents folder have a resume", "do I have Python installed",
-    "can you see Spotify running", "where is my latest download",
+    "can you see Spotify running", "where is my latest download", "whats the weather?",
 ])
 def test_question_goals_skip_the_planning_llm(monkeypatch, goal):
     def no_llm(*_a, **_k):

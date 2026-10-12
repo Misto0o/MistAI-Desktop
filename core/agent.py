@@ -256,11 +256,16 @@ class AgentLoop:
         return [n for n in dict.fromkeys(cls._NUMBER_RX.findall(str(speech or "")))
                 if n.replace(",", "") not in have]
 
-    def _done_reminder(self, route_notes, last_read, unseen=(), unsubmitted=False):
+    def _done_reminder(self, route_notes, last_read, unseen=(), unsubmitted=False,
+                       empty_answer=False):
         """The one observation shown at the first 'done' of a phase whose
         draft speech states values its last read does not show, whose last
-        read followed unsubmitted typing, or whose route did not go as asked."""
+        read followed unsubmitted typing, whose route did not go as asked,
+        or whose speech is empty although the user asked a question."""
         parts = ["Before finishing, check your final speech against what actually happened."]
+        if empty_answer:
+            parts.append("Your speech is empty but the user asked a question: answer it "
+                         "from what you read, or say you couldn't find it.")
         if route_notes:
             parts.append(
                 "These steps did not go as asked: " + "; ".join(route_notes[-4:])
@@ -907,18 +912,23 @@ class AgentLoop:
             # --- DONE-TIME CHECK (once per phase) ------------------------------
             # One extra model turn, only when the draft speech states numbers
             # the last read does not show, when that read followed typing that
-            # was never submitted, or when input/route did not go as asked.
+            # was never submitted, when input/route did not go as asked, or
+            # when a question is finished with no spoken answer.
             # A speech that matches its read costs nothing extra.
             unseen = self._unseen_numbers(speech, last_read) if last_read is not None else []
+            empty_answer = action == "done" and not str(speech or "").strip() and (
+                planner._is_question_goal(task) or str(task).rstrip().endswith("?")
+            )
             if (
                 action == "done"
                 and not done_reminded
-                and (route_notes or unseen or (last_read is not None and read_after_unsubmitted))
+                and (route_notes or unseen or empty_answer
+                     or (last_read is not None and read_after_unsubmitted))
                 and steps_taken < self.MAX_STEPS
             ):
                 done_reminded = True
                 reminder = self._done_reminder(route_notes, last_read, unseen,
-                                               read_after_unsubmitted)
+                                               read_after_unsubmitted, empty_answer)
                 print(f"  [DoneCheck] {reminder}")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append({"role": "user", "content": f"[OBSERVATION] {reminder}"})
@@ -1472,8 +1482,9 @@ class AgentLoop:
             use browser_get_text to see the page's actual current content before retrying
             blind, rather than guessing at a different click.
          - "done" is the ONLY way to end a task. There is no "none" action -- if you
-                believe there's nothing left to do, use "done" with an empty or brief
-                speech, not any other action name.
+                believe there's nothing left to do, use "done", not any other action name.
+                Its speech is the only thing the user hears or sees: when the task asked
+                for information it must contain the answer; leave it empty only for a pure action.
 
             MESSAGING A SPECIFIC PERSON -- REQUIRED FLOW (Do not skip any steps):
 

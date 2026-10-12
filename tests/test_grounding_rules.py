@@ -98,6 +98,8 @@ def test_agent_prompt_has_grounding_rules():
     assert "type_text / press_key / hotkey before any clicking" in system
     assert "click_on_text / click_nth (OCR+Vision) -- the last resort" in system
     assert "not from web APIs called with run_command" in system
+    assert "Its speech is the only thing the user hears or sees" in system
+    assert "it must contain the answer; leave it empty only for a pure action" in system
     assert "Never ask the user for API keys, tokens or passwords" in system
 
 

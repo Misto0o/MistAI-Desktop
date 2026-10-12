@@ -280,7 +280,7 @@ def _is_browser_task_goal(goal):
 # Questions are answered inside one agent phase; planning them only adds a
 # model round-trip (and invites invented deliverables like "return true/false").
 _QUESTION_RX = re.compile(
-    r"^(is|are|what|which|how many|does|do|can|where)\b", re.I
+    r"^(is|are|what|whats|which|how many|does|do|can|where)\b", re.I
 )
 
 

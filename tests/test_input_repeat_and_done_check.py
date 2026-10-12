@@ -17,7 +17,7 @@ def _result(action, detail="", success=True, escalated_from=""):
     )
 
 
-def _run(monkeypatch, replies, results=None, foreground=None):
+def _run(monkeypatch, replies, results=None, foreground=None, task="task"):
     """Run one phase. ``results`` maps action -> ExecutionResult-like (or a
     callable(param)); ``foreground`` is an iterator of foreground keys."""
     results = results or {}
@@ -59,7 +59,7 @@ def _run(monkeypatch, replies, results=None, foreground=None):
     monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
     fg = foreground or iter(lambda: (1, "Calculator"), None)
     monkeypatch.setattr(loop, "_current_foreground_key", lambda: next(fg))
-    out = loop._loop("task", "m", "none", "text", None)
+    out = loop._loop(task, "m", "none", "text", None)
     observations = [m["content"] for msgs in sent[1:] for m in msgs[-2:-1]]
     return out, api, calls, observations, spoken
 
@@ -226,6 +226,37 @@ def test_the_second_done_always_finishes(monkeypatch):
     ], results={"read_screen_text": _result("read_screen_text", "Display is 23")})
     assert out["speech"] == "It is 7."
     assert sum("Before finishing" in o for o in obs) == 1
+
+
+@pytest.mark.parametrize("task", ["whats the weather?", "is Edge open"])
+def test_question_finished_with_empty_speech_gets_one_reminder(monkeypatch, task):
+    out, _, _, obs, spoken = _run(monkeypatch, [
+        {"action": "browser_get_text", "parameter": ""},
+        {"action": "done", "speech": ""},
+        {"action": "done", "speech": "It is 18 degrees and sunny."},
+    ], results={"browser_get_text": _result("browser_get_text", "18 degrees, sunny")},
+        task=task)
+    assert out["success"] and spoken == ["It is 18 degrees and sunny."]
+    assert sum("Before finishing" in o for o in obs) == 1
+    assert "Your speech is empty but the user asked a question" in obs[-1]
+
+
+def test_question_second_empty_done_still_finishes(monkeypatch):
+    out, _, _, obs, spoken = _run(monkeypatch, [
+        {"action": "done", "speech": ""},
+        {"action": "done", "speech": ""},
+    ], task="whats the weather?")
+    assert out["success"] and out["speech"] == "" and spoken == []
+    assert sum("Before finishing" in o for o in obs) == 1
+
+
+def test_non_question_empty_done_finishes_without_a_reminder(monkeypatch):
+    out, _, _, obs, _ = _run(monkeypatch, [
+        {"action": "browser_get_text", "parameter": ""},
+        {"action": "done", "speech": ""},
+    ], task="open notepad")
+    assert out["success"] and out["speech"] == ""
+    assert not any("Before finishing" in o for o in obs)
 
 
 def test_off_target_input_is_named_in_the_check(monkeypatch):
