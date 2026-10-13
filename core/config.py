@@ -31,6 +31,17 @@ CHAT_TIMEOUT = 5
 
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]
 
+# Wake-loop energy threshold (core/wake_calibration.py). The threshold is
+# fixed between calibrations. A calibration outside [MIN, MAX] is clamped and
+# retried once. MIN keeps hum from opening clips; MAX only catches a
+# calibration taken over speech or music. Real rooms have calibrated at 217
+# and 668, so MAX leaves headroom above that.
+WAKE_ENERGY_MIN = 60
+WAKE_ENERGY_MAX = 1500
+WAKE_RECAL_IDLE_S = 90         # re-calibrate after this long with no clip
+WAKE_RECAL_AFTER_FAILURES = 3  # ... or after this many untranscribable clips in a row
+WAKE_RECAL_RETRY_S = 30        # one retry this long after an out-of-band result
+
 # Things Google STT actually returns when someone says "mist" / "mist ai".
 # The common English words ``miss`` and ``missed`` are deliberately NOT in
 # this list: even at the start of an utterance, "missed the bus" is not an
@@ -198,6 +209,16 @@ def lazy_vision_mode():
     if os.environ.get("MISTAI_LAZY_VISION", "").strip() == "2":
         return 2
     return 1 if env_flag("MISTAI_LAZY_VISION", False) else 0
+
+
+def wake_clips_enabled():
+    """MISTAI_WAKE_SAVE_CLIPS=1: the wake loop saves every clip it hears (WAV
+    + JSON sidecar) to wake_clip_dir() for offline tuning. Off by default."""
+    return env_flag("MISTAI_WAKE_SAVE_CLIPS", False)
+
+
+def wake_clip_dir():
+    return os.path.join(os.path.expanduser("~"), "MistAI", "logs", "wake-clips")
 
 
 

@@ -32,6 +32,8 @@ from .config import (
     WAKE_WORDS,
     esc,
     fuzzy_wake,
+    wake_clip_dir,
+    wake_clips_enabled,
     is_secret_file,
     is_self_process,
     normalize_process_name,
@@ -50,6 +52,7 @@ from .tools import ToolRegistry
 from .tts import NeuralTTS
 from .uia_nav import EnhancedUIANavigator
 from .vision import CohereVision
+from .wake_calibration import WakeCalibration
 from .watchers import FileWatcher, StateWatcher
 from .workspace import Workspace
 
@@ -295,8 +298,10 @@ class Api:
 
         Toggling wake listening must never spawn a second listener while the
         old one is inside a microphone read. The worker stays dormant while
-        disabled and is reused on the next enable, so it also calibrates once
-        per lifetime instead of once per rapid UI toggle.
+        disabled and is reused on the next enable, so it keeps its calibration
+        across rapid UI toggles. It re-calibrates on its own schedule (idle,
+        repeated untranscribable clips, out-of-band threshold; see
+        core/wake_calibration.py).
         """
         with self._wake_lock:
             self.wake_word_active = True
@@ -331,21 +336,32 @@ class Api:
 
     def _google_wake_loop(self):
         rec = sr.Recognizer()
-        rec.dynamic_energy_threshold = True
+        # Fixed threshold between calibrations. With dynamic adjustment the
+        # threshold climbed during a loud "hey" until a quiet "mist" counted
+        # as silence and was cut off (real logs: 'hey', 'hey miss').
+        rec.dynamic_energy_threshold = False
         rec.pause_threshold = 0.8
+        # Keep all trailing below-threshold audio up to the pause (the library
+        # trims anything past non_speaking_duration) and a matching pre-roll.
+        rec.non_speaking_duration = rec.pause_threshold
+        cal = WakeCalibration()
         print(f"[Wake] Google listening for: {WAKE_WORDS}")
+        save_clips = wake_clips_enabled()
+        if save_clips:
+            print(f"[Wake] MISTAI_WAKE_SAVE_CLIPS=1: saving raw mic clips to "
+                  f"{wake_clip_dir()} (room audio; skim before sharing)")
 
-        calibrated = False
         while not self._wake_shutdown.is_set():
             # While off, own no microphone resource. A later enable wakes this
             # same worker rather than racing a replacement worker into life.
             if not self._wake_enabled.wait(timeout=0.2):
                 continue
 
-            # Calibrate once, never over TTS, and under the same mic lock used
-            # by ask_user/manual capture. This prevents two PortAudio streams
-            # from opening concurrently.
-            if not calibrated:
+            # Calibrate when due, never over TTS, and under the same mic lock
+            # used by ask_user/manual capture. This prevents two PortAudio
+            # streams from opening concurrently.
+            reason = cal.due(time.monotonic())
+            if reason:
                 if self.tts.speaking and not self._wait_for_tts(timeout=5):
                     continue
                 if not self._wake_enabled.is_set():
@@ -357,14 +373,17 @@ class Api:
                     if self._wake_enabled.is_set():
                         with self.microphone as src:
                             rec.adjust_for_ambient_noise(src, duration=1.0)
+                        measured = rec.energy_threshold
+                        rec.energy_threshold = cal.calibrated(measured, time.monotonic())
+                        clamped = (f" (measured {measured:.0f}, clamped to band)"
+                                   if rec.energy_threshold != measured else "")
                         print(
-                            f"[Wake] Calibrated energy threshold: "
-                            f"{rec.energy_threshold:.0f}"
+                            f"[Wake] Calibrated energy threshold ({reason}): "
+                            f"{rec.energy_threshold:.0f}{clamped}"
                         )
-                        calibrated = True
                 except Exception as e:
                     print(f"[Wake] Calibration failed: {e}")
-                    calibrated = True  # avoid a noisy failure loop
+                    cal.failed(time.monotonic())  # retry when idle, not in a loop
                 finally:
                     self._mic_lock.release()
                 continue
@@ -391,14 +410,26 @@ class Api:
             if audio is None or self.tts.speaking or not self._wake_enabled.is_set():
                 continue
 
+            # Threshold and clip length in the log, so it shows why a word was
+            # cut off.
+            threshold = rec.energy_threshold
+            clip_s = self._clip_seconds(audio)
+            stats = f"(threshold {threshold:.0f}, {clip_s:.1f}s)"
+            text = error = None
             try:
                 text = rec.recognize_google(audio).lower()
-                print(f"[Wake] Heard: '{text}'")
+                print(f"[Wake] Heard: '{text}' {stats}")
+                cal.heard(True, time.monotonic())
             except sr.UnknownValueError:
-                print("[Wake] Heard something but couldn't transcribe it")
-                continue
+                print(f"[Wake] Heard something but couldn't transcribe it {stats}")
+                cal.heard(False, time.monotonic())
             except Exception as e:
+                error = type(e).__name__
                 print(f"[Wake] {e}")
+                cal.heard(None, time.monotonic())
+            if save_clips:
+                self._save_wake_clip(audio, text, threshold, clip_s, error=error)
+            if text is None:
                 continue
 
             # -- A task is running: the ONLY thing we listen for is "stop".
@@ -441,6 +472,36 @@ class Api:
             # Give the conversation a moment to take the mic lock (its own
             # listen) so we don't grab the same utterance twice.
             time.sleep(0.3)
+
+    @staticmethod
+    def _clip_seconds(audio):
+        bytes_per_s = audio.sample_rate * audio.sample_width
+        return len(audio.frame_data) / bytes_per_s if bytes_per_s else 0.0
+
+    @staticmethod
+    def _save_wake_clip(audio, transcript, threshold, clip_s, error=None,
+                        directory=None):
+        """Write one wake-loop clip as <stamp>.wav plus <stamp>.json for the
+        wake-word harness. Never raises: a full disk must not stop listening."""
+        try:
+            directory = directory or wake_clip_dir()
+            os.makedirs(directory, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            with open(os.path.join(directory, stamp + ".wav"), "wb") as f:
+                f.write(audio.get_wav_data())
+            meta = {
+                "wav": stamp + ".wav",
+                "transcript": transcript if transcript is not None else "untranscribed",
+                "energy_threshold": round(float(threshold), 1),
+                "clip_seconds": round(clip_s, 2),
+            }
+            if error:
+                meta["error"] = error
+            with open(os.path.join(directory, stamp + ".json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as e:
+            print(f"[Wake] Could not save clip: {e}")
 
     def _detect_gender_address(self, text):
         """Scan heard speech for an explicit 'sir'/'ma'am' address and, if
