@@ -19,6 +19,8 @@ otherwise the target derives from the action parameter.
 
 import os
 
+from .config import normalize_window_title
+
 
 def _resolve(api, path):
     try:
@@ -71,7 +73,11 @@ def _window_focused(api, action, param, arg):
         return None, "no target window"
     try:
         fw = api.live.snapshot.get("foreground_window", "").lower()
-        ok = bool(fw) and (target in fw or fw in target)
+        # Compare normalized forms too: a title quoted back with '-' for its
+        # em dash must not contradict a switch that actually worked.
+        t, f = normalize_window_title(target), normalize_window_title(fw)
+        ok = bool(fw) and (target in fw or fw in target
+                           or bool(f and t) and (t in f or f in t))
         return (ok, f"foreground is '{fw[:40]}'")
     except Exception as e:
         return None, f"verify error: {e}"

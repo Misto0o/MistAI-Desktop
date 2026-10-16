@@ -12,27 +12,59 @@ PROCS = {1: "ApplicationFrameHost.exe", 2: "CalculatorApp.exe", 3: "firefox.exe"
          4: "Notepad.exe", 5: "Code.exe"}
 
 
-def _fake_desktop(monkeypatch, windows, foreground=None):
-    """windows: {hwnd: (pid, class, title, [child pids])}."""
+class _Refused(Exception):
+    """Stands in for pywintypes.error: pywin32 raises when Windows refuses."""
+
+
+def _fake_desktop(monkeypatch, windows, foreground=None, refuse_focus=False,
+                  iconic=(), parents=None, bring_to_top_raises=False):
+    """windows: {hwnd: (pid, class, title, [child pids])}. Returns the fake's
+    state: the current foreground ("fg") and the calls made ("calls").
+    A window's thread id is 1000 + hwnd; MistAI's own thread id is 1.
+    parents: {pid: [parent pids]} for psutil.Process(pid).parents()."""
+    state = {"fg": foreground, "calls": []}
+
+    def set_foreground(h):
+        state["calls"].append(("SetForegroundWindow", h))
+        if refuse_focus:
+            raise _Refused(0, "SetForegroundWindow", "No error message is available")
+        state["fg"] = h
+
+    def bring_to_top(h):
+        state["calls"].append(("BringWindowToTop", h))
+        if bring_to_top_raises:
+            raise _Refused(5, "BringWindowToTop", "Access is denied.")
+
     win32gui = SimpleNamespace(
         IsWindowVisible=lambda h: True,
         GetWindowText=lambda h: windows[h][2],
         GetClassName=lambda h: windows[h][1],
-        GetForegroundWindow=lambda: foreground,
+        GetForegroundWindow=lambda: state["fg"],
         EnumWindows=lambda cb, extra: [cb(h, extra) for h in windows],
         EnumChildWindows=lambda h, cb, extra: [cb(("child", h, p), extra) for p in windows[h][3]],
-        ShowWindow=lambda *a: None,
-        SetForegroundWindow=lambda h: None,
+        ShowWindow=lambda h, cmd: state["calls"].append(("ShowWindow", h, cmd)),
+        SetForegroundWindow=set_foreground,
+        IsIconic=lambda h: h in iconic,
+        BringWindowToTop=bring_to_top,
     )
 
     def thread_pid(h):
-        return (0, h[2]) if isinstance(h, tuple) else (0, windows[h][0])
+        return (0, h[2]) if isinstance(h, tuple) else (1000 + h, windows[h][0])
+
+    def attach(own, other, on):
+        state["calls"].append(("AttachThreadInput", own, other, on))
 
     monkeypatch.setitem(sys.modules, "win32gui", win32gui)
     monkeypatch.setitem(sys.modules, "win32process",
-                        SimpleNamespace(GetWindowThreadProcessId=thread_pid))
-    monkeypatch.setattr("core.api.psutil.Process",
-                        lambda pid: SimpleNamespace(name=lambda: PROCS[pid]))
+                        SimpleNamespace(GetWindowThreadProcessId=thread_pid,
+                                        AttachThreadInput=attach))
+    monkeypatch.setitem(sys.modules, "win32api",
+                        SimpleNamespace(GetCurrentThreadId=lambda: 1))
+    monkeypatch.setattr("core.api.psutil.Process", lambda pid: SimpleNamespace(
+        name=lambda: PROCS[pid],
+        parents=lambda: [SimpleNamespace(pid=p) for p in (parents or {}).get(pid, [])],
+    ))
+    return state
 
 
 # -- UWP window ownership -------------------------------------------------------------

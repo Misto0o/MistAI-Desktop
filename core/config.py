@@ -116,6 +116,18 @@ def fuzzy_wake(text, anchored=False):
     return None, None
 
 
+_TITLE_DASHES = str.maketrans({"—": "-", "–": "-"})
+
+
+def normalize_window_title(text):
+    """A window title for loose comparison: em/en dashes as '-', spaces
+    collapsed, trailing separators trimmed. A title quoted back after being
+    cut ('Page title —' -> 'Page title -') then still matches the real
+    'Page title — Mozilla Firefox'."""
+    t = " ".join(str(text or "").translate(_TITLE_DASHES).split())
+    return t.rstrip(" -|:·•").strip()
+
+
 def strip_wake_prefix(command):
     """A user who repeats 'hey mist ...' because the assistant was slow ends
     up with the wake phrase inside the COMMAND. Strip it (leading only) so

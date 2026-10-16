@@ -1319,7 +1319,7 @@ class Api:
             elif action == "window_list":
                 return self._act_window_list()
             elif action == "window_activate":
-                return self._act_window_op("activate_window", param)
+                return self._act_window_activate(param)
             elif action == "window_close":
                 return self._act_window_op("close_window", param)
             elif action == "window_maximize":
@@ -1466,10 +1466,15 @@ class Api:
     def _find_hwnd_by_process_name(self, app_lower):
         """Find a visible window belonging to the app (_window_belongs_to:
         process identity, plus the UWP frame-host case)."""
+        matches = self._find_hwnds_by_process_name(app_lower)
+        return matches[0] if matches else None
+
+    def _find_hwnds_by_process_name(self, app_lower):
+        """Every visible, titled window of the app, in z-order."""
         try:
             import win32gui
         except ImportError:
-            return None
+            return []
 
         matches = []
 
@@ -1486,7 +1491,113 @@ class Api:
             return True
 
         win32gui.EnumWindows(callback, None)
-        return matches[0] if matches else None
+        return matches
+
+    def _focus_hwnd(self, hwnd):
+        """Bring a window to the front. Returns (ok, reason); reason says why
+        Windows refused. pywin32's SetForegroundWindow RAISES when Windows
+        refuses (foreground lock), so every try is caught and every try is
+        checked against the real foreground window."""
+        import win32gui
+
+        def in_front():
+            try:
+                return win32gui.GetForegroundWindow() == hwnd
+            except Exception:
+                return False
+
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE, only if minimized
+        except Exception:
+            pass
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        time.sleep(0.6)
+        if in_front():
+            return True, ""
+        # Share the foreground thread's input state, which Windows accepts
+        # as permission to change the foreground.
+        self._attach_and_focus(hwnd)
+        time.sleep(0.3)
+        if in_front():
+            return True, ""
+        # A synthetic key press also grants the permission; retry once.
+        try:
+            pyautogui.press("alt")
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        time.sleep(0.4)
+        if in_front():
+            return True, ""
+        return False, self._focus_refusal_reason()
+
+    @staticmethod
+    def _attach_and_focus(hwnd):
+        try:
+            import win32api
+            import win32gui
+            import win32process
+        except ImportError:
+            return
+        try:
+            fg = win32gui.GetForegroundWindow()
+            fg_thread = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+            own_thread = win32api.GetCurrentThreadId()
+        except Exception:
+            return
+        attached = False
+        try:
+            if fg_thread and fg_thread != own_thread:
+                win32process.AttachThreadInput(own_thread, fg_thread, True)
+                attached = True
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        finally:
+            if attached:
+                try:
+                    win32process.AttachThreadInput(own_thread, fg_thread, False)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _focus_refusal_reason():
+        """Which window kept the foreground (process name only, no title)."""
+        try:
+            import win32gui
+            import win32process
+
+            fg = win32gui.GetForegroundWindow()
+            if not fg:
+                return "Windows refused focus (no window is in front)"
+            pid = win32process.GetWindowThreadProcessId(fg)[1]
+            try:
+                name = psutil.Process(pid).name()
+            except Exception:
+                name = "an unknown process"
+            whose = "MistAI's own window" if is_self_process(name, pid) else "not MistAI"
+            state = "minimized" if win32gui.IsIconic(fg) else "not minimized"
+            return (f"Windows refused focus; the window in front belongs to "
+                    f"{name} ({whose}, {state})")
+        except Exception as e:
+            return f"Windows refused focus ({type(e).__name__} reading the window in front)"
+
+    @staticmethod
+    def _is_own_browser_window(hwnd):
+        """Does this window's process descend from MistAI (its Playwright
+        browser runs as a child of the Playwright driver MistAI started)?"""
+        try:
+            import win32process
+
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            return any(p.pid == os.getpid() for p in psutil.Process(pid).parents())
+        except Exception:
+            return False
 
     def app_window_state(self, app_name):
         """What the USER would say about this app right now.
@@ -1551,29 +1662,25 @@ class Api:
         app_lower = str(app_name or "").lower().strip()
         if len(self._normalize_app_name(app_lower)) < 2:
             print("[SwitchApp] Refusing an empty or one-character app target")
+            self.last_result_text = "switch_app needs a specific app name."
             return False
+        hwnds, title, note, refused = [], "", "", ""
         try:
             import win32gui
 
-            hwnd = self._find_hwnd_by_process_name(app_lower)
-            if hwnd:
-                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE -- un-minimizes if needed
-                win32gui.SetForegroundWindow(hwnd)
-                time.sleep(0.6)
-                if win32gui.GetForegroundWindow() == hwnd:
+            hwnds = self._find_hwnds_by_process_name(app_lower)
+            if hwnds:
+                hwnd = hwnds[0]
+                title = (win32gui.GetWindowText(hwnd) or "")[:40]
+                note = self._switch_match_note(hwnds)
+                ok, refused = self._focus_hwnd(hwnd)
+                if ok:
+                    self.last_result_text = (
+                        f"Switched to '{app_name}' (window '{title}'){note}"
+                    )
                     return True
-                # Windows refuses SetForegroundWindow from a process that
-                # doesn't own the foreground (a common, silent failure).
-                # A synthetic key press grants the permission; retry once.
-                try:
-                    pyautogui.press("alt")
-                    win32gui.SetForegroundWindow(hwnd)
-                    time.sleep(0.4)
-                    if win32gui.GetForegroundWindow() == hwnd:
-                        return True
-                except Exception:
-                    pass
-                print(f"[SwitchApp] Window for '{app_name}' exists but refused focus")
+                print(f"[SwitchApp] Window for '{app_name}' exists but refused focus: "
+                      f"{refused}")
         except Exception as e:
             print(f"[SwitchApp] win32gui tier failed: {e}")
 
@@ -1595,12 +1702,33 @@ class Api:
             # AppActivate matches title text ("code" -> "Codex ..."), so only
             # accept it if the focused window's PROCESS is the requested app.
             if self._foreground_process_matches(app_name):
+                self.last_result_text = f"Switched to '{app_name}' (via AppActivate){note}"
                 return True
         except Exception as e:
             print(f"[SwitchApp] PowerShell AppActivate failed: {e}")
 
-        print(f"[SwitchApp] No window found for process '{app_name}'")
+        if hwnds:
+            self.last_result_text = (
+                f"'{app_name}' has a window ('{title}'){note}, but it could not be "
+                f"brought to the front: {refused or 'Windows refused focus'}"
+            )
+        else:
+            print(f"[SwitchApp] No window found for process '{app_name}'")
+            self.last_result_text = f"No window found for '{app_name}'"
         return False
+
+    def _switch_match_note(self, hwnds):
+        """How many windows matched, and whether the chosen one (or another)
+        is MistAI's own automation browser. Reported, never excluded."""
+        parts = []
+        if len(hwnds) > 1:
+            parts.append(f"1 of {len(hwnds)} matching windows")
+        own = [self._is_own_browser_window(h) for h in hwnds]
+        if own[0]:
+            parts.append("this window is MistAI's own browser, driven by browser_* actions")
+        elif any(own[1:]):
+            parts.append("another matching window is MistAI's own browser")
+        return f" [{'; '.join(parts)}]" if parts else ""
     
     def _act_browser_import_cookies(self, param):
         if not param:
@@ -3111,6 +3239,35 @@ class Api:
         )
         self.speak(self.last_result_text)
         return ok
+
+    def _act_window_activate(self, param):
+        """Find the window by title first, then focus it, so "not found" and
+        "Windows refused focus" are reported as the different facts they are.
+        One retry compares normalized titles (dashes, trailing separators)."""
+        if not self.enhanced_available:
+            self.last_result_text = "Window management module isn't available."
+            self.speak(self.last_result_text)
+            return False
+        win = None
+        try:
+            win = (self.window_mgr.find_window(param)
+                   or self.window_mgr.find_window_normalized(param))
+        except Exception as e:
+            print(f"[WindowActivate] lookup failed: {e}")
+        hwnd = getattr(win, "_hWnd", None)
+        if not hwnd:
+            self.last_result_text = f"Could not find window: {param}"
+            self.speak(self.last_result_text)
+            return False
+        title = (getattr(win, "title", "") or "")[:40]
+        ok, reason = self._focus_hwnd(hwnd)
+        self.last_result_text = (
+            f"Activate Window: {title}" if ok
+            else f"Found window '{title}' but could not bring it to the front: {reason}"
+        )
+        self.speak(self.last_result_text)
+        return ok
+
     def _act_browser_open(self, param):
             try:
                 self.browser.ensure_started()

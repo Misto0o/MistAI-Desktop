@@ -113,6 +113,22 @@ class WindowManager:
         return None
 
     @staticmethod
+    def find_window_normalized(title: str) -> Optional[object]:
+        """Second try after find_window: compare normalize_window_title()
+        forms (dashes, spacing, trailing separators), case-insensitively."""
+        if not WINDOW_MGMT_AVAILABLE:
+            return None
+        from .config import normalize_window_title
+
+        needle = normalize_window_title(title).upper()
+        if not needle:
+            return None
+        for w in gw.getAllWindows():
+            if w.title and needle in normalize_window_title(w.title).upper():
+                return w
+        return None
+
+    @staticmethod
     def find_window_uia(title: str, partial: bool = True) -> Optional[object]:
         if not UIAUTOMATION_AVAILABLE:
             return None
