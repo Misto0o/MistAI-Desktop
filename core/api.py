@@ -52,6 +52,7 @@ from .tools import ToolRegistry
 from .tts import NeuralTTS
 from .uia_nav import EnhancedUIANavigator
 from .vision import CohereVision
+from .voice_timing import VoiceTimer
 from .wake_calibration import WakeCalibration
 from .watchers import FileWatcher, StateWatcher
 from .workspace import Workspace
@@ -178,6 +179,10 @@ class Api:
         self._wake_shutdown = threading.Event()
         self._wake_lock = threading.Lock()
         self._conversation_lock = threading.Lock()
+        # Diagnostics only: voice-turn durations, and whether a _listen_once
+        # is waiting for the mic while the wake loop transcribes a clip.
+        self.voice_timer = VoiceTimer()
+        self._listen_waiting = threading.Event()
         self.captions_enabled = False
         self.caption_window = None
         self._window = None
@@ -409,6 +414,8 @@ class Api:
 
             if audio is None or self.tts.speaking or not self._wake_enabled.is_set():
                 continue
+            clip_end = time.monotonic()
+            compete = self._mic_compete_state()
 
             # Threshold and clip length in the log, so it shows why a word was
             # cut off.
@@ -429,7 +436,11 @@ class Api:
                 cal.heard(None, time.monotonic())
             if save_clips:
                 self._save_wake_clip(audio, text, threshold, clip_s, error=error)
+            # A listen that started while this clip was being transcribed
+            # counts too.
+            compete = compete or self._mic_compete_state()
             if text is None:
+                self._log_mic_compete(compete, text, "untranscribed")
                 continue
 
             # -- A task is running: the ONLY thing we listen for is "stop".
@@ -438,6 +449,7 @@ class Api:
             if self._agent_lock.locked():
                 t = self._normalize_utterance(text)
                 if t in self._VOICE_STOP_WORDS:
+                    self._log_mic_compete(compete, text, "voice stop")
                     # A standalone stop always interrupts the active task,
                     # including while it is waiting at a confirmation or
                     # ask_user prompt. stop_current_task() wakes that prompt
@@ -446,10 +458,13 @@ class Api:
                     print("[Wake] Voice stop -- halting current task")
                     self.stop_current_task()
                     self.speak("Stopping.", interrupt=True)
+                else:
+                    self._log_mic_compete(compete, text, "ignored (task running)")
                 continue
 
             ww, cmd = fuzzy_wake(text)
             if not ww:
+                self._log_mic_compete(compete, text, "dropped (no wake word)")
                 continue
             print(f"[Wake] Matched wake word '{ww}', command: '{cmd}'")
             if cmd and len(cmd.split()) < 2:
@@ -457,8 +472,11 @@ class Api:
             # Run the conversation OFF this thread so the wake loop keeps
             # listening for a voice "stop" while the agent works.
             if not self._conversation_lock.acquire(blocking=False):
+                self._log_mic_compete(compete, text, "dropped (conversation active)")
                 print("[Wake] Conversation already active; ignoring duplicate wake")
                 continue
+            self._voice_start("wake", t0=clip_end)
+            self._voice_mark("wake_heard")
 
             def _conversation_worker(command=cmd):
                 try:
@@ -472,6 +490,35 @@ class Api:
             # Give the conversation a moment to take the mic lock (its own
             # listen) so we don't grab the same utterance twice.
             time.sleep(0.3)
+
+    def _voice_start(self, label, t0=None):
+        timer = getattr(self, "voice_timer", None)
+        if timer is not None:
+            timer.start(label, t0=t0)
+
+    def _voice_mark(self, name, end=False):
+        timer = getattr(self, "voice_timer", None)
+        if timer is not None:
+            timer.mark(name, end=end)
+
+    def _mic_compete_state(self):
+        """Why a clip the wake loop is handling may have been meant for a
+        _listen_once (a command, follow-up or answer), or None."""
+        waiting = getattr(self, "_listen_waiting", None)
+        if waiting is not None and waiting.is_set():
+            return "a _listen_once was waiting for the mic"
+        convo = getattr(self, "_conversation_lock", None)
+        if convo is not None and convo.locked() and not self._agent_lock.locked():
+            return "a conversation was active (a _listen_once may be about to start)"
+        return None
+
+    @staticmethod
+    def _log_mic_compete(state, text, outcome):
+        # Word count only: the utterance itself is never logged here.
+        if state:
+            words = len(text.split()) if text else 0
+            print(f"[MicCompete] Wake loop handled a clip ({words} words) while "
+                  f"{state}; outcome: {outcome}")
 
     @staticmethod
     def _clip_seconds(audio):
@@ -535,6 +582,7 @@ class Api:
         }
         self.speak(random.choice(resps.get(gender, resps["none"])), interrupt=True)
         self._wait_for_tts()
+        self._voice_mark("ack_done")
 
         if inline_command:
             cmd = inline_command
@@ -622,6 +670,7 @@ class Api:
                 self.speak("You're welcome." if "thank" in t or t in ("ty", "thx")
                            else "Sure.")
                 self._wait_for_tts()
+                self._voice_start("followup")
                 cmd = self._listen_once(timeout=5)
                 if cmd:
                     cmd = strip_wake_prefix(cmd)
@@ -642,6 +691,7 @@ class Api:
 
             self._wait_for_tts()
 
+            self._voice_start("followup")
             cmd = self._listen_once(timeout=5)
             if cmd:
                 cmd = strip_wake_prefix(cmd)
@@ -649,19 +699,34 @@ class Api:
         print("[ConversationLoop] Ended, returning to wake-word-only mode")
 
     def _listen_once(self, timeout=6):
-        with self._mic_lock:
-            try:
-                with self.microphone as src:
-                    self.recognizer.pause_threshold = 1.0
-                    self.recognizer.non_speaking_duration = 0.5
-                    self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
-                    audio = self.recognizer.listen(
-                        src, timeout=timeout, phrase_time_limit=15
-                    )
-                    return self.recognizer.recognize_google(audio)
-            except Exception as e:
-                print(f"[ListenOnce] {e}")
-                return None
+        # Set before waiting for the mic, so the wake loop can log a clip it
+        # transcribes meanwhile ([MicCompete]).
+        waiting = getattr(self, "_listen_waiting", None)
+        if waiting is not None:
+            waiting.set()
+        try:
+            with self._mic_lock:
+                self._voice_mark("mic_acquired")
+                try:
+                    with self.microphone as src:
+                        self.recognizer.pause_threshold = 1.0
+                        self.recognizer.non_speaking_duration = 0.5
+                        self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
+                        self._voice_mark("listen_start")
+                        audio = self.recognizer.listen(
+                            src, timeout=timeout, phrase_time_limit=15
+                        )
+                        self._voice_mark("speech_end")
+                        text = self.recognizer.recognize_google(audio)
+                        self._voice_mark("stt_done")
+                        return text
+                except Exception as e:
+                    print(f"[ListenOnce] {e}")
+                    self._voice_mark(f"listen_failed ({type(e).__name__})", end=True)
+                    return None
+        finally:
+            if waiting is not None:
+                waiting.clear()
 
     def toggle_proactive_mode(self, enabled):
         return {"success": True}
@@ -941,6 +1006,7 @@ class Api:
                          else "Hey. What do you need?" if t in ("hi", "hello", "hey")
                          else "Okay.")
                 if input_mode == "voice":
+                    self._voice_mark("filler_reply", end=True)
                     self.speak(reply)
                 return {
                     "success": True,
@@ -954,6 +1020,8 @@ class Api:
             # through to the agent unchanged. Skipped while an agent is busy.
             if not resume_rec and not self._agent_lock.locked():
                 reply = conversation.try_chat(self, message, gender)
+                if input_mode == "voice":
+                    self._voice_mark("router_done", end=bool(reply))
                 if reply:
                     self.memory.add_conversation("user", message)
                     self.memory.add_conversation("assistant", reply)
@@ -1000,6 +1068,7 @@ class Api:
                 msg = f"I'm still working on '{running}'. Say stop, or wait for it to finish."
                 print(f"[API] ask_mistai rejected -- agent busy with: {running}")
                 if input_mode == "voice":
+                    self._voice_mark("busy_reply", end=True)
                     self.speak(msg)
                 return {
                     "success": False,
@@ -1027,6 +1096,8 @@ class Api:
             def _on_step(n, action, param, speech):
                 if my_gen != self._agent_generation:
                     return
+                if input_mode == "voice":
+                    self._voice_mark("first_step", end=True)  # later steps: no-op
                 self._notify_js(
                     f'handleAgentStep({n},"{esc(action)}","{esc(str(param))}","{esc(speech)}")'
                 )
