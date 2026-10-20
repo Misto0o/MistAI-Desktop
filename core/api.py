@@ -190,6 +190,9 @@ class Api:
         # is waiting for the mic while the wake loop transcribes a clip.
         self.voice_timer = VoiceTimer()
         self._listen_waiting = threading.Event()
+        # Set while a push-to-talk press waits for or holds the mic: the wake
+        # loop skips taking the mic so it cannot swallow the command.
+        self._ptt_waiting = threading.Event()
         self.captions_enabled = False
         self.caption_window = None
         self._window = None
@@ -393,7 +396,7 @@ class Api:
                     continue
                 if not self._wake_enabled.is_set():
                     continue
-                if not self._mic_lock.acquire(blocking=False):
+                if self._ptt_wants_mic() or not self._mic_lock.acquire(blocking=False):
                     time.sleep(0.2)
                     continue
                 try:
@@ -417,6 +420,9 @@ class Api:
 
             if self.tts.speaking:
                 self.tts.wait_until_done(timeout=1.0)
+                continue
+            if self._ptt_wants_mic():
+                time.sleep(0.1)   # a push-to-talk press is about to listen
                 continue
             if not self._mic_lock.acquire(blocking=False):
                 time.sleep(0.2)   # a conversation/ask_user listen owns the mic
@@ -522,6 +528,10 @@ class Api:
         timer = getattr(self, "voice_timer", None)
         if timer is not None:
             timer.mark(name, end=end)
+
+    def _ptt_wants_mic(self):
+        ptt = getattr(self, "_ptt_waiting", None)
+        return ptt is not None and ptt.is_set()
 
     def _mic_compete_state(self):
         """Why a clip the wake loop is handling may have been meant for a
@@ -720,9 +730,10 @@ class Api:
 
         print("[ConversationLoop] Ended, returning to wake-word-only mode")
 
-    def _listen_once(self, timeout=6):
+    def _listen_once(self, timeout=6, on_listening=None):
         # Set before waiting for the mic, so the wake loop can log a clip it
-        # transcribes meanwhile ([MicCompete]).
+        # transcribes meanwhile ([MicCompete]). on_listening (optional) is
+        # called once the mic is open, right before listening starts.
         waiting = getattr(self, "_listen_waiting", None)
         if waiting is not None:
             waiting.set()
@@ -735,6 +746,11 @@ class Api:
                         self.recognizer.non_speaking_duration = 0.5
                         self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
                         self._voice_mark("listen_start")
+                        if on_listening is not None:
+                            try:
+                                on_listening()
+                            except Exception as e:
+                                print(f"[ListenOnce] on_listening failed ({type(e).__name__})")
                         audio = self.recognizer.listen(
                             src, timeout=timeout, phrase_time_limit=15
                         )
@@ -749,6 +765,69 @@ class Api:
         finally:
             if waiting is not None:
                 waiting.clear()
+
+    # -- Push-to-talk -----------------------------------------------------------
+
+    _PTT_BUSY = "Mist is working. Press Stop or say stop."
+    _PTT_ACTIVE = "Already listening."
+    _PTT_NOTHING = "Didn't catch that"
+
+    def push_to_talk(self):
+        """One press, one voice command, no wake word: listen once, then run
+        the normal voice turn. Refused (mic untouched) while a task runs or a
+        conversation is active. Returns at once; the turn runs on a thread and
+        the page follows it through handleListenState."""
+        if self._agent_lock.locked():
+            return {"success": False, "error": "busy", "message": self._PTT_BUSY}
+        if not self._conversation_lock.acquire(blocking=False):
+            return {"success": False, "error": "listening", "message": self._PTT_ACTIVE}
+        try:
+            threading.Thread(target=self._ptt_turn, daemon=True, name="PushToTalk").start()
+        except Exception:
+            self._conversation_lock.release()
+            raise
+        return {"success": True}
+
+    def _ptt_turn(self):
+        """The push-to-talk turn. Owns _conversation_lock (taken by
+        push_to_talk) and always releases it; the heard words are never logged."""
+        idle_sent = False
+
+        def idle(message=""):
+            nonlocal idle_sent
+            idle_sent = True
+            self._notify_js(f'handleListenState("idle","{esc(message)}")')
+
+        try:
+            self._voice_start("ptt")
+            self.tts.interrupt()                  # stop Mist mid-sentence
+            self._ptt_waiting.set()               # the wake loop leaves the mic alone
+            self._notify_js('handleListenState("waiting","")')
+            cmd = self._listen_once(
+                timeout=6,
+                on_listening=lambda: self._notify_js('handleListenState("listening","")'),
+            )
+            # Free the mic for the wake loop now, so it can hear "stop" mid-task.
+            self._ptt_waiting.clear()
+            cmd = strip_wake_prefix(cmd) if cmd else ""
+            if not cmd:
+                idle(self._PTT_NOTHING)           # a status line, not spoken
+                return
+            idle()
+            gender = self.memory.get_profile("user_gender", "none")
+            detected = self._detect_gender_address(cmd)
+            if detected:
+                gender = detected
+            self.ask_mistai(cmd, gender=gender, input_mode="voice")
+        except Exception as e:
+            print(f"[PushToTalk] Turn failed ({type(e).__name__})")
+            if not idle_sent:
+                idle("Push-to-talk failed")
+        finally:
+            self._ptt_waiting.clear()
+            self._conversation_lock.release()
+            if not idle_sent:
+                idle()
 
     def toggle_proactive_mode(self, enabled):
         return {"success": True}
