@@ -17,6 +17,11 @@ runtime (what the app itself needs). No microphone, no Node, no network:
 - at the end the tool closes the Api's database connections and removes only
   the mist_ui_smoke_* temp folder it created (if that fails it prints the path).
 
+Each mode also checks the under-orb push-to-talk button: Api.push_to_talk
+is stubbed on the class (no mic) to send the real notifications of a press
+that heard nothing, and the page must show "Listening...", then the note,
+then its normal status; the wake word switch must be off at startup.
+
 Modes. "dev" is this source run. "build" acts as a release build: the real
 Api.get_ui_flags runs with sys.frozen set for that call only (pywebview reads
 sys.frozen to find its WebView2 DLL, so it is not set process-wide) and with
@@ -67,6 +72,14 @@ _STATE = """JSON.stringify({
   backendRow: getComputedStyle(document.getElementById('backend-row')).display,
   errors: window.__smokeErrors || ['capture snippet missing']})"""
 
+_PTT_STATE = """JSON.stringify({
+  text: document.getElementById('mist-status-text').textContent,
+  active: document.getElementById('btn-ptt').classList.contains('active'),
+  label: document.getElementById('btn-ptt').nextElementSibling.textContent,
+  wakeLabel: document.getElementById('sw-wake').previousElementSibling.textContent,
+  wakeOn: document.getElementById('sw-wake').classList.contains('on'),
+  oldWakeButton: !!document.getElementById('ctrl-wake')})"""
+
 # Press Save with an empty key and the box ticked (the page's default).
 _PRESS_SAVE = """window.__saveDone=false;
 document.getElementById('apiKeyInput').value='';
@@ -114,7 +127,7 @@ def main_mode(mode):
     import webview
 
     from core.api import Api
-    from core.config import MODEL_CHOICES, MODEL_LABELS
+    from core.config import MODEL_CHOICES, MODEL_LABELS, esc
     from core.memory import Memory
     from ui.html import HTML
 
@@ -125,6 +138,7 @@ def main_mode(mode):
     seed = api = None
     result = {"code": 1}
     route_calls = []
+    ptt_calls = []
 
     try:
         seed = Memory()
@@ -149,13 +163,31 @@ def main_mode(mode):
 
         Api.get_ui_flags, Api.set_api_mode = get_ui_flags, set_api_mode
 
+        def push_to_talk(self):
+            """No mic: replay the real notifications of a press that heard nothing."""
+            ptt_calls.append(1)
+
+            def turn():
+                self._notify_js('handleListenState("waiting","")')
+                time.sleep(0.4)
+                self._notify_js('handleListenState("listening","")')
+                time.sleep(1.2)
+                self._notify_js(f'handleListenState("idle","{esc(Api._PTT_NOTHING)}")')
+
+            threading.Thread(target=turn, daemon=True).start()
+            return {"success": True}
+
+        Api.push_to_talk = push_to_talk
+
         api = Api()
         page = HTML.replace("<head>", "<head>" + _CAPTURE, 1)
         window = webview.create_window("MistAI UI smoke", html=page, js_api=api, hidden=True)
         api._window = window
         expected_options = [[m, MODEL_LABELS[m]] for m in MODEL_CHOICES]
 
-        def checks(state, saved):
+        def checks(state, saved, ptt):
+            before, listening, note, after = (ptt.get(k) or {} for k in
+                                              ("before", "listening", "note", "after"))
             return [
                 ("header leaves 'Checking...'", state["online"] not in ("", "Checking..."),
                  state["online"]),
@@ -171,6 +203,21 @@ def main_mode(mode):
                 (f"Save {'switches' if expect_dev else 'never switches'} the route",
                  saved and route_calls == ([True] if expect_dev else []),
                  {"save finished": saved, "set_api_mode calls": route_calls}),
+                ("under-orb button is push-to-talk ('Talk'), old wake button gone",
+                 before.get("label") == "Talk" and before.get("oldWakeButton") is False,
+                 before),
+                ("'Wake word (beta)' switch is off at startup",
+                 before.get("wakeLabel") == "Wake word (beta)"
+                 and before.get("wakeOn") is False and api.wake_word_active is False,
+                 {**before, "python wake_word_active": api.wake_word_active}),
+                ("push-to-talk click reaches Python", ptt_calls == [1], ptt_calls),
+                ("status shows 'Listening...' with the button highlighted",
+                 listening.get("text") == "Listening..." and listening.get("active") is True,
+                 listening),
+                ("'Didn't catch that' shows, then the status returns",
+                 note.get("text") == "Didn't catch that" and note.get("active") is False
+                 and after.get("text") == "Ready" and after.get("active") is False,
+                 {"note": note, "after": after}),
                 ("no page errors captured", state["errors"] == [], state["errors"]),
             ]
 
@@ -199,8 +246,20 @@ def main_mode(mode):
                     state = json.loads(window.evaluate_js(_STATE))
                 window.evaluate_js(_PRESS_SAVE)
                 saved = bool(poll("window.__saveDone===true", bool))
-                state = json.loads(window.evaluate_js(_STATE))   # errors after Save too
-                results = checks(state, saved)
+                # Push-to-talk: click, then follow the states the stub reports.
+                ptt = {"before": json.loads(window.evaluate_js(_PTT_STATE))}
+                window.evaluate_js("document.getElementById('btn-ptt').click()")
+                for key, want in (("listening", "Listening..."),
+                                  ("note", "Didn't catch that"), ("after", "Ready")):
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline:
+                        snap = json.loads(window.evaluate_js(_PTT_STATE))
+                        if snap["text"] == want:
+                            ptt[key] = snap
+                            break
+                        time.sleep(0.1)
+                state = json.loads(window.evaluate_js(_STATE))   # errors after all of it
+                results = checks(state, saved, ptt)
                 for name, ok, got in results:
                     print(f"{'PASS' if ok else 'FAIL'}  {name}" +
                           ("" if ok else f"  (got {got!r})"))

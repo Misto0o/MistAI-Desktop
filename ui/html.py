@@ -208,7 +208,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
 
     <div class="card">
       <div class="card-title">System</div>
-      <div class="toggle-row"><span>Wake Word</span><div class="sw" id="sw-wake"></div></div>
+      <div class="toggle-row"><span>Wake word (beta)</span><div class="sw" id="sw-wake"></div></div>
       <div class="toggle-row"><span>Captions</span><div class="sw" id="sw-cap"></div></div>
     </div>
 
@@ -242,8 +242,8 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
 
     <div class="control-bar">
       <div class="control-item">
-        <button class="ctrl-btn" id="ctrl-wake" title="Toggle wake word listening">&#127908;</button>
-        <div class="ctrl-label">Wake Word</div>
+        <button class="ctrl-btn" id="btn-ptt" title="Push to talk: say one command">&#127908;</button>
+        <div class="ctrl-label">Talk</div>
       </div>
       <div class="control-item">
         <button class="ctrl-btn" id="ctrl-caption" title="Toggle on-screen captions">&#128190;</button>
@@ -304,7 +304,7 @@ const swCap=document.getElementById('sw-cap'),wave=document.getElementById('wave
 const selGender=document.getElementById('sel-gender'),selModel=document.getElementById('sel-model');
 const apiModal=document.getElementById('apiModal');
 const mistStatus=document.getElementById('mist-status'),mistStatusText=document.getElementById('mist-status-text');
-const ctrlWake=document.getElementById('ctrl-wake'),ctrlCaption=document.getElementById('ctrl-caption');
+const btnPtt=document.getElementById('btn-ptt'),ctrlCaption=document.getElementById('ctrl-caption');
 let stepEl=null;
 
 function tickClock(){
@@ -403,18 +403,60 @@ function setMistStatus(state,text){
   mistStatusText.textContent=text;
 }
 
+// The status line when nothing temporary is showing: a push-to-talk listen,
+// then a running task, then the wake word mode.
+function restoreStatus(){
+  if(pttState==='waiting') setMistStatus('listening','Waiting for mic...');
+  else if(pttState==='listening') setMistStatus('listening','Listening...');
+  else if(busy) setMistStatus('listening', stopping ? 'Stopping...' : 'Working...');
+  else if(!wakeOn) setMistStatus('ready','Ready');
+  else setMistStatus('listening','Listening for wake word...');
+}
+
+// Wake word: one switch (sidebar), off at startup.
 async function toggleWake(){
   wakeOn=!wakeOn;
-  swWake.classList.toggle('on',wakeOn);ctrlWake.classList.toggle('active',wakeOn);
+  swWake.classList.toggle('on',wakeOn);
   orb.classList.toggle('active',wakeOn);
   if(ready)try{
-    if(wakeOn){await pywebview.api.start_wake_word_detection();setMistStatus('listening','Listening for wake word...');}
-    else{await pywebview.api.stop_wake_word_detection();setMistStatus('ready','Ready');}
+    if(wakeOn)await pywebview.api.start_wake_word_detection();
+    else await pywebview.api.stop_wake_word_detection();
+    restoreStatus();
     addMsg('Wake: '+(wakeOn?'active':'off'),'system');
   }catch(e){console.error('Wake toggle error:',e);addMsg('Wake error: '+e,'error');}
 }
 swWake.onclick=toggleWake;
-ctrlWake.onclick=toggleWake;
+
+// Push-to-talk: Python runs the turn (Api.push_to_talk) and reports the mic
+// through handleListenState; the page only shows it. A short note (a refusal,
+// "Didn't catch that") replaces the status line for a few seconds.
+const PTT_NOTE_MS=3000,PTT_SAFETY_MS=30000;
+let pttState='idle',pttNoteTimer=null,pttSafetyTimer=null;
+function showPttNote(text){
+  clearTimeout(pttNoteTimer);
+  setMistStatus('notice',String(text));
+  pttNoteTimer=setTimeout(()=>{pttNoteTimer=null;restoreStatus();},PTT_NOTE_MS);
+}
+function handleListenState(state,message){
+  pttState=(state==='waiting'||state==='listening')?state:'idle';
+  btnPtt.classList.toggle('active',pttState!=='idle');
+  wave.style.opacity=pttState==='listening'?'1':'0';
+  clearTimeout(pttSafetyTimer);pttSafetyTimer=null;
+  // If Python never reports the end (a lost notification), don't stay "Listening".
+  if(pttState!=='idle')pttSafetyTimer=setTimeout(()=>handleListenState('idle',''),PTT_SAFETY_MS);
+  if(pttState==='idle'&&message)showPttNote(message);
+  else{clearTimeout(pttNoteTimer);pttNoteTimer=null;restoreStatus();}
+}
+btnPtt.onclick=async()=>{
+  if(!ready)return;
+  try{
+    const r=await pywebview.api.push_to_talk();
+    if(!(r&&r.success))showPttNote((r&&r.message)||'Push-to-talk is not available right now');
+  }catch(e){
+    console.error('[ptt] push_to_talk failed:',e);
+    showPttNote('Push-to-talk failed: '+((e&&e.message)||e));
+  }
+};
 
 async function toggleCaptions(){
   capOn=!capOn;
@@ -552,9 +594,7 @@ function setBusy(b){
   busy=b;
   btnSend.disabled=inp.disabled=b;
   orb.classList.toggle('busy',b);
-  if(b) setMistStatus('listening', stopping ? 'Stopping...' : 'Working...');
-  else if(!wakeOn) setMistStatus('ready','Ready');
-  else setMistStatus('listening','Listening for wake word...');
+  restoreStatus();
 }
 
 // Reconcile the UI with the runtime's actual agent state. Voice-initiated

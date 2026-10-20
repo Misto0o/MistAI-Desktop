@@ -81,13 +81,36 @@ _HARNESS = r"""
 const CONFIG = %CONFIG%;
 const realSetTimeout = setTimeout;
 const intervals = [];
+// With CONFIG.fakeTimers the page's timeouts only run when an action says
+// {advance: ms}, so a 3s note or a 30s safety restore can be checked at once.
+let fakeNow = 0, timers = [], timerId = 0;
+if (CONFIG.fakeTimers) {
+  globalThis.setTimeout = (fn, ms) => { timers.push({id: ++timerId, at: fakeNow + (ms || 0), fn}); return timerId; };
+  globalThis.clearTimeout = (id) => { timers = timers.filter(t => t.id !== id); };
+}
+function advance(ms) {
+  fakeNow += ms;
+  for (;;) {
+    const due = timers.filter(t => t.at <= fakeNow).sort((a, b) => a.at - b.at)[0];
+    if (!due) break;
+    timers = timers.filter(t => t !== due);
+    due.fn();
+  }
+}
 globalThis.setInterval = (fn, ms) => { intervals.push(ms); return intervals.length; };
 const consoleErrors = [];
 console.error = (...a) => consoleErrors.push(a.map(x => String(x && x.message || x)).join(' '));
 
 function makeEl(tag) {
+  const classes = new Set();
   return {
-    tag, children: [], classList: {toggle() {}, add() {}, remove() {}}, style: {}, dataset: {},
+    tag, children: [], style: {}, dataset: {},
+    classList: {
+      toggle(c, force) { const on = force === undefined ? !classes.has(c) : !!force;
+        on ? classes.add(c) : classes.delete(c); return on; },
+      add(c) { classes.add(c); }, remove(c) { classes.delete(c); },
+      contains(c) { return classes.has(c); }, get list() { return [...classes].sort(); },
+    },
     textContent: '', value: '', className: '', disabled: false, placeholder: '',
     scrollTop: 0, scrollHeight: 0, onclick: null, onchange: null, onkeypress: null,
     appendChild(c) { this.children.push(c); return c; }, remove() {}, focus() {},
@@ -133,11 +156,15 @@ globalThis.pywebview = {api: {
   get_ui_flags: api('get_ui_flags', CONFIG.flags),
   set_api_key: api('set_api_key', {success: true}),
   set_api_mode: api('set_api_mode', {success: true}),
+  push_to_talk: api('push_to_talk', () => (CONFIG.ptt || []).shift() || {success: true}),
+  start_wake_word_detection: api('start_wake_word_detection', {success: true}),
+  stop_wake_word_detection: api('stop_wake_word_detection', {success: true}),
 }};
 
 %PAGE%
 
 const settle = () => new Promise(r => realSetTimeout(r, 30));
+let out_actions = [];
 (async () => {
   for (const fn of listeners['pywebviewready'] || []) fn();
   await settle();
@@ -157,6 +184,25 @@ const settle = () => new Promise(r => realSetTimeout(r, 30));
   for (const m of CONFIG.change || []) await sel.onchange({target: {value: m}});
   const gsel = document.getElementById('sel-gender');
   for (const g of CONFIG.gender_change || []) await gsel.onchange({target: {value: g}});
+  // Push-to-talk and wake actions, with a snapshot after each.
+  const status = () => ({
+    text: document.getElementById('mist-status-text').textContent,
+    cls: document.getElementById('mist-status').className,
+    ptt: document.getElementById('btn-ptt').classList.list,
+    wave: document.getElementById('wave').style.opacity || '',
+  });
+  out_actions = [];
+  for (const a of CONFIG.actions || []) {
+    if (a.click) await document.getElementById(a.click).onclick();
+    if (a.state) handleListenState(a.state, a.message || '');
+    if (a.advance) advance(a.advance);
+    if (a.busy !== undefined) setBusy(a.busy);
+    await settle();
+    out_actions.push({...status(), calls: calls.filter(c => c === 'push_to_talk').length,
+                      wake: document.getElementById('sw-wake').classList.list,
+                      wakeCalls: calls.filter(c => c.endsWith('wake_word_detection')),
+                      errors: consoleErrors.slice()});
+  }
   for (const s of CONFIG.save || []) {   // the API modal's Save button
     document.getElementById('apiKeyInput').value = s.key;
     document.getElementById('useBackend').checked = s.useBackend;
@@ -164,6 +210,7 @@ const settle = () => new Promise(r => realSetTimeout(r, 30));
   }
   await settle();
   out.after = {...snap(), calls: calls.slice(out.calls.length)};
+  out.actions = out_actions;
   console.log(JSON.stringify(out));
 })();
 """
