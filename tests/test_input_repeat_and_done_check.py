@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.agent import AgentLoop
+from core.agent import EMPTY_ANSWER_READS, NO_ANSWER_SPEECH, AgentLoop
 from core.tools import SPECS
 
 
@@ -241,22 +241,95 @@ def test_question_finished_with_empty_speech_gets_one_reminder(monkeypatch, task
     assert "Your speech is empty but the user asked a question" in obs[-1]
 
 
-def test_question_second_empty_done_still_finishes(monkeypatch):
+def test_question_second_empty_done_ends_with_the_honest_line(monkeypatch):
     out, _, _, obs, spoken = _run(monkeypatch, [
         {"action": "done", "speech": ""},
         {"action": "done", "speech": ""},
     ], task="whats the weather?")
-    assert out["success"] and out["speech"] == "" and spoken == []
-    assert sum("Before finishing" in o for o in obs) == 1
+    assert out == {"success": False, "error": "no answer",
+                   "speech": NO_ANSWER_SPEECH, "steps": out["steps"]}
+    assert spoken == ["I couldn't read the answer."]          # never silence
+    assert sum("Before finishing" in o for o in obs) == 1     # no extra model call
 
 
-def test_non_question_empty_done_finishes_without_a_reminder(monkeypatch):
-    out, _, _, obs, _ = _run(monkeypatch, [
+@pytest.mark.parametrize("last", ["open_app", "type_text", "run_command"])
+def test_an_action_task_not_ending_on_a_read_finishes_silently(monkeypatch, last):
+    out, _, _, obs, spoken = _run(monkeypatch, [
         {"action": "browser_get_text", "parameter": ""},
+        {"action": last, "parameter": "notepad"},
         {"action": "done", "speech": ""},
     ], task="open notepad")
-    assert out["success"] and out["speech"] == ""
+    assert out["success"] and out["speech"] == "" and spoken == []
     assert not any("Before finishing" in o for o in obs)
+
+
+@pytest.mark.parametrize("read", sorted(EMPTY_ANSWER_READS))
+def test_an_empty_done_right_after_a_read_gets_a_reminder(monkeypatch, read):
+    out, _, _, obs, spoken = _run(monkeypatch, [
+        {"action": read, "parameter": ""},
+        {"action": "done", "speech": ""},
+        {"action": "done", "speech": "It shows 18 degrees."},
+    ], results={read: _result(read, "18 degrees")}, task="open notepad")
+    assert out["success"] and spoken == ["It shows 18 degrees."]
+    assert sum("Before finishing" in o for o in obs) == 1
+    assert "Your speech is empty right after a read" in obs[-1]
+
+
+def test_contiune_a_read_then_unseen_numbers_then_an_empty_done(monkeypatch, capsys):
+    """The real run: a follow-up "contiune", a screen read, a draft that states
+    numbers the read doesn't show (the one reminder), then an empty done."""
+    out, _, calls, obs, spoken = _run(monkeypatch, [
+        {"action": "read_screen_text", "parameter": "weather"},
+        {"action": "done", "speech": "It is 49 degrees with a high of 72 and 5 mph wind."},
+        {"action": "done", "speech": ""},
+    ], results={"read_screen_text": _result("read_screen_text", "Weather: partly cloudy")},
+        task="contiune")
+    assert calls == [("read_screen_text", "weather")]
+    assert sum("Before finishing" in o for o in obs) == 1
+    assert "Your draft speech states 49, 72, 5" in obs[-1]
+    assert out["success"] is False and out["error"] == "no answer"
+    assert spoken == ["I couldn't read the answer."]
+    assert "[DoneCheck] Still no answer; finishing with an honest line" in capsys.readouterr().out
+
+
+def test_a_create_file_command_ending_with_an_empty_done_stays_silent(monkeypatch):
+    out, _, _, obs, spoken = _run(monkeypatch, [
+        {"action": "run_command", "parameter": "New-Item -ItemType File notes.txt"},
+        {"action": "done", "speech": ""},
+    ], results={"run_command": _result(
+        "run_command", "COMMAND COMPLETED SUCCESSFULLY (exit code 0).")},
+        task="create a file called notes.txt")
+    assert out["success"] and out["speech"] == "" and spoken == []
+    assert not any("Before finishing" in o for o in obs)
+
+
+def test_run_command_counts_when_the_goal_is_a_question(monkeypatch):
+    out, _, _, obs, spoken = _run(monkeypatch, [
+        {"action": "run_command", "parameter": "Get-Process notepad"},
+        {"action": "done", "speech": ""},
+        {"action": "done", "speech": ""},
+    ], task="is notepad running?")
+    assert out["error"] == "no answer" and spoken == [NO_ANSWER_SPEECH]
+
+
+def test_a_speech_that_matches_its_read_costs_no_extra_call(monkeypatch):
+    out, _, _, obs, spoken = _run(monkeypatch, [
+        {"action": "read_screen_text", "parameter": ""},
+        {"action": "done", "speech": "It is 18 degrees."},
+    ], results={"read_screen_text": _result("read_screen_text", "Temperature 18")},
+        task="contiune")
+    assert out["success"] and spoken == ["It is 18 degrees."]
+    assert len(obs) == 1                  # one model call after the read, no reminder
+
+
+def test_the_step_log_shows_the_done_speech_as_a_word_count_only(monkeypatch, capsys):
+    _run(monkeypatch, [
+        {"action": "read_screen_text", "parameter": ""},
+        {"action": "done", "speech": "It is 18 degrees outside."},
+    ], results={"read_screen_text": _result("read_screen_text", "18")}, task="contiune")
+    out = capsys.readouterr().out
+    assert "Step 2: done('') speech: 5 words" in out
+    assert "degrees" not in out and "outside" not in out
 
 
 def test_off_target_input_is_named_in_the_check(monkeypatch):

@@ -27,6 +27,14 @@ NOT_VISIBLE_ON_SCREEN = "NOT VISIBLE ON SCREEN"
 
 # Appended to a run_command observation when the route needs credentials the
 # agent doesn't have (config.credential_failure_reason).
+# A 'done' with empty speech after one of these reads (or for a question) is a
+# missing answer, never a silent finish. run_command is not here: a command
+# that creates or changes something can end with no speech.
+EMPTY_ANSWER_READS = frozenset(
+    {"read_screen_text", "analyze_screen", "browser_get_text", "inspect_file", "find_file"})
+# Spoken when such a done still has no answer after its one reminder.
+NO_ANSWER_SPEECH = "I couldn't read the answer."
+
 CREDENTIAL_NOTE = (
     "NOTE: this route needs credentials you don't have (an API key, token or "
     "login). Don't ask the user for one or guess one; get the information "
@@ -267,15 +275,18 @@ class AgentLoop:
                 if n.replace(",", "") not in have]
 
     def _done_reminder(self, route_notes, last_read, unseen=(), unsubmitted=False,
-                       empty_answer=False):
+                       empty_answer=False, is_question=True):
         """The one observation shown at the first 'done' of a phase whose
         draft speech states values its last read does not show, whose last
         read followed unsubmitted typing, whose route did not go as asked,
         or whose speech is empty although the user asked a question."""
         parts = ["Before finishing, check your final speech against what actually happened."]
-        if empty_answer:
+        if empty_answer and is_question:
             parts.append("Your speech is empty but the user asked a question: answer it "
                          "from what you read, or say you couldn't find it.")
+        elif empty_answer:
+            parts.append("Your speech is empty right after a read: say what it showed "
+                         "that answers the task, or say you couldn't find it.")
         if route_notes:
             parts.append(
                 "These steps did not go as asked: " + "; ".join(route_notes[-4:])
@@ -529,6 +540,7 @@ class AgentLoop:
         input_streak = (None, None, 0)  # (sig, foreground key, count) of identical inputs
         route_notes = []  # off-target input, cross-category fallbacks (for the done check)
         last_read = None  # result of the phase's last read_screen_text
+        last_executed = None  # the action the Executor really ran last this phase
         unsubmitted = False  # type_text ran and no key/click submitted it yet
         read_after_unsubmitted = False  # the last read happened in that state
         done_reminded = False
@@ -713,7 +725,10 @@ class AgentLoop:
                 self.api.caption_window.show_thinking(thinking, 6)
             if thinking:
                 print(f"  [Think] {thinking}")
-            print(f"  Step {steps_taken}: {action}({repr(str(param)[:60])})")
+            # A done's speech is the answer: log its length, never its text.
+            said = (f" speech: {len(str(speech or '').split())} words"
+                    if action == "done" else "")
+            print(f"  Step {steps_taken}: {action}({repr(str(param)[:60])}){said}")
 
             # --- ACTION NAME VALIDATION ---------------------------------------
             # Unknown names never reach the Executor (so they don't pollute the
@@ -931,8 +946,9 @@ class AgentLoop:
             # when a question is finished with no spoken answer.
             # A speech that matches its read costs nothing extra.
             unseen = self._unseen_numbers(speech, last_read) if last_read is not None else []
+            is_question = planner._is_question_goal(task) or str(task).rstrip().endswith("?")
             empty_answer = action == "done" and not str(speech or "").strip() and (
-                planner._is_question_goal(task) or str(task).rstrip().endswith("?")
+                is_question or last_executed in EMPTY_ANSWER_READS
             )
             if (
                 action == "done"
@@ -943,7 +959,8 @@ class AgentLoop:
             ):
                 done_reminded = True
                 reminder = self._done_reminder(route_notes, last_read, unseen,
-                                               read_after_unsubmitted, empty_answer)
+                                               read_after_unsubmitted, empty_answer,
+                                               is_question)
                 print(f"  [DoneCheck] {reminder}")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append({"role": "user", "content": f"[OBSERVATION] {reminder}"})
@@ -1018,6 +1035,16 @@ class AgentLoop:
                 continue
 
             if action == "done":
+                if empty_answer:
+                    # Its one reminder is used (or there is no room for it) and
+                    # there is still no answer: say so, never finish silently.
+                    print("  [DoneCheck] Still no answer; finishing with an honest line")
+                    self.api.speak(NO_ANSWER_SPEECH)
+                    if self.api.caption_window and self.api.captions_enabled:
+                        self.api.caption_window.show_speech(NO_ANSWER_SPEECH, 6)
+                    self._print_step_times(steps_taken, step_times)
+                    return {"success": False, "error": "no answer",
+                            "speech": NO_ANSWER_SPEECH, "steps": steps_taken}
                 if speech:
                     self.api.speak(speech)
                     if self.api.caption_window and self.api.captions_enabled:
@@ -1037,6 +1064,7 @@ class AgentLoop:
             result_text = res.detail
             executed_action = getattr(res, "action", action)
             executed_param = getattr(res, "parameter", param)
+            last_executed = executed_action
 
             time.sleep(0.2)
 
