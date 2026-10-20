@@ -87,7 +87,9 @@ def test_a_press_listens_once_and_runs_the_normal_voice_turn(monkeypatch, capsys
         'handleListenState("listening","")',              # only once the mic is open
         "listen timeout=6",
         'handleListenState("idle","")',
+        'handleVoiceTurn("open my banking password")',    # the chat turn (Stage 3)
         "ask_mistai",
+        'handleVoiceReply(true,"",0,"")',
     ]
     # Wake prefix stripped, saved gender, voice mode; the mic flag is already
     # clear (the wake loop can hear "stop" mid-task) but the turn still owns

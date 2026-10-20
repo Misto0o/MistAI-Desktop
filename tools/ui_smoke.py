@@ -20,7 +20,10 @@ runtime (what the app itself needs). No microphone, no Node, no network:
 Each mode also checks the under-orb push-to-talk button: Api.push_to_talk
 is stubbed on the class (no mic) to send the real notifications of a press
 that heard nothing, and the page must show "Listening...", then the note,
-then its normal status; the wake word switch must be off at startup.
+then its normal status; the wake word switch must be off at startup. A
+voice turn then goes through the real Api._voice_ask (ask_mistai stubbed on
+the instance) and must show the heard words with the mic, the reply and the
+step count, as text.
 
 Modes. "dev" is this source run. "build" acts as a release build: the real
 Api.get_ui_flags runs with sys.frozen set for that call only (pywebview reads
@@ -79,6 +82,14 @@ _PTT_STATE = """JSON.stringify({
   wakeLabel: document.getElementById('sw-wake').previousElementSibling.textContent,
   wakeOn: document.getElementById('sw-wake').classList.contains('on'),
   oldWakeButton: !!document.getElementById('ctrl-wake')})"""
+
+_CHAT = """JSON.stringify(Array.from(document.querySelectorAll('#chat > *')).slice(-4).map(m=>({
+  cls: m.className, text: m.textContent,
+  marker: m.classList.contains('voice') ? getComputedStyle(m,'::before').content : ''})))"""
+
+# A voice turn with a quote, an apostrophe and a script tag in it.
+VOICE_HEARD = """open "notes" it's </script><script>window.__x=1</script>"""
+VOICE_REPLY = 'Opened "notes" <b>bold</b>'
 
 # Press Save with an empty key and the box ticked (the page's default).
 _PRESS_SAVE = """window.__saveDone=false;
@@ -185,7 +196,7 @@ def main_mode(mode):
         api._window = window
         expected_options = [[m, MODEL_LABELS[m]] for m in MODEL_CHOICES]
 
-        def checks(state, saved, ptt):
+        def checks(state, saved, ptt, voice):
             before, listening, note, after = (ptt.get(k) or {} for k in
                                               ("before", "listening", "note", "after"))
             return [
@@ -218,6 +229,10 @@ def main_mode(mode):
                  note.get("text") == "Didn't catch that" and note.get("active") is False
                  and after.get("text") == "Ready" and after.get("active") is False,
                  {"note": note, "after": after}),
+                ("a voice turn shows the heard words (mic), reply and steps",
+                 voice == [["msg user voice", VOICE_HEARD, True],
+                           ["msg assistant", VOICE_REPLY, False],
+                           ["msg memory", "Completed in 2 steps", False]], voice),
                 ("no page errors captured", state["errors"] == [], state["errors"]),
             ]
 
@@ -258,8 +273,19 @@ def main_mode(mode):
                             ptt[key] = snap
                             break
                         time.sleep(0.1)
+                # A voice turn through the REAL Api._voice_ask; only ask_mistai
+                # is stubbed (on this instance: no agent, no network).
+                api.ask_mistai = lambda message, gender=None, input_mode="text", model=None: {
+                    "success": True, "steps": 2, "error": "",
+                    "command": {"action": "done", "parameter": "", "speech": VOICE_REPLY}}
+                api._voice_ask(VOICE_HEARD, "none")
+                time.sleep(0.5)
+                voice = [[m["cls"], m["text"], "🎤" in m["marker"]]
+                         for m in json.loads(window.evaluate_js(_CHAT))][-3:]
+                if window.evaluate_js("window.__x===1"):
+                    voice.append("a script in the heard words RAN")
                 state = json.loads(window.evaluate_js(_STATE))   # errors after all of it
-                results = checks(state, saved, ptt)
+                results = checks(state, saved, ptt, voice)
                 for name, ok, got in results:
                     print(f"{'PASS' if ok else 'FAIL'}  {name}" +
                           ("" if ok else f"  (got {got!r})"))

@@ -197,10 +197,13 @@ let out_actions = [];
     if (a.state) handleListenState(a.state, a.message || '');
     if (a.advance) advance(a.advance);
     if (a.busy !== undefined) setBusy(a.busy);
+    if (a.js) eval(a.js);            // a notification exactly as Python sends it
     await settle();
     out_actions.push({...status(), calls: calls.filter(c => c === 'push_to_talk').length,
                       wake: document.getElementById('sw-wake').classList.list,
                       wakeCalls: calls.filter(c => c.endsWith('wake_word_detection')),
+                      chat: document.getElementById('chat').children.map(m =>
+                        [m.className, m.textContent, m.classList.contains('voice')]),
                       errors: consoleErrors.slice()});
   }
   for (const s of CONFIG.save || []) {   // the API modal's Save button

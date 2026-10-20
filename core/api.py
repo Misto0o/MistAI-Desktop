@@ -713,7 +713,7 @@ class Api:
                 gender = detected
 
             try:
-                res = self.ask_mistai(cmd, gender=gender, input_mode="voice")
+                res = self._voice_ask(cmd, gender)
                 if res.get("error") == "busy":
                     # Another loop owns the machine; ask_mistai already said so.
                     break
@@ -765,6 +765,29 @@ class Api:
         finally:
             if waiting is not None:
                 waiting.clear()
+
+    def _voice_ask(self, cmd, gender):
+        """One voice command through the normal flow (push-to-talk and the
+        wake conversation), shown in the chat like a typed turn: the heard
+        words before, the result after. Words and reply go only to the page,
+        escaped; they are never logged."""
+        self._notify_js(f'handleVoiceTurn("{esc(cmd)}")')
+        res = None
+        try:
+            res = self.ask_mistai(cmd, gender=gender, input_mode="voice")
+            return res
+        finally:
+            if not isinstance(res, dict):       # ask_mistai raised
+                res = {"success": False, "error": "Voice turn failed"}
+            speech = (res.get("command") or {}).get("speech") or ""
+            try:
+                steps = int(res.get("steps") or 0)
+            except (TypeError, ValueError):
+                steps = 0
+            self._notify_js(
+                f'handleVoiceReply({"true" if res.get("success") else "false"},'
+                f'"{esc(speech)}",{steps},"{esc(res.get("error") or "")}")'
+            )
 
     # -- Push-to-talk -----------------------------------------------------------
 
@@ -818,7 +841,7 @@ class Api:
             detected = self._detect_gender_address(cmd)
             if detected:
                 gender = detected
-            self.ask_mistai(cmd, gender=gender, input_mode="voice")
+            self._voice_ask(cmd, gender)
         except Exception as e:
             print(f"[PushToTalk] Turn failed ({type(e).__name__})")
             if not idle_sent:

@@ -131,6 +131,7 @@ header{
 .msg.assistant{background:var(--surface2);border:1px solid var(--border);align-self:flex-start;border-radius:2px 10px 10px 10px}
 .msg.system{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.18);align-self:center;color:var(--amber);font-size:.75em;font-family:'DM Mono',monospace}
 .msg.step{background:rgba(0,217,255,.06);border:1px solid var(--border);align-self:flex-start;color:var(--accent2);font-size:.73em;font-family:'DM Mono',monospace;max-width:96%}
+.msg.user.voice::before{content:'🎤';margin-right:5px;opacity:.8}
 .msg.wake{background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.18);align-self:center;color:var(--green);font-size:.74em}
 .msg.suggestion{background:rgba(0,217,255,.08);border:1px solid var(--border);align-self:flex-end;font-style:italic;font-size:.8em;color:var(--accent2)}
 .msg.memory{background:rgba(94,234,212,.06);border:1px solid rgba(94,234,212,.18);align-self:center;font-size:.72em;color:var(--accent2);font-family:'DM Mono',monospace}
@@ -565,21 +566,7 @@ async function send() {
     // set from the Model card, and the saved profile) -- the UI passes null.
     const res = await pywebview.api.ask_mistai(msg, null, null);
     stepEl = null;
-
-    if (res.success) {
-      if (res.command && res.command.speech) {
-        addMsg(res.command.speech, 'assistant');
-        flashWave();
-      }
-      if (res.steps) addMsg(`Completed in ${res.steps} step${res.steps !== 1 ? 's' : ''}`, 'memory');
-      updateStats();
-    } else if (res.error === 'busy') {
-      addMsg(res.command && res.command.speech ? res.command.speech : 'Mist is still working on a previous task.', 'system');
-    } else if (res.error === 'still_running') {
-      addMsg('Still working on this in the background — the status will update when it finishes.', 'system');
-    } else {
-      addMsg('Error: ' + (res.error || 'Unknown'), 'error');
-    }
+    showResult(res);
   } catch(e) {
     addMsg('Error: ' + e, 'error');
   } finally {
@@ -587,6 +574,24 @@ async function send() {
     // Only go idle if the backend agrees nothing is running.
     syncBusy();
     inp.focus();
+  }
+}
+
+// The end of a turn in the chat, typed (send) or voice (handleVoiceReply).
+function showResult(res) {
+  if (res.success) {
+    if (res.command && res.command.speech) {
+      addMsg(res.command.speech, 'assistant');
+      flashWave();
+    }
+    if (res.steps) addMsg(`Completed in ${res.steps} step${res.steps !== 1 ? 's' : ''}`, 'memory');
+    updateStats();
+  } else if (res.error === 'busy') {
+    addMsg(res.command && res.command.speech ? res.command.speech : 'Mist is still working on a previous task.', 'system');
+  } else if (res.error === 'still_running') {
+    addMsg('Still working on this in the background — the status will update when it finishes.', 'system');
+  } else {
+    addMsg('Error: ' + (res.error || 'Unknown'), 'error');
   }
 }
 
@@ -662,6 +667,18 @@ function handleAgentStep(n,action,param,speech){
 }
 
 function handleWakeWordDetected(){addMsg('Listening...','wake');setMistStatus('listening','Heard wake word...');}
+// A voice turn (push-to-talk or wake word), sent by Api._voice_ask. The
+// bubble shows exactly what Mist HEARD (textContent; the mic is CSS), and a
+// new turn gets its own step card.
+function handleVoiceTurn(text){
+  stepEl=null;
+  addMsg(String(text||''),'user').classList.add('voice');
+}
+function handleVoiceReply(success,speech,steps,error){
+  stepEl=null;
+  showResult({success:!!success,command:{speech:String(speech||'')},
+              steps:Number(steps)||0,error:String(error||'')});
+}
 function handleVoiceResult(text){
   inp.value=String(text||'');
   send();
