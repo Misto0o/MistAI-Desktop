@@ -25,8 +25,10 @@ from .api_manager import APIKeyManager, describe_api_error
 from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler
 from .config import (
+    DEFAULT_GENDER,
     DEFAULT_MODEL,
     ENTER_CONFIRM_APPS,
+    GENDER_CHOICES,
     MODEL_CHOICES,
     MODEL_LABELS,
     STATUS_URL,
@@ -745,10 +747,27 @@ class Api:
         return {"enabled": self.captions_enabled}
 
     def set_user_gender(self, gender):
-        self.memory.set_profile("user_gender", gender)
-        self.tts.set_gender(gender)
-        print(f"[API] Gender set to: {gender}")
-        return {"success": True}
+        """Save the gender address. Anything outside GENDER_CHOICES is refused
+        and changes nothing (not the saved value, not the voice)."""
+        g = str(gender or "").strip().lower()
+        if g not in GENDER_CHOICES:
+            return {"success": False,
+                    "error": f"Unknown gender address. Choose one of: {', '.join(GENDER_CHOICES)}."}
+        self.memory.set_profile("user_gender", g)
+        self.tts.set_gender(g)
+        print(f"[API] Gender set to: {g}")
+        return {"success": True, "gender": g}
+
+    def get_user_gender(self):
+        """The saved gender address, for the UI to show. Never raises: an
+        unreadable, empty or unknown value gives DEFAULT_GENDER."""
+        try:
+            saved = str(self.memory.get_profile("user_gender", DEFAULT_GENDER) or "")
+        except Exception as e:
+            print(f"[API] Could not read the saved gender ({type(e).__name__})")
+            return DEFAULT_GENDER
+        saved = saved.strip().lower()
+        return saved if saved in GENDER_CHOICES else DEFAULT_GENDER
 
     # -- Model choice -----------------------------------------------------------
 

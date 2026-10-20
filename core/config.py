@@ -148,6 +148,9 @@ EDGE_TTS_VOICE = {
     # female voice. Neutral now maps to a distinct third voice.
     "none": "en-US-ChristopherNeural",
 }
+# The gender-address values the profile may hold ("user_gender").
+GENDER_CHOICES = tuple(EDGE_TTS_VOICE)
+DEFAULT_GENDER = "none"
 
 TRACKED_APPS = [
     "chrome",

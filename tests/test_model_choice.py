@@ -93,6 +93,55 @@ def test_a_bad_saved_value_falls_back_to_the_default(memory, capsys):
     assert "using cohere" in capsys.readouterr().out
 
 
+# -- gender, read back for the UI -------------------------------------------------
+
+@pytest.mark.parametrize("saved, expected", [
+    ("female", "female"), (" MALE ", "male"), ("none", "none"),
+    ("robot", "none"), ("", "none"), (None, "none"),
+])
+def test_get_user_gender_validates_the_saved_value(memory, saved, expected):
+    if saved is not None:
+        memory.set_profile("user_gender", saved)
+    api = Api.__new__(Api)
+    api.memory = memory
+    assert api.get_user_gender() == expected
+
+
+def _gender_api(memory):
+    voices = []
+    api = Api.__new__(Api)
+    api.memory = memory
+    api.tts = SimpleNamespace(set_gender=voices.append)
+    return api, voices
+
+
+def test_set_user_gender_saves_a_valid_choice(memory):
+    api, voices = _gender_api(memory)
+    assert api.set_user_gender(" Female ") == {"success": True, "gender": "female"}
+    assert memory.get_profile("user_gender") == "female" and voices == ["female"]
+    assert api.get_user_gender() == "female"
+
+
+@pytest.mark.parametrize("value", ["robot", "", None, "Flux", "female; drop table", 1])
+def test_set_user_gender_rejects_anything_outside_the_choices(memory, value):
+    api, voices = _gender_api(memory)
+    api.set_user_gender("male")
+    result = api.set_user_gender(value)
+    assert result == {"success": False,
+                      "error": "Unknown gender address. Choose one of: male, female, none."}
+    assert memory.get_profile("user_gender") == "male" and voices == ["male"]  # unchanged
+
+
+def test_get_user_gender_never_raises(capsys):
+    def broken(*_a):
+        raise RuntimeError("database is locked")
+
+    api = Api.__new__(Api)
+    api.memory = SimpleNamespace(get_profile=broken)
+    assert api.get_user_gender() == "none"
+    assert "Could not read the saved gender (RuntimeError)" in capsys.readouterr().out
+
+
 # -- one model per request: router, agent, hotkey -------------------------------
 
 def _hotkey_models(monkeypatch, api):
