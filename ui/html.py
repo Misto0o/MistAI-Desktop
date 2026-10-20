@@ -175,6 +175,9 @@ header{
 .btn-save:hover{background:var(--accent2)}
 .btn-cancel{flex:1;background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:6px;cursor:pointer;font-size:.8em}
 .btn-cancel:hover{border-color:var(--accent)}
+.card-note{font-size:.66em;color:var(--muted2);font-family:'DM Mono',monospace;margin-top:6px}
+.card-note.error{color:var(--red)}
+.card-note:empty{display:none}
 select{background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:6px 8px;border-radius:6px;font-size:.78em;cursor:pointer;font-family:'DM Mono',monospace;pointer-events:auto;width:100%;margin-top:6px}
 </style>
 </head>
@@ -218,6 +221,13 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
     <div class="card">
       <div class="card-title">Gender Address</div>
       <select id="sel-gender"><option value="none">Neutral</option><option value="male">Sir</option><option value="female">Ma'am</option></select>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Model</div>
+      <!-- Options come from Api.get_model_options() (config.MODEL_CHOICES). -->
+      <select id="sel-model"></select>
+      <div class="card-note" id="model-note">Loading models...</div>
     </div>
   </div>
 
@@ -291,7 +301,7 @@ const chat=document.getElementById('chat'),inp=document.getElementById('inp');
 const btnSend=document.getElementById('btn-send'),orb=document.getElementById('orb');
 const swWake=document.getElementById('sw-wake');
 const swCap=document.getElementById('sw-cap'),wave=document.getElementById('wave');
-const selGender=document.getElementById('sel-gender');
+const selGender=document.getElementById('sel-gender'),selModel=document.getElementById('sel-model');
 const apiModal=document.getElementById('apiModal');
 const mistStatus=document.getElementById('mist-status'),mistStatusText=document.getElementById('mist-status-text');
 const ctrlWake=document.getElementById('ctrl-wake'),ctrlCaption=document.getElementById('ctrl-caption');
@@ -308,21 +318,75 @@ function openLink(url){
   window.open(url, '_blank');
 }
 
-window.addEventListener('pywebviewready',async()=>{
+// Startup. All state lives in Python (memory.db): pywebview loads this page
+// with NavigateToString, an opaque origin where every browser storage API
+// throws (tests/test_ui_model_card.py checks none is used). The intervals start first, and each step runs on its own
+// (not awaited one after another), so a step that throws or never answers
+// cannot stop the others.
+async function runStep(name,step){
+  try{await step();}catch(e){console.error('[startup] '+name+' failed:',e);}
+}
+window.addEventListener('pywebviewready',()=>{
   ready=true;
-  const saved=localStorage.getItem('gender');
-  if(saved){selGender.value=saved;await pywebview.api.set_user_gender(saved);}
-  updateStats();
-  checkStatus();
   setInterval(updateStats,4000);
   setInterval(checkStatus,20000);
   setInterval(syncBusy,1500);
+  runStep('gender',loadGender);
+  runStep('models',loadModels);
+  runStep('stats',updateStats);
+  runStep('status',checkStatus);
 });
 
+async function loadGender(){
+  selGender.value=await pywebview.api.get_user_gender();
+}
 selGender.onchange=async e=>{
   if(!ready)return;
-  localStorage.setItem('gender',e.target.value);
-  await pywebview.api.set_user_gender(e.target.value);
+  try{
+    const r=await pywebview.api.set_user_gender(e.target.value);
+    if(!(r&&r.success)){addMsg((r&&r.error)||'Could not save the gender address','error');await loadGender();}
+  }catch(err){console.error('[gender] save failed:',err);addMsg('Could not save the gender address: '+err,'error');}
+};
+
+// The model choice lives in Python; the UI shows labels and sends ids. A
+// running request keeps its model.
+const modelNote=document.getElementById('model-note');
+function setModelNote(text,isError){
+  modelNote.textContent=text;
+  modelNote.className='card-note'+(isError?' error':'');
+}
+async function loadModels(){
+  try{
+    const o=await pywebview.api.get_model_options();
+    const choices=(o&&Array.isArray(o.choices))?o.choices:[];
+    if(!choices.length)throw new Error('no models were returned');
+    selModel.innerHTML='';
+    for(const c of choices){
+      const opt=document.createElement('option');
+      opt.value=String(c.id);opt.textContent=String(c.label||c.id);
+      selModel.appendChild(opt);
+    }
+    selModel.value=o.current;
+    setModelNote('',false);
+  }catch(e){
+    console.error('[models] could not load the model list:',e);
+    setModelNote('Could not load the model list: '+((e&&e.message)||e),true);
+  }
+}
+selModel.onchange=async e=>{
+  if(!ready)return;
+  try{
+    const r=await pywebview.api.set_model(e.target.value);
+    if(r&&r.success){
+      addMsg('Model: '+(r.label||r.model)+' (applies from the next request)','system');
+    }else{
+      addMsg((r&&r.error)||'Could not change the model','error');
+      await loadModels();   // show the model that is really in use
+    }
+  }catch(err){
+    console.error('[models] set_model failed:',err);
+    addMsg('Error: '+err,'error');await loadModels();
+  }
 };
 
 function setMistStatus(state,text){
@@ -445,8 +509,8 @@ async function send() {
     // finish (or reports still_running / busy honestly). A UI timer that
     // gave up after 130s used to unlock the input while the loop was still
     // driving the mouse -- which is how two agents ended up running at once.
-    // model + gender are resolved on the Python side (config.AGENT_MODEL and
-    // the saved profile) -- the UI no longer hardcodes either.
+    // model + gender are resolved on the Python side (Api.current_model(),
+    // set from the Model card, and the saved profile) -- the UI passes null.
     const res = await pywebview.api.ask_mistai(msg, null, null);
     stepEl = null;
 
@@ -564,6 +628,7 @@ async function checkStatus(){
     document.getElementById('online-dot').style.background=r.online?'var(--green)':'var(--red)';
     document.getElementById('online-dot').style.boxShadow=r.online?'0 0 6px var(--green)':'0 0 6px var(--red)';
   }catch(e){
+    console.error('[status] check failed:',e);
     document.getElementById('online-text').textContent='Unknown';
     document.getElementById('online-dot').style.background='var(--amber)';
   }
@@ -577,7 +642,7 @@ async function updateStats(){
     document.getElementById('stat-actions').textContent=s.actions_performed;
     document.getElementById('stat-facts').textContent=s.facts_remembered;
     document.getElementById('stat-reminders').textContent=s.pending_reminders;
-  }catch(e){}
+  }catch(e){console.error('[stats] update failed:',e);}
 }
 
 const btnStop = document.getElementById('btn-stop');
