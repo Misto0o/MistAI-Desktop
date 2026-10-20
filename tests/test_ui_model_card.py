@@ -50,7 +50,7 @@ def test_startup_starts_intervals_first_and_runs_each_step_on_its_own():
     h = _ready_handler()
     assert h.startswith(",()=>{")                      # not async: nothing awaited in turn
     intervals = [h.index(f"setInterval({f}") for f in ("updateStats", "checkStatus", "syncBusy")]
-    steps = [h.index(f"runStep('{s}',") for s in ("gender", "models", "stats", "status")]
+    steps = [h.index(f"runStep('{s}',") for s in ("flags", "gender", "models", "stats", "status")]
     assert max(intervals) < min(steps)
     assert "await" not in h
     assert "async function runStep(name,step){\n  try{await step();}catch(e){console.error(" \
@@ -130,6 +130,9 @@ globalThis.pywebview = {api: {
     {conversation_length: 3, actions_performed: 2, facts_remembered: 1, pending_reminders: 0}),
   check_api_status: api('check_api_status', {online: true}),
   is_agent_busy: api('is_agent_busy', {busy: false}),
+  get_ui_flags: api('get_ui_flags', CONFIG.flags),
+  set_api_key: api('set_api_key', {success: true}),
+  set_api_mode: api('set_api_mode', {success: true}),
 }};
 
 %PAGE%
@@ -148,10 +151,17 @@ const settle = () => new Promise(r => realSetTimeout(r, 30));
     gender: document.getElementById('sel-gender').value,
     online: document.getElementById('online-text').textContent,
     // A real element stores textContent as a string.
-    stats: String(document.getElementById('stat-msgs').textContent), ...snap()};
+    stats: String(document.getElementById('stat-msgs').textContent),
+    // Not set by the page: the HTML default stays (display:none, string-checked).
+    backendRow: document.getElementById('backend-row').style.display || 'unset', ...snap()};
   for (const m of CONFIG.change || []) await sel.onchange({target: {value: m}});
   const gsel = document.getElementById('sel-gender');
   for (const g of CONFIG.gender_change || []) await gsel.onchange({target: {value: g}});
+  for (const s of CONFIG.save || []) {   // the API modal's Save button
+    document.getElementById('apiKeyInput').value = s.key;
+    document.getElementById('useBackend').checked = s.useBackend;
+    await saveAPIKey();
+  }
   await settle();
   out.after = {...snap(), calls: calls.slice(out.calls.length)};
   console.log(JSON.stringify(out));
@@ -173,7 +183,7 @@ def _real_outputs():
 def _run_page(tmp_path, **config):
     options, set_results, set_gender = _real_outputs()
     cfg = {"options": options, "gender": "female", "set_model": set_results,
-           "set_gender": set_gender, **config}
+           "set_gender": set_gender, "flags": {"is_dev": True}, **config}
     script = tmp_path / "page.js"
     script.write_text(_HARNESS.replace("%CONFIG%", json.dumps(cfg))
                       .replace("%PAGE%", _script()), encoding="utf-8")
@@ -184,7 +194,8 @@ def _run_page(tmp_path, **config):
 
 needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 LABELLED = [["gemini", "Nova"], ["cohere", "Sage"], ["mistral", "Flux"]]
-STARTUP_CALLS = {"get_user_gender", "get_model_options", "get_memory_stats", "check_api_status"}
+STARTUP_CALLS = {"get_ui_flags", "get_user_gender", "get_model_options", "get_memory_stats",
+                 "check_api_status"}
 
 
 @needs_node

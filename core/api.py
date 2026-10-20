@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -268,7 +269,22 @@ class Api:
         self.api_manager.set_api_key(key)
         return {"success": True, "message": "API key set."}
 
+    def get_ui_flags(self):
+        """What the Settings UI may show. Developer-only controls (the backend
+        route switch) appear in a source run, or in a build with MISTAI_DEV=1.
+        The route itself always comes from MISTAI_USE_BACKEND unless a
+        developer switches it."""
+        dev = (not getattr(sys, "frozen", False)
+               or os.environ.get("MISTAI_DEV", "").strip() == "1")
+        return {"is_dev": dev}
+
     def set_api_mode(self, use_backend):
+        """Switch the backend route. Dev runs only (get_ui_flags); in a build
+        it is refused and MISTAI_USE_BACKEND keeps deciding the route."""
+        if not self.get_ui_flags()["is_dev"]:
+            return {"success": False,
+                    "error": "Switching the API route is a developer setting. "
+                             "Set MISTAI_USE_BACKEND in .env instead."}
         self.api_manager.use_backend(use_backend)
         return {
             "success": True,

@@ -280,7 +280,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
   <div class="modal-content">
     <div class="modal-title">API CONFIGURATION</div>
     <input type="text" class="modal-input" id="apiKeyInput" placeholder="Enter your MistAI API key (mistai_...)"/>
-    <label style="font-size:.75em;color:var(--muted);margin-bottom:12px;display:block">
+    <label id="backend-row" style="font-size:.75em;color:var(--muted);margin-bottom:12px;display:none">
       <input type="checkbox" id="useBackend" checked/> Use MistAI backend
     </label>
     <div class="modal-buttons">
@@ -331,12 +331,21 @@ window.addEventListener('pywebviewready',()=>{
   setInterval(updateStats,4000);
   setInterval(checkStatus,20000);
   setInterval(syncBusy,1500);
+  runStep('flags',loadFlags);
   runStep('gender',loadGender);
   runStep('models',loadModels);
   runStep('stats',updateStats);
   runStep('status',checkStatus);
 });
 
+// Developer-only controls stay hidden (and unused) unless Python says this is
+// a dev run (Api.get_ui_flags); if the flags never load, the page acts as a build.
+let devMode=false;
+async function loadFlags(){
+  const f=await pywebview.api.get_ui_flags();
+  devMode=!!(f&&f.is_dev===true);
+  document.getElementById('backend-row').style.display=devMode?'block':'none';
+}
 async function loadGender(){
   selGender.value=await pywebview.api.get_user_gender();
 }
@@ -442,13 +451,14 @@ async function saveAPIKey(){
       addMsg('API key configured','system');
     }catch(e){addMsg('Error: '+e,'error');}
   }
-  // A saved API key plus an unchecked box means direct authenticated API
-  // mode. Previously this only ever switched ON backend mode, leaving the
-  // manager's default backend route active even when the UI said otherwise.
-  if(key || useBackend){
+  // Dev runs only: a saved API key plus an unchecked box means direct
+  // authenticated API mode. In a build the route stays what
+  // MISTAI_USE_BACKEND chose; Save only sets the key.
+  if(devMode && (key || useBackend)){
     try{
-      await pywebview.api.set_api_mode(useBackend);
-      addMsg(useBackend?'Using MistAI backend':'Using direct API mode (agent-compatible endpoint required)','system');
+      const r=await pywebview.api.set_api_mode(useBackend);
+      if(r&&r.success===false)addMsg(r.error||'Could not change the API route','error');
+      else addMsg(useBackend?'Using MistAI backend':'Using direct API mode (agent-compatible endpoint required)','system');
     }catch(e){addMsg('Error: '+e,'error');}
   }
   closeAPIModal();
