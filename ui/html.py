@@ -611,6 +611,10 @@ function showResult(res) {
     addMsg(res.command && res.command.speech ? res.command.speech : 'Mist is still working on a previous task.', 'system');
   } else if (res.error === 'still_running') {
     addMsg('Still working on this in the background — the status will update when it finishes.', 'system');
+  } else if (res.command && String(res.command.speech || '').trim()) {
+    // What Mist said (e.g. "I couldn't read the answer.", or an API error,
+    // whose speech is the error text): shown once, not as "Error: ...".
+    addMsg(String(res.command.speech), 'assistant');
   } else {
     addMsg('Error: ' + (res.error || 'Unknown'), 'error');
   }

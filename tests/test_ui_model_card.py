@@ -160,6 +160,7 @@ globalThis.pywebview = {api: {
   start_wake_word_detection: api('start_wake_word_detection', {success: true}),
   stop_wake_word_detection: api('stop_wake_word_detection', {success: true}),
   import_my_facts: api('import_my_facts', () => CONFIG.facts_result),
+  ask_mistai: api('ask_mistai', () => (CONFIG.ask || []).shift()),
 }};
 
 %PAGE%
