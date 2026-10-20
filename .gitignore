@@ -9,6 +9,8 @@
 *.log
 run-log.txt
 crash.txt
+# The user's own facts file (Import my facts); lives in ~/MistAI, never committed
+my_facts.json
 logs/
 ocr_debug/
 browser_profile*/

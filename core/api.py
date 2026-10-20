@@ -27,6 +27,7 @@ from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler
 from .config import (
     DEFAULT_GENDER,
+    DEFAULT_HOTKEYS,
     DEFAULT_MODEL,
     ENTER_CONFIRM_APPS,
     GENDER_CHOICES,
@@ -41,6 +42,7 @@ from .config import (
     wake_clips_enabled,
     is_secret_file,
     is_self_process,
+    my_facts_path,
     normalize_process_name,
     process_matches,
     secret_output_reason,
@@ -50,7 +52,7 @@ from . import conversation, file_search
 from .events import EventBus
 from .executor import Executor
 from .live_state import LiveStateTracker, window_belongs_to
-from .memory import Memory
+from .memory import Memory, recall_builtin
 from .screen import ScreenBuffer
 from .task_store import TaskStore
 from .tools import ToolRegistry
@@ -141,11 +143,8 @@ class Api:
         from .task_memory import TaskMemory
 
         self.task_memory = TaskMemory()
-        from .seed_data import DEFAULT_HOTKEYS, DEFAULT_SITE_SHORTCUTS, SEED_FACTS
-
-        self.memory.seed_defaults(DEFAULT_HOTKEYS)
-        self.memory.seed_defaults(DEFAULT_SITE_SHORTCUTS)
-        self.memory.seed_facts(SEED_FACTS)
+        # Nothing is seeded: built-in hotkeys and MistAI's facts about itself
+        # are read from code (config.DEFAULT_HOTKEYS, config.MISTAI_FACTS).
         self.tts.set_gender(self.memory.get_profile("user_gender", "none"))
         self._model = self._load_model_choice()
         self._request_model = None  # the running request's model (hotkey lookup)
@@ -2337,7 +2336,8 @@ class Api:
         already knows this stuff (same brain as the web version), so we
         just ask once per app and remember the answer forever."""
         app_lower = app.lower().strip()
-        cached = self.memory.get_profile(f"hotkey_{app_lower}", None)
+        cached = (self.memory.get_profile(f"hotkey_{app_lower}", None)
+                  or DEFAULT_HOTKEYS.get(f"hotkey_{app_lower}"))
         if cached:
             return cached
 
@@ -3249,7 +3249,41 @@ class Api:
         return {"success": True, "stored": fact}
 
     def recall_facts(self, query=None, category=None):
-        return self.memory.recall_facts(query=query, category=category, limit=5)
+        """The user's saved facts; when none match a query, MistAI's facts
+        about itself (from code)."""
+        facts = self.memory.recall_facts(query=query, category=category, limit=5)
+        if not facts and query and category is None:
+            facts = recall_builtin(query, limit=5)
+        return facts
+
+    def import_my_facts(self):
+        """Import the user's own facts from config.my_facts_path(): a JSON list
+        of strings (or of {"content": ...}). Only when the user asks; facts
+        already saved (in any category) are skipped. Never logs fact text."""
+        path = my_facts_path()
+        if not os.path.isfile(path):
+            # Not an error: the file is optional.
+            return {"success": True, "added": 0, "skipped": 0,
+                    "message": f"No facts file found. To import facts, create {path} "
+                               "with a JSON list of facts."}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            return {"success": False, "added": 0, "skipped": 0,
+                    "message": f"Could not read {path} ({type(e).__name__})."}
+        items = data if isinstance(data, list) else []
+        facts = [i.get("content") if isinstance(i, dict) else i for i in items]
+        facts = [str(t) for t in facts if isinstance(t, str) and t.strip()]
+        if not facts:
+            return {"success": True, "added": 0, "skipped": 0,
+                    "message": f"{path} has no facts to import (expected a JSON list)."}
+        added, skipped, restored = self.memory.import_facts(facts)
+        summary = (f"Imported {added} fact{'s' if added != 1 else ''} "
+                   f"({skipped} already saved, {restored} restored).")
+        print(f"[Memory] {summary}")                 # counts only, never fact text
+        return {"success": True, "added": added, "skipped": skipped,
+                "restored": restored, "message": summary}
 
     def add_reminder(self, text, due_time=None):
         self.memory.add_reminder(text, due_time=due_time)

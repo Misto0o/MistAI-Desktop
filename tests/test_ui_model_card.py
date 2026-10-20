@@ -159,6 +159,7 @@ globalThis.pywebview = {api: {
   push_to_talk: api('push_to_talk', () => (CONFIG.ptt || []).shift() || {success: true}),
   start_wake_word_detection: api('start_wake_word_detection', {success: true}),
   stop_wake_word_detection: api('stop_wake_word_detection', {success: true}),
+  import_my_facts: api('import_my_facts', () => CONFIG.facts_result),
 }};
 
 %PAGE%
@@ -204,6 +205,9 @@ let out_actions = [];
                       wakeCalls: calls.filter(c => c.endsWith('wake_word_detection')),
                       chat: document.getElementById('chat').children.map(m =>
                         [m.className, m.textContent, m.classList.contains('voice')]),
+                      facts: [document.getElementById('facts-note').textContent,
+                              document.getElementById('facts-note').className],
+                      statsCalls: calls.filter(c => c === 'get_memory_stats').length,
                       errors: consoleErrors.slice()});
   }
   for (const s of CONFIG.save || []) {   // the API modal's Save button

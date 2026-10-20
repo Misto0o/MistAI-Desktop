@@ -617,22 +617,17 @@ def restored_session_reason(name, controls):
 
 
 def reset_session(api, db_path):
-    """Fresh memory/task/tool-stat databases, re-seeded like Api.__init__,
-    plus a clean workspace and a fresh live-state read, so nothing from an
-    earlier scenario (last command, conversation, Open apps) leaks in."""
+    """Fresh memory/task/tool-stat databases (empty, like a fresh Api: nothing
+    is seeded), plus a clean workspace and a fresh live-state read, so nothing
+    from an earlier scenario (last command, conversation, Open apps) leaks in."""
     os.environ["MISTAI_DB_PATH"] = db_path
     try:
         from core.memory import Memory
-        from core.seed_data import DEFAULT_HOTKEYS, DEFAULT_SITE_SHORTCUTS, SEED_FACTS
         from core.task_memory import TaskMemory
         from core.task_store import TaskStore
         from core.tools import ToolRegistry
 
-        memory = Memory()
-        memory.seed_defaults(DEFAULT_HOTKEYS)
-        memory.seed_defaults(DEFAULT_SITE_SHORTCUTS)
-        memory.seed_facts(SEED_FACTS)
-        api.memory = memory
+        api.memory = Memory()
         api.task_memory = TaskMemory()
         api.tools = ToolRegistry()
         api.task_store = TaskStore()

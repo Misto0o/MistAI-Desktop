@@ -242,6 +242,62 @@ def wake_clip_dir():
 
 
 
+# -- Built-in knowledge: read from code, never written to the database --------
+
+# App quick-switch/search hotkeys (quick_message). A hotkey learned at runtime
+# (Api._get_app_search_hotkey) is saved in user_profile and wins over these.
+DEFAULT_HOTKEYS = {
+    "hotkey_discord": "ctrl+k",
+    "hotkey_slack": "ctrl+k",
+    "hotkey_teams": "ctrl+e",
+    "hotkey_whatsapp": "ctrl+f",
+    "hotkey_telegram": "ctrl+f",
+    "hotkey_signal": "ctrl+f",
+    "hotkey_skype": "ctrl+f",
+    "hotkey_messenger": "ctrl+k",
+    "hotkey_zoom": "ctrl+f",
+    "hotkey_outlook": "ctrl+e",
+    "hotkey_gmail": "/",
+    "hotkey_vscode": "ctrl+p",
+    "hotkey_spotify": "ctrl+l",
+    "hotkey_steam": "ctrl+f",
+    "hotkey_notion": "ctrl+p",
+}
+
+# What MistAI knows about itself, for `recall` when no saved fact matches
+# ("what are you", "what can you do"). Never database rows, never counted as
+# Facts. Each entry: (text, words a question about it uses).
+MISTAI_FACTS = (
+    ("MistAI is a JARVIS-style desktop assistant that can see the screen, "
+     "control apps, run system commands, and browse the web.",
+     ("you", "yourself", "mist", "mistai", "assistant", "can", "do")),
+    ("MistAI prefers real system tools (PowerShell, UIA, DOM access) over "
+     "guessing at pixel coordinates whenever one is available.",
+     ("tools", "how", "work", "works", "pixel", "pixels", "powershell")),
+    ("MistAI will always ask for confirmation before destructive actions "
+     "like deleting files, even if the instruction was unambiguous.",
+     ("delete", "deleting", "confirm", "confirmation", "destructive", "safe")),
+    ("MistAI organizes desktop/folder files by type into category "
+     "subfolders: Images, Documents, Archives, Installers, Shortcuts.",
+     ("organize", "organise", "sort", "files", "folders", "folder")),
+    ("MistAI's wake words are 'Mist', 'Hey Mist', 'MistAI', and 'Mist AI'.",
+     ("wake", "word", "words", "call", "activate")),
+)
+
+# The only facts that count and that `recall` returns: saved with `remember`
+# ("general") or imported by the user ("imported"). Rows an older version
+# seeded ("system", "personal", "work") are kept but ignored.
+USER_FACT_CATEGORIES = ("general", "imported")
+
+
+def my_facts_path():
+    """The user's own facts file for "Import my facts" (Api.import_my_facts).
+    Outside the repo; MISTAI_MY_FACTS_PATH overrides it (tests)."""
+    return os.environ.get("MISTAI_MY_FACTS_PATH") or os.path.join(
+        os.path.expanduser("~"), "MistAI", "my_facts.json"
+    )
+
+
 def memory_db_path():
     """The SQLite file for memory/tasks/tool stats. MISTAI_DB_PATH overrides
     it (the scenario harness points this at a throwaway file)."""

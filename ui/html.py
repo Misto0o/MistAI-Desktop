@@ -284,6 +284,10 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
     <label id="backend-row" style="font-size:.75em;color:var(--muted);margin-bottom:12px;display:none">
       <input type="checkbox" id="useBackend" checked/> Use MistAI backend
     </label>
+    <div style="margin-bottom:12px">
+      <button class="btn-cancel" id="btn-import-facts" title="Add facts from your my_facts.json file">Import my facts</button>
+      <div class="card-note" id="facts-note"></div>
+    </div>
     <div class="modal-buttons">
       <button class="btn-save" onclick="saveAPIKey()">Save</button>
       <button class="btn-cancel" onclick="closeAPIModal()">Cancel</button>
@@ -506,6 +510,23 @@ async function saveAPIKey(){
   }
   closeAPIModal();
 }
+
+// "Import my facts": only when the user asks. Python reads the file and
+// reports what it added; the page shows that line as text.
+document.getElementById('btn-import-facts').onclick=async()=>{
+  if(!ready)return;
+  const note=document.getElementById('facts-note');
+  try{
+    const r=await pywebview.api.import_my_facts();
+    note.textContent=(r&&r.message)||'Import finished';
+    note.className='card-note'+(r&&r.success?'':' error');
+    if(r&&r.added)updateStats();
+  }catch(e){
+    console.error('[facts] import failed:',e);
+    note.textContent='Import failed: '+((e&&e.message)||e);
+    note.className='card-note error';
+  }
+};
 
 btnSend.onclick=send;
 inp.onkeypress=e=>{if(e.key==='Enter'&&!busy)send()};

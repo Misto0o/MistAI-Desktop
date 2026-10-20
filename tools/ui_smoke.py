@@ -23,7 +23,8 @@ that heard nothing, and the page must show "Listening...", then the note,
 then its normal status; the wake word switch must be off at startup. A
 voice turn then goes through the real Api._voice_ask (ask_mistai stubbed on
 the instance) and must show the heard words with the mic, the reply and the
-step count, as text.
+step count, as text. "Import my facts" (no facts file: MISTAI_MY_FACTS_PATH
+points into this run's folder, never the user's file) must show a plain note.
 
 Modes. "dev" is this source run. "build" acts as a release build: the real
 Api.get_ui_flags runs with sys.frozen set for that call only (pywebview reads
@@ -144,6 +145,8 @@ def main_mode(mode):
 
     tmp = tempfile.mkdtemp(prefix=TMP_PREFIX)
     os.environ["MISTAI_DB_PATH"] = os.path.join(tmp, "memory.db")  # before any DB opens
+    # Never the user's real facts file: a path in this run's folder, not created.
+    os.environ["MISTAI_MY_FACTS_PATH"] = os.path.join(tmp, "my_facts.json")
     os.environ.pop("MISTAI_DEV", None)
     expect_dev = mode == "dev"
     seed = api = None
@@ -196,7 +199,7 @@ def main_mode(mode):
         api._window = window
         expected_options = [[m, MODEL_LABELS[m]] for m in MODEL_CHOICES]
 
-        def checks(state, saved, ptt, voice):
+        def checks(state, saved, ptt, voice, facts):
             before, listening, note, after = (ptt.get(k) or {} for k in
                                               ("before", "listening", "note", "after"))
             return [
@@ -233,6 +236,9 @@ def main_mode(mode):
                  voice == [["msg user voice", VOICE_HEARD, True],
                            ["msg assistant", VOICE_REPLY, False],
                            ["msg memory", "Completed in 2 steps", False]], voice),
+                ("'Import my facts' with no file shows a plain note",
+                 facts[0].startswith("No facts file found.") and facts[1] == "card-note",
+                 facts),
                 ("no page errors captured", state["errors"] == [], state["errors"]),
             ]
 
@@ -284,8 +290,17 @@ def main_mode(mode):
                          for m in json.loads(window.evaluate_js(_CHAT))][-3:]
                 if window.evaluate_js("window.__x===1"):
                     voice.append("a script in the heard words RAN")
+                # Import my facts, through the real Api.import_my_facts (no file).
+                window.evaluate_js("document.getElementById('btn-import-facts').click()")
+                facts = ["", ""]
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not facts[0]:
+                    facts = json.loads(window.evaluate_js(
+                        "JSON.stringify([document.getElementById('facts-note').textContent,"
+                        "document.getElementById('facts-note').className])"))
+                    time.sleep(0.1)
                 state = json.loads(window.evaluate_js(_STATE))   # errors after all of it
-                results = checks(state, saved, ptt, voice)
+                results = checks(state, saved, ptt, voice, facts)
                 for name, ok, got in results:
                     print(f"{'PASS' if ok else 'FAIL'}  {name}" +
                           ("" if ok else f"  (got {got!r})"))
