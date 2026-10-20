@@ -17,13 +17,22 @@ import requests
 
 from . import planner
 from .api_manager import describe_api_error
-from .config import lazy_vision_mode, vision_gating_enabled
+from .config import credential_failure_reason, lazy_vision_mode, vision_gating_enabled
 from .live_state import describe_open_apps
 from .tools import READ_RESULT_CHARS
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
 # on screen (core/api.py read_screen_text).
 NOT_VISIBLE_ON_SCREEN = "NOT VISIBLE ON SCREEN"
+
+# Appended to a run_command observation when the route needs credentials the
+# agent doesn't have (config.credential_failure_reason).
+CREDENTIAL_NOTE = (
+    "NOTE: this route needs credentials you don't have (an API key, token or "
+    "login). Don't ask the user for one or guess one; get the information "
+    "through the browser instead (browser_search / browser_navigate + "
+    "browser_get_text)."
+)
 
 
 class Timings:
@@ -1104,6 +1113,15 @@ class AgentLoop:
             if result_text:
                 shown_result = self._clip_result(result_text, result_limit)
                 obs += f" RESULT: {shown_result}"
+            if executed_action == "run_command":
+                # After RESULT, so the result_chars cut cannot remove it. Output
+                # the secret guard withheld is never examined.
+                text = str(result_text or "")
+                cred = credential_failure_reason(
+                    executed_param, "" if "OUTPUT WITHHELD:" in text else text)
+                if cred:
+                    print(f"[AgentLoop] Credential hint: {cred}")
+                    obs += f" {CREDENTIAL_NOTE}"
             if format_note:
                 obs += f" {format_note}"
             if NOT_VISIBLE_ON_SCREEN in str(result_text or ""):

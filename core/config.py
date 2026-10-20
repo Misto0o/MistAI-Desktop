@@ -419,6 +419,47 @@ def secret_output_reason(command, output=""):
     return None
 
 
+# A command that failed (or "succeeded" with an error body: curl.exe exits 0
+# on a 401) because the route needs a credential the agent doesn't have.
+# Generic HTTP/auth wording only, no particular service.
+_CRED_HTTP_RX = re.compile(
+    r"\b(?:401|403)\b[^\n]{0,40}?\b(?:unauthori[sz]ed|forbidden)\b"
+    r"|\b(?:unauthori[sz]ed|forbidden)\b[^\n]{0,40}?\b(?:401|403)\b",
+    re.I,
+)
+_CRED_TEXT_RX = re.compile(
+    r"\binvalid\s+api[\s_-]?key\b"
+    r"|\bapi[\s_-]?key\s+(?:is\s+)?(?:missing|required|invalid|not\s+provided)\b"
+    r"|\b(?:missing|no)\s+(?:api[\s_-]?key|(?:access\s+|auth\s+)?token)\b"
+    r"|\b(?:access\s+|auth\s+)?token\s+(?:is\s+)?(?:missing|required)\b"
+    r"|\bauthentication\s+(?:failed|required)\b",
+    re.I,
+)
+# Placeholder credentials written into a command: YOUR_API_KEY, {API_KEY},
+# <your_token>, appid=YOUR...
+_CRED_PLACEHOLDER_RX = re.compile(
+    r"\b(?:YOUR|MY)[_-]?(?:API[_-]?KEY|APP[_-]?ID|KEY|TOKEN|SECRET)\b"
+    r"|[{<]\s*(?:your[\s_-]?)?(?:api[\s_-]?key|app[\s_-]?id|(?:access[\s_-]?)?token|secret)\s*[}>]"
+    r"|\b(?:api[_-]?key|app[_-]?id|key|token|access_token)=(?:YOUR|<|\{|X{3,})",
+    re.I,
+)
+
+
+def credential_failure_reason(command, output=""):
+    """Why a run_command result shows a route that needs credentials the agent
+    doesn't have, or None. Checks success and failure alike. The caller passes
+    no output when it was withheld (secret guard): withheld output is never
+    examined."""
+    if _CRED_PLACEHOLDER_RX.search(str(command or "")):
+        return "the command contains a placeholder credential"
+    output = str(output or "")
+    if _CRED_HTTP_RX.search(output):
+        return "the request was refused as unauthorized (401/403)"
+    if _CRED_TEXT_RX.search(output):
+        return "the response says a credential is missing or invalid"
+    return None
+
+
 def secret_text_reason(text):
     """Why on-screen text (e.g. a UIA snapshot) must be withheld, or None:
     a private key block or a credential-looking token. Textual, not airtight."""
