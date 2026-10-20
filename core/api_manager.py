@@ -3,7 +3,44 @@ core/api_manager.py — handles which backend/API key MistAI talks to.
 """
 
 import os
-from .config import API_MODE, PRIMARY_API, FALLBACK_API
+import re
+from .config import API_MODE, PRIMARY_API, FALLBACK_API, MODEL_LABELS
+
+# Removed from a backend error message before it is shown or logged, in case
+# the backend echoes something sensitive back.
+_ERROR_REDACT = re.compile(
+    r"https?://\S+|\b(?:bearer\s+)?(?:mistai|sk|pk|key|tok)[-_][A-Za-z0-9_-]{6,}",
+    re.I,
+)
+ERROR_DETAIL_CHARS = 120
+
+
+def describe_api_error(response, model=""):
+    """One plain sentence for a failed LLM response: the status code plus the
+    body's "error"/"message" field (capped, URLs and key-like strings
+    removed). Never headers, keys, URLs or the request text. The caller
+    decides what to do; nothing here retries or switches models."""
+    status = getattr(response, "status_code", None)
+    detail = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            value = body.get("error") or body.get("message") or ""
+            if isinstance(value, dict):
+                value = value.get("message") or value.get("error") or ""
+            detail = " ".join(_ERROR_REDACT.sub("[removed]", str(value)).split())
+    except Exception:
+        pass
+    if len(detail) > ERROR_DETAIL_CHARS:
+        detail = detail[: ERROR_DETAIL_CHARS - 3].rstrip() + "..."
+    # The name the user sees in Settings (MODEL_LABELS), not the backend id.
+    name = MODEL_LABELS.get(model) or (model or "the model").capitalize()
+    code = f"HTTP {status}" if status else "no status"
+    reason = f"{code}: {detail}" if detail else code
+    if status == 429:
+        return (f"{name} is rate-limited or unavailable right now ({reason}). "
+                f"Pick another model in Settings or try again later.")
+    return f"{name} request failed ({reason})."
 
 
 class APIKeyManager:

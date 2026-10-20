@@ -33,6 +33,7 @@ import time
 import requests
 
 from . import events
+from .api_manager import describe_api_error
 
 PENDING = "pending"
 RUNNING = "running"
@@ -175,6 +176,9 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback
             )
             if r.ok:
                 return r.json().get("response", "")
+            # Logged only: planning and routing fail over to their safe paths
+            # (one phase / the agent), which then report the same error.
+            print(f"[{label}] {describe_api_error(r, model)}")
         except Exception as e:
             print(f"[{label}] LLM call via {url} failed: {e}")
     return ""

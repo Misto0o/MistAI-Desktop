@@ -16,6 +16,7 @@ import time
 import requests
 
 from . import planner
+from .api_manager import describe_api_error
 from .config import lazy_vision_mode, vision_gating_enabled
 from .live_state import describe_open_apps
 from .tools import READ_RESULT_CHARS
@@ -616,6 +617,7 @@ class AgentLoop:
 
                 if not r.ok:
                     primary_status = r.status_code
+                    primary_response = r
                     print(
                         f"[AgentLoop] Primary API {r.status_code}, trying fallback..."
                     )
@@ -640,11 +642,15 @@ class AgentLoop:
                             else f"primary {primary_status} (no compatible fallback)"
                         )
                         print(f"[AgentLoop] API failed: {status_detail}")
+                        # Same model on the fallback URL only; never another
+                        # model. Say what the backend said, plainly.
+                        message = describe_api_error(primary_response, model)
+                        print(f"[AgentLoop] {message}")
                         if self.api.caption_window and self.api.captions_enabled:
-                            self.api.caption_window.show_error(
-                                f"API error: {status_detail}", 5
-                            )
-                        return {"success": False, "error": f"API {status_detail}"}
+                            self.api.caption_window.show_error(message, 5)
+                        if input_mode == "voice":
+                            self.api.speak(message)
+                        return {"success": False, "error": message, "speech": message}
 
                 raw = r.json().get("response", "")
             except Exception as e:

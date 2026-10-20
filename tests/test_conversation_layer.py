@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from core import conversation
-from core.config import CHAT_MODEL, CHAT_TIMEOUT
+from core.config import CHAT_TIMEOUT, DEFAULT_MODEL
 
 NOW = "Tuesday, October 06, 2026 at 03:15 PM"
 
@@ -90,9 +90,21 @@ def test_try_chat_sends_one_small_call_and_returns_the_reply(monkeypatch):
     assert conversation.try_chat(_api("\n    User: earlier\n"), "joke", "male") == "Ha."
     prompt, model, timeout, label, fallback = calls[0]
     assert len(calls) == 1
-    assert (model, timeout, label) == (CHAT_MODEL, CHAT_TIMEOUT, "Conversation")
+    # A bare api without current_model(): the default model.
+    assert (model, timeout, label) == (DEFAULT_MODEL, CHAT_TIMEOUT, "Conversation")
     assert fallback is False
     assert "User: earlier" in prompt and "address the user as sir," in prompt
+
+
+def test_try_chat_uses_the_requests_model_then_the_users_choice(monkeypatch):
+    models = []
+    monkeypatch.setattr("core.planner._llm",
+                        lambda api, prompt, model, **_k: models.append(model) or "")
+    api = _api()
+    api.current_model = lambda: "mistral"
+    conversation.try_chat(api, "joke")
+    conversation.try_chat(api, "joke", model="cohere")
+    assert models == ["mistral", "cohere"]
 
 
 @pytest.mark.parametrize(("fallback", "urls"), [

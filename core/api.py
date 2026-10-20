@@ -21,12 +21,14 @@ import requests
 import speech_recognition as sr
 
 from .agent import NOT_VISIBLE_ON_SCREEN, AgentLoop
-from .api_manager import APIKeyManager
+from .api_manager import APIKeyManager, describe_api_error
 from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler
 from .config import (
-    AGENT_MODEL,
+    DEFAULT_MODEL,
     ENTER_CONFIRM_APPS,
+    MODEL_CHOICES,
+    MODEL_LABELS,
     STATUS_URL,
     TRACKED_APPS,
     WAKE_WORDS,
@@ -142,6 +144,8 @@ class Api:
         self.memory.seed_defaults(DEFAULT_SITE_SHORTCUTS)
         self.memory.seed_facts(SEED_FACTS)
         self.tts.set_gender(self.memory.get_profile("user_gender", "none"))
+        self._model = self._load_model_choice()
+        self._request_model = None  # the running request's model (hotkey lookup)
         self.vision = CohereVision()
         self.screen = ScreenBuffer(fps=30)
         self.live = LiveStateTracker()
@@ -746,6 +750,41 @@ class Api:
         print(f"[API] Gender set to: {gender}")
         return {"success": True}
 
+    # -- Model choice -----------------------------------------------------------
+
+    def _load_model_choice(self):
+        saved = str(self.memory.get_profile("model", DEFAULT_MODEL) or "").strip().lower()
+        if saved not in MODEL_CHOICES:
+            print(f"[Model] Saved choice is not one of {MODEL_CHOICES}; using {DEFAULT_MODEL}")
+            return DEFAULT_MODEL
+        return saved
+
+    def current_model(self):
+        """The model every LLM call uses: the user's choice, else
+        DEFAULT_MODEL. ask_mistai reads it once per request, so a change
+        applies from the next request."""
+        model = getattr(self, "_model", None)
+        return model if model in MODEL_CHOICES else DEFAULT_MODEL
+
+    def set_model(self, name):
+        """Validate against MODEL_CHOICES and save as the profile key "model"."""
+        model = str(name or "").strip().lower()
+        if model not in MODEL_CHOICES:
+            return {"success": False,
+                    "error": f"Unknown model. Choose one of: {', '.join(MODEL_CHOICES)}."}
+        self._model = model
+        self.memory.set_profile("model", model)
+        print(f"[Model] Set to {model} (applies from the next request)")
+        return {"success": True, "model": model, "label": MODEL_LABELS.get(model, model)}
+
+    def get_model_options(self):
+        """Every choice as {id, label} (the UI shows labels, sends ids), plus
+        the current id."""
+        return {
+            "choices": [{"id": m, "label": MODEL_LABELS.get(m, m)} for m in MODEL_CHOICES],
+            "current": self.current_model(),
+        }
+
     def set_vision_api_key(self, key):
         self.vision.set_api_key(key)
         return {"success": True}
@@ -962,10 +1001,12 @@ class Api:
     def ask_mistai(self, message, model=None, gender=None, input_mode="text"):
         gate_taken = False      # did THIS call acquire the run gate?
         thread_started = False  # has the agent thread (which owns release) begun?
-        # Single sources of truth: the model comes from config, the gender from
-        # the saved profile (the UI dropdown writes the profile too, so text
-        # and voice can no longer disagree about "sir").
-        model = model or AGENT_MODEL
+        # Single sources of truth: the model is the user's choice, read once
+        # here so the whole request keeps it (the ``model`` argument is
+        # ignored: nothing may pick a different one per call); the gender
+        # comes from the saved profile (the UI dropdown writes the profile
+        # too, so text and voice can no longer disagree about "sir").
+        model = self.current_model()
         if not gender:
             gender = self.memory.get_profile("user_gender", "none")
         try:
@@ -1019,7 +1060,7 @@ class Api:
             # no gate, screen, planning or tools. Any doubt or failure falls
             # through to the agent unchanged. Skipped while an agent is busy.
             if not resume_rec and not self._agent_lock.locked():
-                reply = conversation.try_chat(self, message, gender)
+                reply = conversation.try_chat(self, message, gender, model=model)
                 if input_mode == "voice":
                     self._voice_mark("router_done", end=bool(reply))
                 if reply:
@@ -1048,6 +1089,7 @@ class Api:
                     my_gen = self._agent_generation
                     self._agent_task = message
                     self._agent_started_at = time.time()
+                    self._request_model = model  # the hotkey lookup follows it
 
             if gate_taken:
                 self._trusted_project_roots = set()
@@ -1088,6 +1130,7 @@ class Api:
                     if my_gen != self._agent_generation:
                         return  # stale callback from an older run; ignore
                     self._agent_task = None
+                    self._request_model = None
                     try:
                         self._agent_lock.release()
                     except RuntimeError:
@@ -1172,6 +1215,7 @@ class Api:
             if gate_taken and not thread_started:
                 with self._agent_state_lock:
                     self._agent_task = None
+                    self._request_model = None
                     try:
                         self._agent_lock.release()
                     except RuntimeError:
@@ -2177,13 +2221,16 @@ class Api:
                 f"'ctrl+k', nothing else. If you genuinely don't know, reply "
                 f"exactly 'unknown'."
             )
+            # The running request's model while a task runs, else the choice.
+            model = getattr(self, "_request_model", None) or self.current_model()
             r = requests.post(
                 url,
-                json={"message": prompt, "model": AGENT_MODEL},
+                json={"message": prompt, "model": model},
                 headers=headers,
                 timeout=10,
             )
             if not r.ok:
+                print(f"[Hotkey] {describe_api_error(r, model)}")
                 return None
             raw = r.json().get("response", "").strip().lower()
             if "unknown" in raw:

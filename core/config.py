@@ -19,14 +19,19 @@ FALLBACK_API = "https://mist-ai.fly.dev/api/v1/chat"
 # structured agent-mode contract.
 API_MODE = "backend"  # "direct_api" or "backend"
 
-# The ONE place the desktop agent's model is chosen. agent.py, api.py and the
-# UI all read this; nothing hardcodes "mistral"/"cohere" anymore. Mistral's
-# free tier is currently disabled upstream (429s), so: cohere.
-AGENT_MODEL = "cohere"
-# Conversation layer (core/conversation.py): model and timeout of the
-# chat-or-task routing call (primary URL only, no fallback). Any failure
-# routes to the agent.
-CHAT_MODEL = AGENT_MODEL
+# The models the user can pick in Settings (Api.set_model, saved as the
+# user_profile key "model"). Every LLM call -- agent, planner, conversation
+# router, hotkey lookup -- uses the one picked (Api.current_model()), and a
+# failure never switches to another one. Vision stays on Cohere (vision.py).
+MODEL_CHOICES = ("gemini", "cohere", "mistral")   # ids sent to the backend
+# What the UI shows for each id (Api.get_model_options). The only place the
+# names appear: ui/html.py hardcodes no id or label.
+MODEL_LABELS = {"gemini": "Nova", "cohere": "Sage", "mistral": "Flux"}
+DEFAULT_MODEL = "cohere"
+AGENT_MODEL = DEFAULT_MODEL  # alias: the default before the user picks one
+# Conversation layer (core/conversation.py): timeout of the chat-or-task
+# routing call (primary URL only, no fallback). Any failure routes to the
+# agent.
 CHAT_TIMEOUT = 5
 
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]

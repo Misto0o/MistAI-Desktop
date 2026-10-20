@@ -169,8 +169,9 @@ def test_no_key_backend_failure_is_not_masked_by_an_unauthenticated_fallback(
 
     result = loop._loop("perform a test task", "test-model", "none", "text", None)
 
-    assert calls == [1]
-    assert result["error"] == "API primary 503 (no compatible fallback)"
+    assert calls == [1]  # no unauthenticated fallback call
+    # The primary failure itself is reported, plainly (describe_api_error).
+    assert result["error"] == "Test-model request failed (HTTP 503)."
 
 
 def test_stop_while_model_request_is_in_flight_prevents_returned_action_dispatch(

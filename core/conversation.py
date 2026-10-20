@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 
 from . import planner
-from .config import CHAT_MODEL, CHAT_TIMEOUT
+from .config import CHAT_TIMEOUT, DEFAULT_MODEL
 
 _PROMPT = """You are Mist, a desktop assistant inspired by JARVIS: quick, confident, dry and a little playful, natural when spoken aloud, never robotic, and you don't narrate yourself.{address}
 
@@ -58,9 +58,18 @@ def parse_route(raw):
     return reply.strip()
 
 
-def try_chat(api, message, gender="none"):
+def _model_for(api, model):
+    """The request's model, else the user's choice (api.current_model()),
+    else the default -- bare test objects have no current_model."""
+    if model:
+        return model
+    current = getattr(api, "current_model", None)
+    return current() if callable(current) else DEFAULT_MODEL
+
+
+def try_chat(api, message, gender="none", model=None):
     """Answer ``message`` as conversation, or return None to hand it to the
-    agent. Never raises."""
+    agent. Never raises. ``model`` is the request's model (ask_mistai)."""
     t0 = time.monotonic()
     try:
         try:
@@ -72,7 +81,7 @@ def try_chat(api, message, gender="none"):
         raw = planner._llm(
             api,
             build_prompt(message, now, history, title),
-            CHAT_MODEL,
+            _model_for(api, model),
             timeout=CHAT_TIMEOUT,
             label="Conversation",
             fallback=False,
