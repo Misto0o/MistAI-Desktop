@@ -26,7 +26,9 @@ class _InlineThread:
 
 def _ptt_api(monkeypatch, heard="open my banking password", inline=True):
     """An Api with a stubbed mic/recognizer; heard is a string, None (silence)
-    or an exception to raise from recognize_google."""
+    or an exception to raise from recognize_google -- or a list of those, one
+    per listen (the last one repeats)."""
+    script = list(heard) if isinstance(heard, list) else [heard]
     if inline:
         monkeypatch.setattr(api_mod.threading, "Thread", _InlineThread)
     api = Api.__new__(Api)
@@ -43,6 +45,7 @@ def _ptt_api(monkeypatch, heard="open my banking password", inline=True):
                                  set_profile=profile.__setitem__)
     api.profile = profile
     api.tts = SimpleNamespace(interrupt=lambda: api.events.append("tts.interrupt"),
+                              say=lambda *a, **k: api.events.append("tts.say"),
                               set_gender=lambda g: None)
     api._notify_js = lambda js: api.events.append(js)
 
@@ -52,14 +55,15 @@ def _ptt_api(monkeypatch, heard="open my banking password", inline=True):
 
         def listen(self, src, timeout=None, phrase_time_limit=None):
             api.events.append(f"listen timeout={timeout}")
-            if heard is None:
+            self.now = script.pop(0) if len(script) > 1 else script[0]
+            if self.now is None:
                 raise sr.WaitTimeoutError("listening timed out")
             return object()
 
         def recognize_google(self, audio):
-            if isinstance(heard, Exception):
-                raise heard
-            return heard
+            if isinstance(self.now, Exception):
+                raise self.now
+            return self.now
 
     api.recognizer = Rec()
 
@@ -106,14 +110,82 @@ def test_sir_or_maam_in_the_command_sets_the_gender_as_in_on_wake(monkeypatch):
     assert api.profile["user_gender"] == "male"
 
 
-@pytest.mark.parametrize("heard", [None, sr.UnknownValueError(), "", "hey mist"])
-def test_no_words_shows_a_status_line_and_runs_nothing(monkeypatch, heard):
+NOTHING = 'handleListenState("idle","Didn\\\'t catch that")'
+
+
+def _listens(api):
+    return [e for e in api.events if e.startswith("listen timeout=")]
+
+
+@pytest.mark.parametrize("heard, listens", [
+    (None, 1), (sr.UnknownValueError(), 1), ("", 1),
+    ("hey mist", 2),            # wake phrase only: one follow-up, then give up
+])
+def test_no_words_shows_a_status_line_and_runs_nothing(monkeypatch, heard, listens):
     api = _ptt_api(monkeypatch, heard=heard)
     assert api.push_to_talk() == {"success": True}
-    assert _states(api)[-1] == 'handleListenState("idle","Didn\\\'t catch that")'
+    assert _states(api)[-1] == NOTHING
     assert api.asked == []
-    assert "speak" not in api.events                     # a status line, not spoken
+    assert len(_listens(api)) == listens
+    assert "tts.say" not in api.events                   # a status line, not spoken
     assert not api._ptt_waiting.is_set() and not api._conversation_lock.locked()
+
+
+# -- only the wake phrase heard: one silent follow-up listen ---------------------------
+
+def test_wake_phrase_then_a_command_runs_the_command(monkeypatch, capsys):
+    api = _ptt_api(monkeypatch, heard=["hey mist", "open my banking password"])
+    api.push_to_talk()
+    assert _listens(api) == ["listen timeout=6", "listen timeout=5"]   # 5s to start
+    assert api.asked == [("open my banking password", "female", "voice", False, True)]
+    assert "tts.say" not in api.events                   # silent: no "Yes?"
+    assert _states(api) == [
+        'handleListenState("waiting","")',
+        'handleListenState("listening","")',
+        'handleListenState("listening","")',             # the follow-up's mic is open
+        'handleListenState("idle","")',
+    ]
+    assert not any(w in capsys.readouterr().out for w in SECRET_WORDS)
+
+
+def test_the_follow_up_strips_the_wake_phrase_too(monkeypatch):
+    api = _ptt_api(monkeypatch, heard=["mist", "hey mist open notepad"])
+    api.push_to_talk()
+    assert [a[0] for a in api.asked] == ["open notepad"]
+
+
+@pytest.mark.parametrize("follow_up", ["hey mist", None, sr.UnknownValueError()],
+                         ids=["wake phrase twice", "then silence", "then unclear"])
+def test_one_follow_up_only_then_didnt_catch_that(monkeypatch, follow_up):
+    api = _ptt_api(monkeypatch, heard=["hey mist", follow_up, "open notepad"])
+    api.push_to_talk()
+    assert len(_listens(api)) == 2                        # never a third listen
+    assert _states(api)[-1] == NOTHING and api.asked == []
+    assert "tts.say" not in api.events
+
+
+@pytest.mark.parametrize("heard", [None, "open notepad"], ids=["silence", "a command"])
+def test_no_follow_up_unless_only_the_wake_phrase_was_heard(monkeypatch, heard):
+    api = _ptt_api(monkeypatch, heard=[heard, "should never be heard"])
+    api.push_to_talk()
+    assert _listens(api) == ["listen timeout=6"]
+
+
+def test_the_wake_loop_stays_off_the_mic_through_the_follow_up(monkeypatch):
+    api = _ptt_api(monkeypatch, heard=["hey mist", "open notepad"])
+    flags = []
+    real = api._listen_once
+
+    def listen(**kw):
+        flags.append(api._ptt_waiting.is_set())           # set before each listen...
+        out = real(**kw)
+        flags.append(api._ptt_waiting.is_set())           # ...and still set after it
+        return out
+
+    api._listen_once = listen
+    api.push_to_talk()
+    assert flags == [True, True, True, True]
+    assert api.asked[0][3] is False                       # cleared after the LAST listen
 
 
 def test_refused_while_a_task_runs_without_touching_the_mic(monkeypatch):

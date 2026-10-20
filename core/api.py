@@ -826,13 +826,19 @@ class Api:
             self.tts.interrupt()                  # stop Mist mid-sentence
             self._ptt_waiting.set()               # the wake loop leaves the mic alone
             self._notify_js('handleListenState("waiting","")')
-            cmd = self._listen_once(
-                timeout=6,
-                on_listening=lambda: self._notify_js('handleListenState("listening","")'),
-            )
-            # Free the mic for the wake loop now, so it can hear "stop" mid-task.
+            def listening():
+                self._notify_js('handleListenState("listening","")')
+
+            heard = self._listen_once(timeout=6, on_listening=listening)
+            cmd = strip_wake_prefix(heard) if heard else ""
+            if heard and not cmd:
+                # Only the wake phrase ("hey mist"): one silent follow-up
+                # listen for the command itself, then give up.
+                heard = self._listen_once(timeout=5, on_listening=listening)
+                cmd = strip_wake_prefix(heard) if heard else ""
+            # Free the mic for the wake loop now (after the LAST listen), so
+            # it can hear "stop" mid-task.
             self._ptt_waiting.clear()
-            cmd = strip_wake_prefix(cmd) if cmd else ""
             if not cmd:
                 idle(self._PTT_NOTHING)           # a status line, not spoken
                 return
