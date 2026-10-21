@@ -2,9 +2,10 @@
 
 ask_mistai minimizes MistAI before the agent runs; when the run REALLY ends
 (the agent thread's done/error callback, after the gate is released) the
-window comes back WITHOUT focus: ShowWindowAsync(SW_SHOWNOACTIVATE) plus an
-async, no-activate SetWindowPos. Never SetForegroundWindow, never
-window.restore(). win32gui / win32process / ShowWindowAsync are stubbed.
+window comes back WITHOUT focus: ShowWindowAsync(SW_SHOWNOACTIVATE), then an
+async, no-activate HWND_TOPMOST / HWND_NOTOPMOST pair that lifts it to the top
+of the normal band and always ends non-topmost. Never SetForegroundWindow,
+never window.restore(). win32gui / win32process / ShowWindowAsync are stubbed.
 """
 
 import inspect
@@ -23,6 +24,10 @@ from test_conversation_layer import CHAT, _routing_api
 HWND = 0x1234
 SW_SHOWNOACTIVATE = 4
 SWP_FLAGS = 0x4000 | 0x0010 | 0x0002 | 0x0001   # ASYNC | NOACTIVATE | NOMOVE | NOSIZE
+SWP_ASYNC, SWP_NOACTIVATE = 0x4000, 0x0010
+SWP_FORBIDDEN = 0x0040 | 0x0004 | 0x0020          # SHOWWINDOW | NOZORDER | FRAMECHANGED
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+WS_EX_TOPMOST = 0x8
 
 
 class _Win32:
@@ -31,6 +36,8 @@ class _Win32:
     def __init__(self, windows=None, iconic=True):
         self.calls = []
         self.iconic = iconic
+        self.exstyle = 0              # WS_EX_TOPMOST tracked like Windows does
+        self.raise_on = set()         # insert-after values whose call raises
         # hwnd -> (pid, owner, title): EnumWindows' top-level windows.
         self.windows = windows or {}
 
@@ -46,8 +53,18 @@ class _Win32:
         self.calls.append(("IsIconic", h))
         return self.iconic
 
-    def SetWindowPos(self, *a):
-        self.calls.append(("SetWindowPos",) + a)
+    def GetWindowLong(self, h, index):
+        self.calls.append(("GetWindowLong", h, index))
+        return self.exstyle
+
+    def SetWindowPos(self, h, after, *rest):
+        self.calls.append(("SetWindowPos", h, after) + rest)
+        if after in self.raise_on:
+            raise OSError("SetWindowPos failed")
+        if after == HWND_TOPMOST:
+            self.exstyle |= WS_EX_TOPMOST
+        elif after == HWND_NOTOPMOST:
+            self.exstyle &= ~WS_EX_TOPMOST
 
     def SetForegroundWindow(self, h):
         self.calls.append(("SetForegroundWindow", h))
@@ -93,7 +110,9 @@ def win(monkeypatch):
 
 
 RESTORE = [("IsIconic", HWND), ("ShowWindowAsync", HWND, SW_SHOWNOACTIVATE),
-           ("SetWindowPos", HWND, 0, 0, 0, 0, 0, SWP_FLAGS)]
+           ("GetWindowLong", HWND, -20),
+           ("SetWindowPos", HWND, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS),
+           ("SetWindowPos", HWND, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_FLAGS)]
 
 
 def _restores(w):
@@ -117,9 +136,21 @@ def _api(monkeypatch, run=None, llm_reply=""):
     return api
 
 
+def _positions(w):
+    return [c for c in w.calls if c[0] == "SetWindowPos"]
+
+
 def _no_focus_change(api, w):
-    assert not any(c[0] == "SetForegroundWindow" for c in w.calls)
+    focus = {"SetForegroundWindow", "BringWindowToTop", "SetActiveWindow", "SetFocus"}
+    assert not any(c[0] in focus for c in w.calls)
     assert api._window.calls == []                  # no window.restore()
+    for c in _positions(w):                         # never activates, always async
+        flags = c[-1]
+        assert flags & SWP_NOACTIVATE and flags & SWP_ASYNC
+        assert not flags & SWP_FORBIDDEN
+    if _positions(w):                               # always ends non-topmost
+        assert _positions(w)[-1][2] == HWND_NOTOPMOST
+    assert not w.exstyle & WS_EX_TOPMOST
 
 
 # -- one no-activate restore per finished task -----------------------------------------
@@ -143,7 +174,7 @@ def test_a_window_the_user_already_restored_is_left_alone(monkeypatch, win):
     win.iconic = False
     api = _api(monkeypatch, run=lambda cb: cb["on_done"]({"success": True}))
     Api.ask_mistai(api, "open notepad")
-    assert win.calls == [("IsIconic", HWND)]
+    assert win.calls == [("IsIconic", HWND)] and _positions(win) == []
 
 
 # -- never for chat, filler or busy replies ---------------------------------------------
@@ -266,6 +297,73 @@ def test_the_handle_falls_back_to_this_process_top_level_window(win):
 
 def test_the_restore_path_never_focuses_or_calls_window_restore():
     src = inspect.getsource(Api._restore_after_task) + inspect.getsource(Api._own_window_handle)
-    assert "SetForegroundWindow" not in src and ".restore()" not in src
+    for name in ("SetForegroundWindow", "BringWindowToTop", "SetActiveWindow", "SetFocus",
+                 ".restore()"):
+        assert name not in src, name
     # The existing ask-the-user restore is unchanged.
     assert "self._window.restore()" in inspect.getsource(Api._get_text_answer)
+
+
+# -- the raise: topmost then not-topmost, always ending non-topmost ------------------------
+
+def _bare(win):
+    api = Api.__new__(Api)
+    api._window = _Window()
+    api._agent_state_lock, api._agent_lock = threading.Lock(), threading.Lock()
+    api._agent_generation = 1
+    return api
+
+
+def test_the_raise_logs_its_line(win, capsys):
+    api = _bare(win)
+    api._restore_after_task(1)
+    assert win.calls == RESTORE
+    assert "[Window] Restored and raised after the task (not activated)" in capsys.readouterr().out
+    _no_focus_change(api, win)
+
+
+def test_a_failed_topmost_call_still_clears_topmost(win, capsys):
+    win.raise_on = {HWND_TOPMOST}
+    api = _bare(win)
+    api._restore_after_task(1)
+    assert [c[2] for c in _positions(win)] == [HWND_TOPMOST, HWND_NOTOPMOST]
+    assert "Restore after the task skipped: OSError" in capsys.readouterr().out
+    _no_focus_change(api, win)
+
+
+def test_a_failed_notopmost_call_is_logged_by_type_only(win, capsys):
+    win.raise_on = {HWND_NOTOPMOST}
+    api = _bare(win)
+    api._restore_after_task(1)                   # no crash
+    out = capsys.readouterr().out
+    assert "[Window] Could not clear topmost: OSError" in out
+    assert "SetWindowPos failed" not in out      # the type, never the message
+    assert [c[2] for c in _positions(win)] == [HWND_TOPMOST, HWND_NOTOPMOST]
+
+
+def test_an_already_topmost_window_is_left_alone(win):
+    win.exstyle = WS_EX_TOPMOST
+    api = _bare(win)
+    api._restore_after_task(1)
+    assert _positions(win) == []
+    assert win.exstyle & WS_EX_TOPMOST           # its topmost state is kept
+    assert ("ShowWindowAsync", HWND, SW_SHOWNOACTIVATE) in win.calls
+
+
+@pytest.mark.parametrize("skip", ["stale", "gate", "prompt", "off", "shown"])
+def test_every_skip_makes_no_position_call(monkeypatch, win, skip):
+    api = _bare(win)
+    api._awaiting_text_answer = threading.Event()
+    gen = 1
+    if skip == "stale":
+        gen = 0
+    elif skip == "gate":
+        api._agent_lock.acquire()
+    elif skip == "prompt":
+        api._awaiting_text_answer.set()
+    elif skip == "off":
+        monkeypatch.setenv("MISTAI_RESTORE_AFTER_TASK", "0")
+    elif skip == "shown":
+        win.iconic = False
+    api._restore_after_task(gen)
+    assert _positions(win) == [] and _restores(win) == []

@@ -382,10 +382,20 @@ class Api:
                 if not win32gui.IsIconic(hwnd):
                     return          # already shown (the user restored it)
                 _show_window_async(hwnd, 4)                     # SW_SHOWNOACTIVATE
-                win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0,      # HWND_TOP
-                                      0x4000 | 0x0010 | 0x0002 | 0x0001)
+                # HWND_TOP does not lift it above the app in front; a brief
+                # topmost then not-topmost puts it at the top of the normal
+                # band. A window that is already topmost is left alone.
+                flags = 0x4000 | 0x0010 | 0x0002 | 0x0001
                 # SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE
-            print("[Window] Restored after the task (not activated)")
+                if not win32gui.GetWindowLong(hwnd, -20) & 0x8:  # GWL_EXSTYLE, WS_EX_TOPMOST
+                    try:
+                        win32gui.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)  # HWND_TOPMOST
+                    finally:
+                        try:
+                            win32gui.SetWindowPos(hwnd, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+                        except Exception as e:
+                            print(f"[Window] Could not clear topmost: {type(e).__name__}")
+            print("[Window] Restored and raised after the task (not activated)")
         except Exception as e:
             print(f"[Window] Restore after the task skipped: {type(e).__name__}")
 
