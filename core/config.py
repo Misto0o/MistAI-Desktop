@@ -216,6 +216,13 @@ def env_flag(name, default):
     return default
 
 
+def restore_after_task_enabled():
+    """Bring MistAI's minimized window back (without taking focus) when an
+    agent task ends. On by default; MISTAI_RESTORE_AFTER_TASK=0 turns it off.
+    Read at call time."""
+    return env_flag("MISTAI_RESTORE_AFTER_TASK", True)
+
+
 def vision_gating_enabled():
     """Gated screen-context reads in AgentLoop. On by default;
     MISTAI_VISION_GATING=0 turns it off (read per phase, so a harness can A/B)."""

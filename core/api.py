@@ -45,6 +45,7 @@ from .config import (
     my_facts_path,
     normalize_process_name,
     process_matches,
+    restore_after_task_enabled,
     secret_output_reason,
     strip_wake_prefix,
 )
@@ -81,6 +82,15 @@ _WITHHELD_NOTE = (
     "because it may contain secrets; do not guess it, and do not offer to "
     "reveal it or retry another way."
 )
+
+
+def _show_window_async(hwnd, cmd):
+    """user32 ShowWindowAsync (pywin32 has no binding): posts the change to
+    the window's own thread, so the caller never waits on it."""
+    import ctypes
+
+    return ctypes.windll.user32.ShowWindowAsync(hwnd, cmd)
+
 
 class Api:
     _BROWSER_APP_NAMES = {"firefox", "chrome", "edge", "browser"}
@@ -300,6 +310,84 @@ class Api:
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _own_window_handle(self):
+        """MistAI's own top-level window: pywebview's WinForms form
+        (window.native.Handle), else the unowned top-level window of this
+        process with the window's title. None when there is no window.
+        Called outside _agent_state_lock (the title read messages the UI
+        thread)."""
+        window = getattr(self, "_window", None)
+        if window is None:
+            return None
+        cached = getattr(self, "_own_hwnd", None)
+        try:
+            import win32gui
+
+            if cached and win32gui.IsWindow(cached):
+                return cached
+        except Exception:
+            return None
+        hwnd = None
+        try:
+            hwnd = int(window.native.Handle.ToInt32()) or None
+        except Exception:
+            hwnd = None
+        if hwnd is None:
+            title = str(getattr(window, "title", "") or "")
+            if not title:
+                return None
+            try:
+                import win32process
+
+                found = []
+
+                def _cb(h, _):
+                    try:
+                        if (win32process.GetWindowThreadProcessId(h)[1] == os.getpid()
+                                and not win32gui.GetWindow(h, 4)      # GW_OWNER
+                                and win32gui.GetWindowText(h) == title):
+                            found.append(h)
+                    except Exception:
+                        pass
+                    return True
+
+                win32gui.EnumWindows(_cb, None)
+                hwnd = found[0] if found else None
+            except Exception:
+                hwnd = None
+        self._own_hwnd = hwnd
+        return hwnd
+
+    def _restore_after_task(self, gen):
+        """Show MistAI's window again, WITHOUT activating it, when the run
+        `gen` has really ended. Skipped when the setting is off, there is no
+        window, a newer run has started or holds the gate, or a text prompt
+        is open. Only async calls are made under _agent_state_lock (they post
+        to the window's thread), so nothing can block while it is held. It
+        never activates the window or uses pywebview's own restore."""
+        try:
+            if not restore_after_task_enabled():
+                return
+            hwnd = self._own_window_handle()
+            if not hwnd:
+                return
+            import win32gui
+
+            prompt = getattr(self, "_awaiting_text_answer", None)
+            with self._agent_state_lock:
+                if (gen != self._agent_generation or self._agent_lock.locked()
+                        or (prompt is not None and prompt.is_set())):
+                    return
+                if not win32gui.IsIconic(hwnd):
+                    return          # already shown (the user restored it)
+                _show_window_async(hwnd, 4)                     # SW_SHOWNOACTIVATE
+                win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0,      # HWND_TOP
+                                      0x4000 | 0x0010 | 0x0002 | 0x0001)
+                # SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE
+            print("[Window] Restored after the task (not activated)")
+        except Exception as e:
+            print(f"[Window] Restore after the task skipped: {type(e).__name__}")
 
     def toggle_captions(self, enabled):
         self.captions_enabled = enabled
@@ -1143,6 +1231,7 @@ class Api:
     def ask_mistai(self, message, model=None, gender=None, input_mode="text"):
         gate_taken = False      # did THIS call acquire the run gate?
         thread_started = False  # has the agent thread (which owns release) begun?
+        minimized = False       # did THIS call minimize MistAI (restored at the end)?
         # Single sources of truth: the model is the user's choice, read once
         # here so the whole request keeps it (the ``model`` argument is
         # ignored: nothing may pick a different one per call); the gender
@@ -1263,6 +1352,7 @@ class Api:
                 }
 
             self.minimize_window()
+            minimized = True
             result_holder = {}
             done_event = threading.Event()
 
@@ -1290,12 +1380,14 @@ class Api:
             def _on_done(result):
                 result_holder.update(result)
                 _release()
+                self._restore_after_task(my_gen)
                 done_event.set()
 
             def _on_error(err):
                 result_holder["success"] = False
                 result_holder["error"] = err
                 _release()
+                self._restore_after_task(my_gen)
                 done_event.set()
 
             self.memory.add_conversation("user", message)
@@ -1362,6 +1454,8 @@ class Api:
                         self._agent_lock.release()
                     except RuntimeError:
                         pass
+                if minimized:
+                    self._restore_after_task(my_gen)
             return {"success": False, "error": str(e)}
 
     def execute_action(self, action_type, parameter, speech=""):
