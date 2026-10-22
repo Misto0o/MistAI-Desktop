@@ -33,6 +33,9 @@ from .config import (
     GENDER_CHOICES,
     MODEL_CHOICES,
     MODEL_LABELS,
+    PTT_PAUSE_THRESHOLD,
+    PTT_PHRASE_TIME_LIMIT,
+    PTT_THRESHOLD_MAX_AGE,
     STATUS_URL,
     TRACKED_APPS,
     WAKE_WORDS,
@@ -827,10 +830,12 @@ class Api:
 
         print("[ConversationLoop] Ended, returning to wake-word-only mode")
 
-    def _listen_once(self, timeout=6, on_listening=None):
+    def _listen_once(self, timeout=6, on_listening=None, ptt=False):
         # Set before waiting for the mic, so the wake loop can log a clip it
         # transcribes meanwhile ([MicCompete]). on_listening (optional) is
         # called once the mic is open, right before listening starts.
+        # ptt=True: push-to-talk's own recognizer and settings (see
+        # _ptt_listen_setup); every other caller is unchanged.
         waiting = getattr(self, "_listen_waiting", None)
         if waiting is not None:
             waiting.set()
@@ -838,21 +843,26 @@ class Api:
             with self._mic_lock:
                 self._voice_mark("mic_acquired")
                 try:
+                    rec = self._ptt_recognizer() if ptt else self.recognizer
                     with self.microphone as src:
-                        self.recognizer.pause_threshold = 1.0
-                        self.recognizer.non_speaking_duration = 0.5
-                        self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
+                        if ptt:
+                            phrase_limit = self._ptt_listen_setup(rec, src)
+                        else:
+                            self.recognizer.pause_threshold = 1.0
+                            self.recognizer.non_speaking_duration = 0.5
+                            self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
+                            phrase_limit = 15
                         self._voice_mark("listen_start")
                         if on_listening is not None:
                             try:
                                 on_listening()
                             except Exception as e:
                                 print(f"[ListenOnce] on_listening failed ({type(e).__name__})")
-                        audio = self.recognizer.listen(
-                            src, timeout=timeout, phrase_time_limit=15
+                        audio = rec.listen(
+                            src, timeout=timeout, phrase_time_limit=phrase_limit
                         )
                         self._voice_mark("speech_end")
-                        text = self.recognizer.recognize_google(audio)
+                        text = rec.recognize_google(audio)
                         self._voice_mark("stt_done")
                         return text
                 except Exception as e:
@@ -862,6 +872,31 @@ class Api:
         finally:
             if waiting is not None:
                 waiting.clear()
+
+    def _ptt_recognizer(self):
+        """Push-to-talk's own recognizer (created on first use), so its
+        settings and noise threshold never touch the shared one."""
+        rec = getattr(self, "ptt_recognizer", None)
+        if rec is None:
+            rec = self.ptt_recognizer = sr.Recognizer()
+        return rec
+
+    def _ptt_listen_setup(self, rec, src):
+        """Settings for a push-to-talk listen, with the mic already open
+        (called under _mic_lock). The 0.3s noise adjustment runs on the first
+        press and again once the measured threshold is PTT_THRESHOLD_MAX_AGE
+        old; in between the threshold is reused. Returns the phrase limit."""
+        self._voice_mark("mic_open")          # mic_acquired -> mic_open: opening
+        rec.pause_threshold = PTT_PAUSE_THRESHOLD
+        rec.non_speaking_duration = 0.5
+        at = getattr(self, "_ptt_calibrated_at", None)
+        now = time.monotonic()
+        if at is not None and now - at < PTT_THRESHOLD_MAX_AGE:
+            print(f"[PushToTalk] Noise threshold reused ({now - at:.0f}s old)")
+        else:
+            rec.adjust_for_ambient_noise(src, duration=0.3)
+            self._ptt_calibrated_at = time.monotonic()
+        return PTT_PHRASE_TIME_LIMIT
 
     def _voice_ask(self, cmd, gender):
         """One voice command through the normal flow (push-to-talk and the
@@ -926,12 +961,12 @@ class Api:
             def listening():
                 self._notify_js('handleListenState("listening","")')
 
-            heard = self._listen_once(timeout=6, on_listening=listening)
+            heard = self._listen_once(timeout=6, on_listening=listening, ptt=True)
             cmd = strip_wake_prefix(heard) if heard else ""
             if heard and not cmd:
                 # Only the wake phrase ("hey mist"): one silent follow-up
                 # listen for the command itself, then give up.
-                heard = self._listen_once(timeout=5, on_listening=listening)
+                heard = self._listen_once(timeout=5, on_listening=listening, ptt=True)
                 cmd = strip_wake_prefix(heard) if heard else ""
             # Free the mic for the wake loop now (after the LAST listen), so
             # it can hear "stop" mid-task.

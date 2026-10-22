@@ -36,6 +36,14 @@ CHAT_TIMEOUT = 5
 
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]
 
+# Push-to-talk listening (Api._listen_once(ptt=True)), on its own recognizer;
+# every other listen keeps the shared recognizer's 1.0s pause and 15s limit.
+# A press may pause longer mid-sentence and talk longer. The noise threshold
+# measured on a press is reused for later presses until it is this old.
+PTT_PAUSE_THRESHOLD = 2.0
+PTT_PHRASE_TIME_LIMIT = 30
+PTT_THRESHOLD_MAX_AGE = 600
+
 # Wake-loop energy threshold (core/wake_calibration.py). The threshold is
 # fixed between calibrations. A calibration outside [MIN, MAX] is clamped and
 # retried once. MIN keeps hum from opening clips; MAX only catches a

@@ -50,11 +50,15 @@ def _ptt_api(monkeypatch, heard="open my banking password", inline=True):
     api._notify_js = lambda js: api.events.append(js)
 
     class Rec:
+        """Push-to-talk's recognizer: each listen records its settings."""
+        pause_threshold, non_speaking_duration = 0.8, 0.5     # sr.Recognizer defaults
+
         def adjust_for_ambient_noise(self, src, duration=1):
-            api.events.append(f"adjust (ptt_waiting={api._ptt_waiting.is_set()})")
+            api.events.append(f"adjust {duration}s (ptt_waiting={api._ptt_waiting.is_set()})")
 
         def listen(self, src, timeout=None, phrase_time_limit=None):
-            api.events.append(f"listen timeout={timeout}")
+            api.events.append(f"listen timeout={timeout} limit={phrase_time_limit} "
+                              f"pause={self.pause_threshold}")
             self.now = script.pop(0) if len(script) > 1 else script[0]
             if self.now is None:
                 raise sr.WaitTimeoutError("listening timed out")
@@ -65,7 +69,14 @@ def _ptt_api(monkeypatch, heard="open my banking password", inline=True):
                 raise self.now
             return self.now
 
-    api.recognizer = Rec()
+    class Shared:
+        """The shared recognizer: push-to-talk must never use it."""
+        def __getattr__(self, name):
+            api.events.append(f"shared recognizer used: {name}")
+            raise AssertionError("push-to-talk used the shared recognizer")
+
+    api.ptt_recognizer = Rec()
+    api.recognizer = Shared()
 
     def ask(message, model=None, gender=None, input_mode="text"):
         api.events.append("ask_mistai")
@@ -87,9 +98,9 @@ def test_a_press_listens_once_and_runs_the_normal_voice_turn(monkeypatch, capsys
     assert api.events == [
         "tts.interrupt",                                  # Mist stops talking first
         'handleListenState("waiting","")',
-        "adjust (ptt_waiting=True)",                      # wake loop kept off the mic
+        "adjust 0.3s (ptt_waiting=True)",                 # wake loop kept off the mic
         'handleListenState("listening","")',              # only once the mic is open
-        "listen timeout=6",
+        "listen timeout=6 limit=30 pause=2.0",            # push-to-talk's own settings
         'handleListenState("idle","")',
         'handleVoiceTurn("open my banking password")',    # the chat turn (Stage 3)
         "ask_mistai",
@@ -114,7 +125,7 @@ NOTHING = 'handleListenState("idle","Didn\\\'t catch that")'
 
 
 def _listens(api):
-    return [e for e in api.events if e.startswith("listen timeout=")]
+    return [e.split(" limit=")[0] for e in api.events if e.startswith("listen timeout=")]
 
 
 @pytest.mark.parametrize("heard, listens", [
@@ -272,6 +283,7 @@ def test_thread_start_failure_releases_the_lock(monkeypatch):
 def test_on_listening_is_optional_and_a_failing_callback_does_not_stop_the_listen(
         monkeypatch, capsys):
     api = _ptt_api(monkeypatch, heard="open notepad")
+    api.recognizer = api.ptt_recognizer         # the shared path, with a working stub
     assert api._listen_once(timeout=3) == "open notepad"           # existing call form
 
     def bad():
