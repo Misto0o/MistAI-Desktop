@@ -240,7 +240,7 @@ def test_the_lock_and_flag_are_released_on_every_exception(monkeypatch, capsys, 
     assert api.push_to_talk() == {"success": True}      # usable again
 
 
-def test_a_second_press_while_the_first_listens_is_refused(monkeypatch):
+def test_a_second_press_while_the_first_listens_stops_it(monkeypatch):
     api = _ptt_api(monkeypatch, inline=False)
     in_listen, finish = threading.Event(), threading.Event()
     real = api._listen_once
@@ -253,13 +253,17 @@ def test_a_second_press_while_the_first_listens_is_refused(monkeypatch):
     api._listen_once = slow_listen
     assert api.push_to_talk() == {"success": True}
     assert in_listen.wait(5)
-    assert api.push_to_talk()["error"] == "listening"
+    # Change 3b: a second press ends the listen (see test_ptt_second_press.py);
+    # this stub's mic has no stream, so what was "heard" still runs.
+    assert api.push_to_talk() == {"success": True, "stopped": True}
+    assert api._ptt_stop.is_set()
     finish.set()
     for _ in range(100):
         if not api._conversation_lock.locked():
             break
         threading.Event().wait(0.02)
     assert not api._conversation_lock.locked() and len(api.asked) == 1
+    assert not api._ptt_stop.is_set()                    # cleared when the turn ends
 
 
 def test_thread_start_failure_releases_the_lock(monkeypatch):

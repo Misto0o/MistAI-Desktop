@@ -228,6 +228,11 @@ def main_mode(mode):
                 ("status shows 'Listening...' with the button highlighted",
                  listening.get("text") == "Listening..." and listening.get("active") is True,
                  listening),
+                ("the Talk label reads 'Done' while listening",
+                 listening.get("label") == "Done", listening),
+                ("the label is back to 'Talk' after the listen",
+                 note.get("label") == "Talk" and after.get("label") == "Talk",
+                 {"note": note, "after": after}),
                 ("'Didn't catch that' shows, then the status returns",
                  note.get("text") == "Didn't catch that" and note.get("active") is False
                  and after.get("text") == "Ready" and after.get("active") is False,

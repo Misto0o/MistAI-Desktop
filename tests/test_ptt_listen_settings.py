@@ -190,7 +190,7 @@ def test_only_push_to_talk_passes_ptt():
     for rel in ("core/api.py", "core/agent.py", "core/planner.py"):
         with open(os.path.join(REPO, rel), encoding="utf-8") as f:
             for line in f:
-                if "_listen_once(" in line and "def _listen_once" not in line:
+                if re.search(r"\b(?:self|api)\._listen_once\(", line):
                     found.append((rel, "ptt=True" in line))
     ptt = [rel for rel, on in found if on]
     assert ptt == ["core/api.py", "core/api.py"]

@@ -95,6 +95,41 @@ def _show_window_async(hwnd, cmd):
     return ctypes.windll.user32.ShowWindowAsync(hwnd, cmd)
 
 
+# What _listen_once(ptt=True) returns when a second press stopped the listen
+# before any speech: the turn ends quietly, with no recognition call.
+_PTT_CANCELLED = object()
+
+
+class _StoppableStream:
+    """The microphone stream of ONE push-to-talk listen. read() returns b""
+    (the end of the stream, for SpeechRecognition's listen()) once `stop` is
+    set, so a second press ends the listen within one chunk. It notes whether
+    any chunk was loud enough to count as speech -- listen()'s own test,
+    against the recognizer's current energy_threshold. close() passes
+    through, so Microphone.__exit__ closes the real stream."""
+
+    def __init__(self, stream, stop, rec, sample_width):
+        import audioop
+
+        self._stream, self._stop, self._rec = stream, stop, rec
+        self._width, self._rms = sample_width, audioop.rms
+        self.speech = False
+
+    def read(self, size):
+        if self._stop.is_set():
+            return b""
+        buf = self._stream.read(size)
+        if buf and not self.speech:
+            try:
+                self.speech = self._rms(buf, self._width) > self._rec.energy_threshold
+            except Exception:
+                pass
+        return buf
+
+    def close(self):
+        return self._stream.close()
+
+
 class Api:
     _BROWSER_APP_NAMES = {"firefox", "chrome", "edge", "browser"}
 
@@ -205,6 +240,8 @@ class Api:
         # Set while a push-to-talk press waits for or holds the mic: the wake
         # loop skips taking the mic so it cannot swallow the command.
         self._ptt_waiting = threading.Event()
+        # Set by a second press during a push-to-talk listen: ends it early.
+        self._ptt_stop = threading.Event()
         self.captions_enabled = False
         self.caption_window = None
         self._window = None
@@ -844,9 +881,16 @@ class Api:
                 self._voice_mark("mic_acquired")
                 try:
                     rec = self._ptt_recognizer() if ptt else self.recognizer
+                    stream = None
                     with self.microphone as src:
                         if ptt:
                             phrase_limit = self._ptt_listen_setup(rec, src)
+                            # After the adjustment, so a stop never skews the
+                            # stored noise threshold.
+                            if getattr(src, "stream", None) is not None:
+                                stream = src.stream = _StoppableStream(
+                                    src.stream, self._ptt_stop_event(), rec,
+                                    getattr(src, "SAMPLE_WIDTH", 2))
                         else:
                             self.recognizer.pause_threshold = 1.0
                             self.recognizer.non_speaking_duration = 0.5
@@ -862,6 +906,10 @@ class Api:
                             src, timeout=timeout, phrase_time_limit=phrase_limit
                         )
                         self._voice_mark("speech_end")
+                        if (stream is not None and self._ptt_stop_event().is_set()
+                                and not stream.speech):
+                            self._voice_mark("cancelled", end=True)
+                            return _PTT_CANCELLED
                         text = rec.recognize_google(audio)
                         self._voice_mark("stt_done")
                         return text
@@ -872,6 +920,12 @@ class Api:
         finally:
             if waiting is not None:
                 waiting.clear()
+
+    def _ptt_stop_event(self):
+        ev = getattr(self, "_ptt_stop", None)
+        if ev is None:
+            ev = self._ptt_stop = threading.Event()
+        return ev
 
     def _ptt_recognizer(self):
         """Push-to-talk's own recognizer (created on first use), so its
@@ -931,7 +985,12 @@ class Api:
         """One press, one voice command, no wake word: listen once, then run
         the normal voice turn. Refused (mic untouched) while a task runs or a
         conversation is active. Returns at once; the turn runs on a thread and
-        the page follows it through handleListenState."""
+        the page follows it through handleListenState. A press DURING a
+        push-to-talk listen ends that listen early (what was said so far is
+        used; nothing said: the turn ends quietly)."""
+        if self._ptt_wants_mic():
+            self._ptt_stop_event().set()
+            return {"success": True, "stopped": True}
         if self._agent_lock.locked():
             return {"success": False, "error": "busy", "message": self._PTT_BUSY}
         if not self._conversation_lock.acquire(blocking=False):
@@ -953,7 +1012,9 @@ class Api:
             idle_sent = True
             self._notify_js(f'handleListenState("idle","{esc(message)}")')
 
+        stop = self._ptt_stop_event()
         try:
+            stop.clear()                          # a press never leaks into this turn
             self._voice_start("ptt")
             self.tts.interrupt()                  # stop Mist mid-sentence
             self._ptt_waiting.set()               # the wake loop leaves the mic alone
@@ -962,11 +1023,16 @@ class Api:
                 self._notify_js('handleListenState("listening","")')
 
             heard = self._listen_once(timeout=6, on_listening=listening, ptt=True)
+            if heard is _PTT_CANCELLED:
+                return self._ptt_cancelled(idle)
             cmd = strip_wake_prefix(heard) if heard else ""
-            if heard and not cmd:
+            if heard and not cmd and not stop.is_set():
                 # Only the wake phrase ("hey mist"): one silent follow-up
-                # listen for the command itself, then give up.
+                # listen for the command itself, then give up. Not after a
+                # second press: the user said they were done.
                 heard = self._listen_once(timeout=5, on_listening=listening, ptt=True)
+                if heard is _PTT_CANCELLED:
+                    return self._ptt_cancelled(idle)
                 cmd = strip_wake_prefix(heard) if heard else ""
             # Free the mic for the wake loop now (after the LAST listen), so
             # it can hear "stop" mid-task.
@@ -986,9 +1052,17 @@ class Api:
                 idle("Push-to-talk failed")
         finally:
             self._ptt_waiting.clear()
+            stop.clear()
             self._conversation_lock.release()
             if not idle_sent:
                 idle()
+
+    def _ptt_cancelled(self, idle):
+        """A second press before any speech: no recognition call, no
+        "Didn't catch that"; the status simply returns."""
+        self._ptt_waiting.clear()
+        print("[PushToTalk] Stopped before any speech (cancelled)")
+        idle()
 
     def toggle_proactive_mode(self, enabled):
         return {"success": True}

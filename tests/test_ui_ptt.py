@@ -30,7 +30,7 @@ def _real_refusals():
 def test_the_under_orb_wake_button_is_now_push_to_talk():
     assert "ctrl-wake" not in HTML and "ctrlWake" not in HTML
     m = re.search(r'<div class="control-item">\s*<button class="ctrl-btn" id="btn-ptt"[^>]*>'
-                  r'[^<]*</button>\s*<div class="ctrl-label">Talk</div>', HTML)
+                  r'[^<]*</button>\s*<div class="ctrl-label" id="ptt-label">Talk</div>', HTML)
     assert m, "btn-ptt sits in the under-orb control bar with the same styling"
     assert HTML.index('id="btn-ptt"') < HTML.index('id="ctrl-caption"')   # same position
 
@@ -54,7 +54,7 @@ def test_push_to_talk_button_and_states():
     assert "showPttNote((r&&r.message)||" in click
     assert "setMistStatus('listening','Waiting for mic...')" in js
     assert "setMistStatus('listening','Listening...')" in js
-    assert "const PTT_NOTE_MS=3000,PTT_SAFETY_MS=30000;" in js
+    assert "const PTT_NOTE_MS=3000,PTT_SAFETY_MS=45000;" in js
     # Notes go through setMistStatus, which writes textContent, never HTML.
     assert "mistStatusText.textContent=text;" in js
     note = js.split("function showPttNote(text){", 1)[1].split("\n}\n", 1)[0]
@@ -123,10 +123,27 @@ def test_refusals_show_pythons_message_then_restore(tmp_path):
 
 
 @needs_node
-def test_a_lost_idle_is_restored_after_thirty_seconds(tmp_path):
-    a = _run(tmp_path, [{"state": "listening"}, {"advance": 29000}, {"advance": 1000}])
+def test_a_lost_idle_is_restored_after_forty_five_seconds(tmp_path):
+    a = _run(tmp_path, [{"state": "listening"}, {"advance": 44000}, {"advance": 1000}])
     assert a[1]["text"] == "Listening..." and a[1]["ptt"] == ["active"]
     assert _status(a[2]) == READY
+
+
+@needs_node
+def test_every_waiting_or_listening_message_restarts_the_safety_window(tmp_path):
+    a = _run(tmp_path, [
+        {"state": "waiting"},
+        {"advance": 40000},
+        {"state": "listening"},          # restarts: a fresh 45s
+        {"advance": 40000},              # 80s since the press, 40s since listening
+        {"state": "listening"},          # the wake-phrase follow-up: restarts again
+        {"advance": 44000},
+        {"advance": 1000},               # 45s of silence from Python: restored
+    ])
+    assert a[1]["text"] == "Waiting for mic..."
+    assert a[3]["text"] == "Listening..." and a[3]["label"] == "Done"
+    assert a[5]["text"] == "Listening..." and a[5]["ptt"] == ["active"]
+    assert _status(a[6]) == READY and a[6]["label"] == "Talk"
 
 
 @needs_node
@@ -154,3 +171,53 @@ def test_the_task_status_follows_a_listen_and_wake_mode(tmp_path):
     assert a[5]["text"] == "Ready" and a[5]["wake"] == []
     assert a[5]["wakeCalls"] == ["start_wake_word_detection", "stop_wake_word_detection"]
     assert a[3]["wakeCalls"] == []                           # nothing started it before
+
+
+# -- a second press ends the listen ("Done") -----------------------------------------
+
+def _real_stop():
+    """What the REAL push_to_talk() returns for a press during a listen."""
+    api = Api.__new__(Api)
+    api._agent_lock, api._conversation_lock = threading.Lock(), threading.Lock()
+    api._ptt_waiting = threading.Event()
+    api._ptt_waiting.set()
+    return api.push_to_talk()
+
+
+def test_the_label_reads_done_while_listening():
+    assert '<div class="ctrl-label" id="ptt-label">Talk</div>' in HTML
+    js = _script()
+    assert "const pttLabel=document.getElementById('ptt-label');" in js
+    state = js.split("function handleListenState(state,message){", 1)[1].split("\n}\n", 1)[0]
+    assert "pttLabel.textContent=pttState==='listening'?'Done':'Talk';" in state
+    assert "innerHTML" not in state
+
+
+@needs_node
+def test_a_second_press_reads_done_and_ends_quietly(tmp_path):
+    stopped = _real_stop()
+    assert stopped == {"success": True, "stopped": True}
+    a = _run(tmp_path, [
+        {"click": "btn-ptt"},
+        {"state": "waiting"},
+        {"state": "listening"},
+        {"click": "btn-ptt"},            # "Done": Python ends the listen
+        {"state": "idle"},               # cancelled: no note
+    ], ptt=[{"success": True}, stopped])
+    assert a[1]["label"] == "Talk"                           # waiting: not yet
+    assert a[2]["label"] == "Done" and a[2]["ptt"] == ["active"]
+    assert a[3]["calls"] == 2 and a[3]["text"] == "Listening..."   # no refusal note
+    assert a[3]["label"] == "Done"
+    assert _status(a[4]) == READY and a[4]["label"] == "Talk"
+
+
+@needs_node
+def test_the_label_returns_to_talk_after_a_note_and_the_safety_restore(tmp_path):
+    a = _run(tmp_path, [
+        {"state": "listening"},
+        {"state": "idle", "message": "Didn't catch that"},
+        {"state": "listening"},
+        {"advance": 45000},
+    ])
+    assert a[0]["label"] == "Done" and a[1]["label"] == "Talk"
+    assert a[2]["label"] == "Done" and a[3]["label"] == "Talk"

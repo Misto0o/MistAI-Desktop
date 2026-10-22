@@ -191,6 +191,7 @@ let out_actions = [];
     text: document.getElementById('mist-status-text').textContent,
     cls: document.getElementById('mist-status').className,
     ptt: document.getElementById('btn-ptt').classList.list,
+    label: document.getElementById('ptt-label').textContent,
     wave: document.getElementById('wave').style.opacity || '',
   });
   out_actions = [];

@@ -244,7 +244,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
     <div class="control-bar">
       <div class="control-item">
         <button class="ctrl-btn" id="btn-ptt" title="Push to talk: say one command">&#127908;</button>
-        <div class="ctrl-label">Talk</div>
+        <div class="ctrl-label" id="ptt-label">Talk</div>
       </div>
       <div class="control-item">
         <button class="ctrl-btn" id="ctrl-caption" title="Toggle on-screen captions">&#128190;</button>
@@ -310,6 +310,7 @@ const selGender=document.getElementById('sel-gender'),selModel=document.getEleme
 const apiModal=document.getElementById('apiModal');
 const mistStatus=document.getElementById('mist-status'),mistStatusText=document.getElementById('mist-status-text');
 const btnPtt=document.getElementById('btn-ptt'),ctrlCaption=document.getElementById('ctrl-caption');
+const pttLabel=document.getElementById('ptt-label');
 let stepEl=null;
 
 function tickClock(){
@@ -435,7 +436,7 @@ swWake.onclick=toggleWake;
 // Push-to-talk: Python runs the turn (Api.push_to_talk) and reports the mic
 // through handleListenState; the page only shows it. A short note (a refusal,
 // "Didn't catch that") replaces the status line for a few seconds.
-const PTT_NOTE_MS=3000,PTT_SAFETY_MS=30000;
+const PTT_NOTE_MS=3000,PTT_SAFETY_MS=45000;
 let pttState='idle',pttNoteTimer=null,pttSafetyTimer=null;
 function showPttNote(text){
   clearTimeout(pttNoteTimer);
@@ -446,8 +447,12 @@ function handleListenState(state,message){
   pttState=(state==='waiting'||state==='listening')?state:'idle';
   btnPtt.classList.toggle('active',pttState!=='idle');
   wave.style.opacity=pttState==='listening'?'1':'0';
+  // While listening, a second press ends the listen (Api.push_to_talk).
+  pttLabel.textContent=pttState==='listening'?'Done':'Talk';
   clearTimeout(pttSafetyTimer);pttSafetyTimer=null;
-  // If Python never reports the end (a lost notification), don't stay "Listening".
+  // If Python never reports the end (a lost notification), don't stay
+  // "Listening". Every waiting/listening message restarts it, so a follow-up
+  // listen gets its own full window (up to 6s wait + 30s phrase + STT).
   if(pttState!=='idle')pttSafetyTimer=setTimeout(()=>handleListenState('idle',''),PTT_SAFETY_MS);
   if(pttState==='idle'&&message)showPttNote(message);
   else{clearTimeout(pttNoteTimer);pttNoteTimer=null;restoreStatus();}
