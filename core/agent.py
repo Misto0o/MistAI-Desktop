@@ -35,6 +35,42 @@ EMPTY_ANSWER_READS = frozenset(
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
 
+# The step log never shows content (message text, contact names, typed text,
+# queries, URLs, window titles). Only these actions' parameters are printed;
+# keys print only as named keys or modifier combinations (_loggable_keys).
+LOGGED_PARAM_ACTIONS = frozenset({"open_app", "switch_app", "scroll", "brightness_set"})
+KEY_ACTIONS = frozenset({"press_key", "browser_press_key", "hotkey"})
+_LOG_MODIFIERS = frozenset({"ctrl", "control", "alt", "shift", "win", "windows", "cmd", "meta"})
+_LOG_NAMED_KEYS = frozenset(
+    {"enter", "return", "tab", "escape", "esc", "delete", "del", "backspace", "space",
+     "up", "down", "left", "right", "arrowup", "arrowdown", "arrowleft", "arrowright",
+     "home", "end", "pageup", "pagedown", "pgup", "pgdn", "insert"}
+    | {f"f{n}" for n in range(1, 25)})
+
+
+def _loggable_keys(param):
+    """A named key, or a combination with a modifier whose other parts are
+    named keys or single characters. A bare letter or digit is not."""
+    parts = [p.strip().lower() for p in str(param or "").split("+")]
+    if not parts or any(not p for p in parts):
+        return False
+    if len(parts) == 1:
+        return parts[0] in _LOG_NAMED_KEYS
+    return (any(p in _LOG_MODIFIERS for p in parts)
+            and all(p in _LOG_MODIFIERS or p in _LOG_NAMED_KEYS or len(p) == 1
+                    for p in parts))
+
+
+def step_param_for_log(action, param):
+    """The step log's view of a parameter: printed only for LOGGED_PARAM_ACTIONS
+    and loggable keys, else its length; an empty parameter is ''."""
+    text = str(param or "")
+    if not text:
+        return "''"
+    if action in LOGGED_PARAM_ACTIONS or (action in KEY_ACTIONS and _loggable_keys(text)):
+        return repr(text[:60])
+    return f"<{len(text)} chars>"
+
 CREDENTIAL_NOTE = (
     "NOTE: this route needs credentials you don't have (an API key, token or "
     "login). Don't ask the user for one or guess one; get the information "
@@ -728,7 +764,7 @@ class AgentLoop:
             # A done's speech is the answer: log its length, never its text.
             said = (f" speech: {len(str(speech or '').split())} words"
                     if action == "done" else "")
-            print(f"  Step {steps_taken}: {action}({repr(str(param)[:60])}){said}")
+            print(f"  Step {steps_taken}: {action}({step_param_for_log(action, param)}){said}")
 
             # --- ACTION NAME VALIDATION ---------------------------------------
             # Unknown names never reach the Executor (so they don't pollute the
@@ -918,9 +954,8 @@ class AgentLoop:
                             ),
                         }
                     )
-                    self.api.memory.add_action(
-                        "confirm_declined", f"{action}({param})", False
-                    )
+                    # The action name only: the parameter can be a message.
+                    self.api.memory.add_action("confirm_declined", action, False)
                     continue
 
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
@@ -971,7 +1006,7 @@ class AgentLoop:
 
             if action == "ask_user":
                 question = param or "Can you clarify what you'd like me to do?"
-                print(f"  [AskUser] {question}")
+                print("  [AskUser] asked")             # never the question's text
 
                 if input_mode == "voice":
                     self.api.speak(question)
@@ -1003,7 +1038,7 @@ class AgentLoop:
                         "speech": "",
                     }
 
-                print(f"  [AskUser] Got: {answer}")
+                print(f"  [AskUser] answered ({len(str(answer).split())} words)")
                 # A user can supply the missing project path in response to
                 # this question.  Re-run only the evidence-based discovery
                 # path on that user answer; never derive a workspace from a
