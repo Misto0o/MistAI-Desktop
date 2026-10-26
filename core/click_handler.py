@@ -7,6 +7,8 @@ import time
 
 import pyautogui
 
+from .config import log_text, verbose_logs
+
 try:
     import cv2
     import numpy as np
@@ -126,7 +128,7 @@ class ImprovedClickHandler:
     def click_on_text(self, query: str) -> bool:
         """Find and click text: OCR -> UIA -> Vision. A match outside the
         target window is refused and the next method is tried."""
-        print(f"[Click] Searching for: '{query}'")
+        print(f"[Click] Searching for: {log_text(query)}")
         self.last_query = query
         self.last_refusal = ""
         finders = [("OCR", lambda: self._try_ocr_click(query)),
@@ -137,7 +139,7 @@ class ImprovedClickHandler:
 
     def click_nth_element(self, item_type: str, n: int = 1) -> bool:
         """Find and click Nth element - OCR/UIA first, Vision last"""
-        print(f"[Click] Looking for #{n} {item_type}")
+        print(f"[Click] Looking for #{n} {log_text(item_type)}")
         self.last_query = item_type
         self.last_refusal = ""
         finders = [("OCR", lambda: self._try_ocr_nth(item_type, n)),
@@ -159,10 +161,11 @@ class ImprovedClickHandler:
             ok = self._execute_click(coords)
             if ok or not self._refused:
                 return ok
+        shown = label if verbose_logs() else "the target"  # the label quotes the query
         if self.last_refusal:
-            print(f"[Click] FAILED: every match for {label} was outside the target window")
+            print(f"[Click] FAILED: every match for {shown} was outside the target window")
         else:
-            print(f"[Click] FAILED: Could not find {label}")
+            print(f"[Click] FAILED: Could not find {shown}")
         return False
 
     def outside_target(self, x, y, method="direct"):
@@ -183,8 +186,8 @@ class ImprovedClickHandler:
         if left - m <= x <= right + m and top - m <= y <= bottom + m:
             return ""
         what = self.last_query or "the target"
-        print(f"[Click] REFUSED {method} click on '{what}' at ({x}, {y}): outside "
-              f"'{title[:60]}' rect ({left}, {top}, {right}, {bottom}) +{m}px")
+        print(f"[Click] REFUSED {method} click on {log_text(what)} at ({x}, {y}): outside "
+              f"{log_text(title, 60)} rect ({left}, {top}, {right}, {bottom}) +{m}px")
         return (f"The click on '{what}' at ({x}, {y}) (found by {method}) was NOT made: "
                 f"it is outside the '{title[:60]}' window ({left}, {top}, {right}, "
                 f"{bottom}). Nothing was clicked. Prefer type_text / press_key, or "
@@ -232,7 +235,7 @@ class ImprovedClickHandler:
             if results:
                 rect = win32gui.GetWindowRect(results[0])
                 print(f"[OCR] MistAI-window mask rect: {rect} "
-                     f"(title: '{win32gui.GetWindowText(results[0])}')")
+                     f"(title: {log_text(win32gui.GetWindowText(results[0]))})")
                 return rect
         except Exception as e:
             print(f"[OCR] MistAI-window rect lookup failed: {e}")
@@ -316,7 +319,7 @@ class ImprovedClickHandler:
                     y = (rect.top + rect.bottom) // 2
                     if CoordinateValidator.is_valid(x, y, *pyautogui.size()):
                         found_text = best_match.window_text().strip()
-                        print(f"[UIA] Found '{found_text}' @ ({x}, {y})")
+                        print(f"[UIA] Found {log_text(found_text)} @ ({x}, {y})")
                         self.last_found_text = found_text
                         return (x, y)
                 except Exception:
@@ -368,7 +371,7 @@ class ImprovedClickHandler:
             if len(matches) >= n:
                 x, y = matches[n - 1]["coords"]
                 if CoordinateValidator.is_valid(x, y, *pyautogui.size()):
-                    print(f"[UIA] Found #{n} {item_type} @ ({x}, {y})")
+                    print(f"[UIA] Found #{n} {log_text(item_type)} @ ({x}, {y})")
                     return (x, y)
             return None
         except Exception as e:
@@ -391,7 +394,7 @@ class ImprovedClickHandler:
             if coords:
                 x, y = coords
                 if CoordinateValidator.is_valid(x, y, sw, sh):
-                    print(f"[Vision] Found '{query}' @ ({x}, {y})")
+                    print(f"[Vision] Found {log_text(query)} @ ({x}, {y})")
                     return (x, y)
             return None
         except Exception as e:
@@ -408,7 +411,8 @@ class ImprovedClickHandler:
             if coords:
                 x, y = coords
                 if CoordinateValidator.is_valid(x, y, sw, sh):
-                    print(f"[Vision] Found #{n} {item_type} '{title}' @ ({x}, {y})")
+                    print(f"[Vision] Found #{n} {log_text(item_type)} {log_text(title)} "
+                          f"@ ({x}, {y})")
                     return (x, y)
             return None
         except Exception as e:
@@ -607,14 +611,14 @@ class ImprovedClickHandler:
             if match and score >= OCR_MATCH_SCORE:
                 x, y = match
                 if CoordinateValidator.is_valid(x, y, sw, sh):
-                    print(f"[OCR] Found '{query}' as '{word}' @ ({x}, {y}) via "
+                    print(f"[OCR] Found {log_text(query)} as {log_text(word)} @ ({x}, {y}) via "
                           f"button-region detection [score={score}, "
                           f"{n_regions} candidates, {time.time()-t0:.2f}s]")
                     self.last_found_text = word
                     return (x, y)
             if n_regions:
                 print(f"[OCR] Button-region pass: {n_regions} candidate shapes, "
-                     f"best '{word}' @ score {score} -- trying whole-frame OCR next")
+                     f"best {log_text(word)} @ score {score} -- trying whole-frame OCR next")
 
             best_overall = (0, "")
             all_seen = []
@@ -630,7 +634,7 @@ class ImprovedClickHandler:
                     if match:
                         x, y = int(match[0] / scale), int(match[1] / scale)
                         if CoordinateValidator.is_valid(x, y, sw, sh):
-                            print(f"[OCR] Found '{query}' as '{word}' @ ({x}, {y}) "
+                            print(f"[OCR] Found {log_text(query)} as {log_text(word)} @ ({x}, {y}) "
                                   f"[scale={scale}, score={score}, "
                                   f"{time.time()-t0:.2f}s]")
                             self.last_found_text = word
@@ -661,18 +665,18 @@ class ImprovedClickHandler:
             sh_frame = cv_frame.shape[0]
             band_top = [w for w in all_seen if w[2] < sh_frame * 0.15]
             band_rest = [w for w in all_seen if w[2] >= sh_frame * 0.15]
-            print(f"[OCR] No match for '{query}' above threshold "
-                  f"(closest: '{best_overall[1]}' @ score {best_overall[0]}, "
+            print(f"[OCR] No match for {log_text(query)} above threshold "
+                  f"(closest: {log_text(best_overall[1])} @ score {best_overall[0]}, "
                   f"needed {OCR_MATCH_SCORE}; {len(all_seen)} words seen, "
                   f"{time.time()-t0:.2f}s)")
             print(f"[OCR] Spatial breakdown: {len(band_top)} words in top 15% "
                  f"of frame (tab bar/chrome), {len(band_rest)} words in the "
                  f"rest of the page (frame height {sh_frame}px)")
-            if band_rest:
+            if band_rest and verbose_logs():  # on-screen words
                 sample = ", ".join(f"'{w}'@({x},{y})" for w, x, y in band_rest[:20])
                 print(f"[OCR] Words from the actual page content: {sample}"
                      + (" ..." if len(band_rest) > 20 else ""))
-            else:
+            elif not band_rest:
                 print(f"[OCR] ZERO words detected anywhere below the top 15% "
                      f"of the frame -- OCR is not reading the actual page "
                      f"content at all, only chrome/tabs. This points at the "

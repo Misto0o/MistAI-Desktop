@@ -70,6 +70,9 @@ MODES = {
 }
 COMPARE_MODES = ("baseline", "gating", "gating+lazy2")
 MODE_ENV_KEYS = ("MISTAI_VISION_GATING", "MISTAI_LAZY_VISION")
+# Scenario logs carry content (typed text, steps' parameters) so expectations
+# such as executed_with_param can check it; each run's log says so up top.
+VERBOSE_ENV = "MISTAI_VERBOSE_LOGS"
 
 
 # -- Scenario file -----------------------------------------------------------------
@@ -127,6 +130,8 @@ class Tee:
 
     def __init__(self, path, console):
         self._f = open(path, "w", encoding="utf-8", errors="replace")
+        if os.environ.get(VERBOSE_ENV) == "1":
+            self._f.write("[Harness] verbose logs: on, this log contains content\n")
         self._console = console
         self._lock = threading.Lock()
         self.parts = []
@@ -1040,8 +1045,9 @@ def main(argv=None, api_factory=None):
     log_dir = os.path.join(args.log_root, f"scenarios-{datetime.now():%Y%m%d-%H%M%S}")
     os.makedirs(log_dir, exist_ok=True)
     run_tmp = make_scenario_dir()
-    saved_env = {k: os.environ.get(k) for k in ("MISTAI_DB_PATH",) + MODE_ENV_KEYS}
+    saved_env = {k: os.environ.get(k) for k in ("MISTAI_DB_PATH", VERBOSE_ENV) + MODE_ENV_KEYS}
     os.environ["MISTAI_DB_PATH"] = os.path.join(run_tmp, "memory.db")
+    os.environ[VERBOSE_ENV] = "1"
 
     if not args.stub:
         try:

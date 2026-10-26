@@ -32,6 +32,7 @@ def _finders(h, monkeypatch, ocr=None, uia=None, vision=None):
 
 def test_match_outside_the_target_window_is_refused_and_the_next_method_tried(
         handler, monkeypatch, capsys):
+    monkeypatch.setenv("MISTAI_VERBOSE_LOGS", "1")   # the query and title print only with the flag
     handler.target_rect_fn = lambda: CALC
     # The real run: OCR read the taskbar's "=n" at (544,1042); UIA found the button.
     _finders(handler, monkeypatch, ocr=(544, 1042), uia=(520, 520))

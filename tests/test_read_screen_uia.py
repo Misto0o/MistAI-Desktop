@@ -251,7 +251,7 @@ def test_secret_looking_snapshot_is_withheld(monkeypatch, capsys, fake_window, t
     monkeypatch.setattr(uia_text, "_walk_text", lambda *_a: (text, False))
     assert uia_text.foreground_uia_text() == ("", "Some App")
     out = capsys.readouterr().out
-    assert "[UIA] withheld the text of 'Some App'" in out
+    assert "[UIA] withheld the text of the window:" in out   # the title only with the flag
     assert text not in out
 
 

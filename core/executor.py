@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import events, verify
+from .config import verbose_logs
 from .tools import CLICK_FAMILY
 
 # Confidence assigned per click-resolution method (design doc #6's example).
@@ -270,5 +271,7 @@ class Executor:
         reason = ""
         if not res.success:
             why = " ".join((res.detail or "no detail").split())[:300]
-            reason = " | reason: " + why.encode("ascii", "backslashreplace").decode("ascii")
+            # The detail can quote command output, a click query or a window title.
+            reason = " | reason: " + (why.encode("ascii", "backslashreplace").decode("ascii")
+                                      if verbose_logs() else f"<{len(why)} chars>")
         print(f"[Executor] {res.short()}{reason}")

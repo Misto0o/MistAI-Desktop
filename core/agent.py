@@ -17,7 +17,8 @@ import requests
 
 from . import planner
 from .api_manager import describe_api_error
-from .config import credential_failure_reason, lazy_vision_mode, vision_gating_enabled
+from .config import (credential_failure_reason, lazy_vision_mode, log_text,
+                     step_param_for_log, verbose_logs, vision_gating_enabled)
 from .live_state import describe_open_apps
 from .tools import READ_RESULT_CHARS
 
@@ -34,42 +35,6 @@ EMPTY_ANSWER_READS = frozenset(
     {"read_screen_text", "analyze_screen", "browser_get_text", "inspect_file", "find_file"})
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
-
-# The step log never shows content (message text, contact names, typed text,
-# queries, URLs, window titles). Only these actions' parameters are printed;
-# keys print only as named keys or modifier combinations (_loggable_keys).
-LOGGED_PARAM_ACTIONS = frozenset({"open_app", "switch_app", "scroll", "brightness_set"})
-KEY_ACTIONS = frozenset({"press_key", "browser_press_key", "hotkey"})
-_LOG_MODIFIERS = frozenset({"ctrl", "control", "alt", "shift", "win", "windows", "cmd", "meta"})
-_LOG_NAMED_KEYS = frozenset(
-    {"enter", "return", "tab", "escape", "esc", "delete", "del", "backspace", "space",
-     "up", "down", "left", "right", "arrowup", "arrowdown", "arrowleft", "arrowright",
-     "home", "end", "pageup", "pagedown", "pgup", "pgdn", "insert"}
-    | {f"f{n}" for n in range(1, 25)})
-
-
-def _loggable_keys(param):
-    """A named key, or a combination with a modifier whose other parts are
-    named keys or single characters. A bare letter or digit is not."""
-    parts = [p.strip().lower() for p in str(param or "").split("+")]
-    if not parts or any(not p for p in parts):
-        return False
-    if len(parts) == 1:
-        return parts[0] in _LOG_NAMED_KEYS
-    return (any(p in _LOG_MODIFIERS for p in parts)
-            and all(p in _LOG_MODIFIERS or p in _LOG_NAMED_KEYS or len(p) == 1
-                    for p in parts))
-
-
-def step_param_for_log(action, param):
-    """The step log's view of a parameter: printed only for LOGGED_PARAM_ACTIONS
-    and loggable keys, else its length; an empty parameter is ''."""
-    text = str(param or "")
-    if not text:
-        return "''"
-    if action in LOGGED_PARAM_ACTIONS or (action in KEY_ACTIONS and _loggable_keys(text)):
-        return repr(text[:60])
-    return f"<{len(text)} chars>"
 
 CREDENTIAL_NOTE = (
     "NOTE: this route needs credentials you don't have (an API key, token or "
@@ -227,6 +192,13 @@ class AgentLoop:
         """
         normalized = " ".join(str(parameter or "").split()).casefold()
         return f"{str(action or '').strip().casefold()}|{normalized}"
+
+    @staticmethod
+    def _refusal_for_log(refuse, action, param):
+        """A [Refused] log line: the parameter as the step log shows it. The
+        model's observation keeps the parameter."""
+        return refuse.replace(f"'{action}({str(param)[:60]})'",
+                              f"'{action}({step_param_for_log(action, param)})'", 1)
 
     @staticmethod
     def _foreground_key(snap):
@@ -603,7 +575,8 @@ class AgentLoop:
                 if screen_stale:
                     read_reason = "first read" if screen_cache_key is None else "after a UI action"
                 elif fg_key != screen_cache_key:
-                    read_reason = f"foreground changed to {fg_key[1]!r}"
+                    read_reason = "foreground changed" + (  # the title is content
+                        f" to {fg_key[1]!r}" if verbose_logs() else "")
                 elif time.monotonic() - screen_cache_time > self.GATED_CACHE_SECONDS:
                     read_reason = "cache expired"
                 else:
@@ -760,7 +733,7 @@ class AgentLoop:
             if thinking and self.api.caption_window and self.api.captions_enabled:
                 self.api.caption_window.show_thinking(thinking, 6)
             if thinking:
-                print(f"  [Think] {thinking}")
+                print(f"  [Think] {log_text(thinking, unit='words')}")
             # A done's speech is the answer: log its length, never its text.
             said = (f" speech: {len(str(speech or '').split())} words"
                     if action == "done" else "")
@@ -834,7 +807,7 @@ class AgentLoop:
                     f"again. Repeating it cannot succeed. Use a different "
                     f"action, a different parameter, or ask_user."
                 )
-                print(f"  [Refused] {refuse}")
+                print(f"  [Refused] {self._refusal_for_log(refuse, action, param)}")
                 if on_step:
                     on_step(steps_taken, "refused", str(param), "")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
@@ -855,7 +828,7 @@ class AgentLoop:
                     "changed. Check the result (or the exact UI text) before sending "
                     "more of the same input."
                 )
-                print(f"  [Refused] {refuse}")
+                print(f"  [Refused] {self._refusal_for_log(refuse, action, param)}")
                 if on_step:
                     on_step(steps_taken, "refused", str(param), "")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
@@ -875,7 +848,7 @@ class AgentLoop:
                         f"earlier in this phase and was not run again. "
                         + self._repeat_advice(action)
                     )
-                    print(f"  [Refused] {refuse}")
+                    print(f"  [Refused] {self._refusal_for_log(refuse, action, param)}")
                     if on_step:
                         on_step(steps_taken, "refused", str(param), "")
                     history.append({"role": "assistant", "content": json.dumps(cmd)})
@@ -996,7 +969,14 @@ class AgentLoop:
                 reminder = self._done_reminder(route_notes, last_read, unseen,
                                                read_after_unsubmitted, empty_answer,
                                                is_question)
-                print(f"  [DoneCheck] {reminder}")
+                if verbose_logs():
+                    print(f"  [DoneCheck] {reminder}")
+                else:  # the reminder quotes the read and the draft speech
+                    fired = [name for name, hit in (
+                        ("route notes", route_notes), ("unseen numbers", unseen),
+                        ("unsubmitted read", last_read is not None and read_after_unsubmitted),
+                        ("empty answer", empty_answer)) if hit]
+                    print(f"  [DoneCheck] reminder sent ({', '.join(fired)})")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append({"role": "user", "content": f"[OBSERVATION] {reminder}"})
                 continue
@@ -1031,7 +1011,7 @@ class AgentLoop:
                     # (clicking Sign In, sending a message) on its own --
                     # exactly what "use your best judgment" used to invite.
                     print("  [AskUser] No response heard -- pausing, not guessing")
-                    self.api.memory.add_action("ask_user", question, False)
+                    self.api.memory.add_action("ask_user", "", False)  # never the question
                     return {
                         "success": False,
                         "error": "No response to question -- task paused",
@@ -1066,7 +1046,7 @@ class AgentLoop:
                             ),
                         }
                     )
-                self.api.memory.add_action("ask_user", question, True)
+                self.api.memory.add_action("ask_user", "", True)
                 continue
 
             if action == "done":
@@ -1312,7 +1292,7 @@ class AgentLoop:
                     if description and len(description) > 10:
                         snap = self.api.live.snapshot
                         fw = snap.get("foreground_window", "Unknown")
-                        print(f"[Vision] Screen understood: {description[:100]}...")
+                        print(f"[Vision] Screen understood: {log_text(description, 100)}")
                         return f"Window: {fw} | Vision: {description}"
             except Exception as e:
                 print(f"[Vision] Error: {e}")

@@ -13,7 +13,7 @@ whose walk ran past the budget once is skipped for the rest of the session.
 import threading
 import time
 
-from .config import secret_text_reason
+from .config import secret_text_reason, verbose_logs
 
 TEXT_CONTROL_TYPES = ("Text", "Edit", "Document")
 UIA_VALUE_PROPERTY_ID = 30045  # UIA_ValueValuePropertyId
@@ -127,6 +127,7 @@ def foreground_uia_text(hwnd=None, budget=1.5, cap=300):
     text = box[0][0]
     reason = secret_text_reason(text)
     if reason:
-        print(f"[UIA] withheld the text of '{title[:60]}': {reason}")
+        whose = f"'{title[:60]}'" if verbose_logs() else "the window"  # a title is content
+        print(f"[UIA] withheld the text of {whose}: {reason}")
         return "", title
     return text, title

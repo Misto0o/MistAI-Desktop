@@ -45,12 +45,16 @@ from .config import (
     wake_clips_enabled,
     is_secret_file,
     is_self_process,
+    log_text,
     my_facts_path,
     normalize_process_name,
     process_matches,
     restore_after_task_enabled,
     secret_output_reason,
+    step_param_for_log,
     strip_wake_prefix,
+    trace_reads_enabled,
+    verbose_logs,
 )
 from . import conversation, file_search
 from .events import EventBus
@@ -590,7 +594,7 @@ class Api:
             text = error = None
             try:
                 text = rec.recognize_google(audio).lower()
-                print(f"[Wake] Heard: '{text}' {stats}")
+                print(f"[Wake] Heard: {log_text(text, unit='words')} {stats}")
                 cal.heard(True, time.monotonic())
             except sr.UnknownValueError:
                 print(f"[Wake] Heard something but couldn't transcribe it {stats}")
@@ -631,7 +635,7 @@ class Api:
             if not ww:
                 self._log_mic_compete(compete, text, "dropped (no wake word)")
                 continue
-            print(f"[Wake] Matched wake word '{ww}', command: '{cmd}'")
+            print(f"[Wake] Matched wake word '{ww}', command: {log_text(cmd, unit='words')}")
             if cmd and len(cmd.split()) < 2:
                 cmd = None
             # Run the conversation OFF this thread so the wake loop keeps
@@ -1586,7 +1590,8 @@ class Api:
 
     def _exec_sync(self, action, parameter):
         param = str(parameter) if not isinstance(parameter, str) else parameter
-        print(f"[Exec] {action}({repr(param[:80])})")
+        shown = repr(param[:80]) if verbose_logs() else step_param_for_log(action, param)
+        print(f"[Exec] {action}({shown})")
 
         try:
             if action == "open_app":
@@ -1774,7 +1779,8 @@ class Api:
             elif action == "browser_use_daily_profile":
                 return self._act_browser_use_daily_profile(param)  
         except Exception as e:
-            print(f"[Exec] Error in {action}: {e}")
+            print(f"[Exec] Error in {action}: "
+                  f"{e if verbose_logs() else type(e).__name__}")  # may quote the parameter
             return False
         return False
 
@@ -3417,7 +3423,7 @@ class Api:
         """Vision's reading of the screen; in a native window also the exact
         accessibility-tree text, and a NOTE when vision reports numbers the
         window does not contain. MISTAI_TRACE_READS=1 logs both side by side."""
-        trace = os.environ.get("MISTAI_TRACE_READS") == "1"
+        trace = trace_reads_enabled()
         # UIA first: it is closer in time to the screenshot than the slow vision call.
         exact, title, native, kind, asked = self._exact_ui_text(query, include_browser=trace)
         answer, ok = self._vision_read(query)
