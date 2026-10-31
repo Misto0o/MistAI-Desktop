@@ -34,6 +34,7 @@ import requests
 
 from . import events
 from .api_manager import describe_api_error
+from .config import confirmation_answer
 
 PENDING = "pending"
 RUNNING = "running"
@@ -725,12 +726,9 @@ class PlanRunner:
             # wake worker is unavailable, so it must honor a stop itself.
             api.stop_current_task()
             return False
-        if re.search(r"\b(no|nope|nah|not|don't|do not|cancel|stop|abort)\b", text):
-            return False
-        return bool(
-            re.search(r"\b(yes|yeah|yep|confirm|confirmed|sure|continue|proceed)\b", text)
-            or "go ahead" in text
-        )
+        verdict = confirmation_answer(text, extra_yes=("continue",))
+        print(f"[Confirm] answer={verdict}")           # never the words
+        return verdict == "yes"                        # unclear: don't continue
 
     def _persist(self, record, plan):
         record.plan = plan.to_dict()

@@ -348,6 +348,8 @@ def test_newest_user_row_is_kept_when_it_is_not_the_current_task():
         ("not sure", False),
         ("No, sure", False),
         ("cancel", False),
+        ("", False),            # unclear answers are never a yes
+        ("maybe", False),
     ],
 )
 def test_confirmation_requires_an_unambiguous_affirmative(answer, expected):

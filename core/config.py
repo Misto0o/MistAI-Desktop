@@ -149,6 +149,27 @@ def strip_wake_prefix(command):
     return rest if ww else (command or "").strip()
 
 
+_ANSWER_NO_RX = re.compile(r"\b(no|nope|nah|not|don't|do not|cancel|stop|abort|never mind)\b")
+_ANSWER_YES_RX = re.compile(r"\b(yes|yeah|yep|confirm|confirmed|sure|proceed)\b")
+
+
+def confirmation_answer(answer, extra_yes=()):
+    """A confirmation answer as "yes", "no" or "unclear". A no word always
+    wins ("not sure" is a no); yes words match as whole words; an empty
+    answer, or one with neither, is unclear. extra_yes: more whole yes words
+    for a question that invites them ("continue")."""
+    text = " ".join(str(answer or "").lower().split())
+    if not text:
+        return "unclear"
+    if _ANSWER_NO_RX.search(text):
+        return "no"
+    words = set(re.findall(r"[a-z']+", text))
+    if (_ANSWER_YES_RX.search(text) or "do it" in text or "go ahead" in text
+            or words & set(extra_yes)):
+        return "yes"
+    return "unclear"
+
+
 EDGE_TTS_VOICE = {
     "male": "en-US-GuyNeural",
     "female": "en-US-AriaNeural",

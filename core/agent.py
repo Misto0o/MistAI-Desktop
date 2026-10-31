@@ -17,8 +17,8 @@ import requests
 
 from . import planner
 from .api_manager import describe_api_error
-from .config import (credential_failure_reason, lazy_vision_mode, log_text,
-                     step_param_for_log, verbose_logs, vision_gating_enabled)
+from .config import (confirmation_answer, credential_failure_reason, lazy_vision_mode,
+                     log_text, step_param_for_log, verbose_logs, vision_gating_enabled)
 from .live_state import describe_open_apps
 from .tools import READ_RESULT_CHARS
 
@@ -35,6 +35,18 @@ EMPTY_ANSWER_READS = frozenset(
     {"read_screen_text", "analyze_screen", "browser_get_text", "inspect_file", "find_file"})
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
+
+# A confirmation answer that is neither yes nor no: asked once more (voice),
+# then the action is not run and the user hears why.
+CONFIRM_RETRY_QUESTION = "Sorry, yes or no?"
+CONFIRM_VERBS = {"quick_message": "send"}       # anything else: "do"
+UNCLEAR_OBSERVATION = (
+    "[OBSERVATION] The user's answer was not understood (not a no); the action "
+    "was not run.")
+
+
+def unclear_answer_speech(action):
+    return f"I didn't hear a yes, so I didn't {CONFIRM_VERBS.get(action, 'do')} that."
 
 CREDENTIAL_NOTE = (
     "NOTE: this route needs credentials you don't have (an API key, token or "
@@ -159,6 +171,36 @@ class AgentLoop:
             )
         return a, p, note, False
 
+    def _ask_confirmation(self, question, input_mode, retry=False):
+        """Ask a confirmation question and classify the answer: "yes", "no",
+        "unclear", or None when the user stopped the task. Logs the verdict
+        only, never the words."""
+        if input_mode == "voice":
+            self.api.speak(question)
+            while self.api.tts.speaking:
+                time.sleep(0.05)
+            # Its own [VoiceTiming] turn: mic and STT time of the answer.
+            self._voice_timing("_voice_start", "confirm")
+            answer = self.api._listen_once(timeout=10)
+            self._voice_timing("_voice_mark", "answered", end=True)
+        else:
+            answer = self.api._get_text_answer(question, timeout=60)
+
+        if self.api._stop_requested.is_set():
+            return None
+
+        if (
+            input_mode == "voice"
+            and self.api._normalize_utterance(answer)
+            in self.api._VOICE_STOP_WORDS
+        ):
+            self.api.stop_current_task()
+            return None
+
+        verdict = confirmation_answer(answer)
+        print(f"  [Confirm] answer={verdict}{' (retry)' if retry else ''}")
+        return verdict
+
     def _voice_timing(self, method, *args, **kwargs):
         """Api._voice_start / _voice_mark ([VoiceTiming] diagnostics), when
         the api has them."""
@@ -174,19 +216,7 @@ class AgentLoop:
         ``sure``. Confirmation is a safety boundary, so an explicit negative
         always wins and affirmative words are matched as whole words.
         """
-        text = " ".join(str(answer or "").lower().split())
-        if not text:
-            return False
-        if re.search(
-            r"\b(no|nope|nah|not|don't|do not|cancel|stop|abort|never mind)\b",
-            text,
-        ):
-            return False
-        return bool(
-            re.search(r"\b(yes|yeah|yep|confirm|confirmed|sure|proceed)\b", text)
-            or "do it" in text
-            or "go ahead" in text
-        )
+        return confirmation_answer(answer) == "yes"
 
     @staticmethod
     def _decline_signature(action, parameter):
@@ -890,31 +920,24 @@ class AgentLoop:
                 enter_safe=self._enter_safe(action, param),
             ):
                 confirm_q = self._confirmation_question(action, param)
-                if input_mode == "voice":
-                    self.api.speak(confirm_q)
-                    while self.api.tts.speaking:
-                        time.sleep(0.05)
-                    # Its own [VoiceTiming] turn: mic and STT time of the answer.
-                    self._voice_timing("_voice_start", "confirm")
-                    answer = self.api._listen_once(timeout=10)
-                    self._voice_timing("_voice_mark", "answered", end=True)
-                else:
-                    answer = self.api._get_text_answer(confirm_q, timeout=60)
-
-                if self.api._stop_requested.is_set():
+                verdict = self._ask_confirmation(confirm_q, input_mode)
+                if verdict == "unclear" and input_mode == "voice":
+                    verdict = self._ask_confirmation(CONFIRM_RETRY_QUESTION, input_mode,
+                                                     retry=True)
+                if verdict is None:
                     return {"success": False, "error": "Stopped by user"}
 
-                if (
-                    input_mode == "voice"
-                    and self.api._normalize_utterance(answer)
-                    in self.api._VOICE_STOP_WORDS
-                ):
-                    self.api.stop_current_task()
-                    return {"success": False, "error": "Stopped by user"}
-
-                confirmed = self._is_confirmation(answer)
                 if on_step:
                     on_step(steps_taken, "confirm", param, confirm_q)
+
+                if verdict == "unclear":
+                    # Not a refusal: no decline signature, the model may ask again.
+                    self.api.speak(unclear_answer_speech(action))
+                    history.append({"role": "assistant", "content": json.dumps(cmd)})
+                    history.append({"role": "user", "content": UNCLEAR_OBSERVATION})
+                    continue
+
+                confirmed = verdict == "yes"
 
                 if not confirmed and declined_once:
                     # Second refusal in the same phase -- stop asking entirely.
