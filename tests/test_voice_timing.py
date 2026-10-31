@@ -1,6 +1,7 @@
 """[VoiceTiming] and [MicCompete] diagnostics: durations and counts only,
 never transcript content, and no change to what the voice path does."""
 
+import re
 import threading
 from types import SimpleNamespace
 
@@ -201,3 +202,92 @@ def test_router_and_first_step_are_marked_in_voice_mode_only(monkeypatch, mode):
     names = [l.split(": ", 1)[1].split(" +")[0] for l in lines]
     assert names == (["router_done", "first_step"] if mode == "voice" else [])
     assert not any(w in l for l in lines for w in SECRET_WORDS)
+
+
+# -- AgentLoop: first_step before any gate; a confirmation listen is its own turn ----
+
+def _loop_marks(monkeypatch, replies, mode="voice", answers=("yes",)):
+    """One phase through the real AgentLoop with a "wake" turn open. The
+    on_step callback marks first_step as Api._on_step does. Returns
+    [(label, mark)] in log order."""
+    import json
+    from core.agent import AgentLoop
+    from core.tools import SPECS
+
+    lines, answers = [], list(answers)
+    replies = iter(json.dumps(r) for r in replies)
+    timer = VoiceTimer(log=lines.append)
+    api = SimpleNamespace(
+        task_memory=SimpleNamespace(get_hints_for_task=lambda _t: []),
+        caption_window=None, captions_enabled=False,
+        _stop_requested=threading.Event(),
+        live=SimpleNamespace(snapshot={"open_apps": [], "screen_resolution": (1, 1)}),
+        api_manager=SimpleNamespace(get_headers=lambda: {},
+                                    get_api_url=lambda: "https://example.invalid/a",
+                                    get_fallback_url=lambda: "https://example.invalid/b"),
+        tools=SimpleNamespace(specs=SPECS, get=lambda n: SPECS[n],
+                              requires_confirmation=lambda a, *_x, **_k: a == "quick_message"),
+        executor=SimpleNamespace(run=lambda a, p: SimpleNamespace(
+            action=a, parameter="", success=True, detail="", verified=None,
+            escalate_to_user=False, reliability_note=lambda: "", escalated_from="")),
+        memory=SimpleNamespace(add_action=lambda *a: None),
+        _resolve_path_placeholders=lambda p: p,
+        speak=lambda _t, **_k: None,
+        tts=SimpleNamespace(speaking=False),
+        _normalize_utterance=lambda t: " ".join(str(t or "").lower().split()),
+        _VOICE_STOP_WORDS={"stop"},
+        _last_opened_app="",
+        voice_timer=timer,
+    )
+    api._voice_start = lambda label, t0=None: Api._voice_start(api, label, t0)
+    api._voice_mark = lambda name, end=False: Api._voice_mark(api, name, end)
+
+    def listen(timeout=10):                       # the real one's marks
+        api._voice_mark("mic_acquired")
+        api._voice_mark("stt_done")
+        return answers.pop(0) if answers else None
+
+    api._listen_once = listen
+    api._get_text_answer = lambda _q, timeout=60: answers.pop(0) if answers else None
+
+    def on_step(_n, _a, _p, _s):
+        if mode == "voice":
+            api._voice_mark("first_step", end=True)
+
+    monkeypatch.setattr("core.agent.requests.post", lambda *_a, **_k: SimpleNamespace(
+        ok=True, status_code=200, json=lambda: {"response": next(replies)}))
+    monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
+    loop = AgentLoop(api, None)
+    monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
+    monkeypatch.setattr(loop, "_current_foreground_key", lambda: (1, "Discord"))
+    timer.start("wake")
+    loop._loop("open my banking password", "m", "none", mode, on_step)
+    return [tuple(re.match(r"\[VoiceTiming\] (\w+): (\S+) \+", l).groups()) for l in lines]
+
+
+DONE ={"action": "done", "speech": "ok"}
+SEND = {"action": "quick_message", "parameter": "Discord|banking|password"}
+
+
+def test_the_first_step_ends_the_turn_once(monkeypatch):
+    marks = _loop_marks(monkeypatch, [{"action": "open_app", "parameter": "notepad"}, DONE])
+    assert marks == [("wake", "first_step")]
+
+
+def test_a_first_step_confirmation_listen_is_its_own_turn(monkeypatch):
+    marks = _loop_marks(monkeypatch, [SEND, DONE])
+    assert marks == [("wake", "first_step"),
+                     ("confirm", "mic_acquired"), ("confirm", "stt_done"),
+                     ("confirm", "answered")]
+
+
+def test_every_confirmation_listen_starts_a_fresh_turn(monkeypatch):
+    marks = _loop_marks(monkeypatch, [{"action": "open_app", "parameter": "discord"},
+                                      SEND, {**SEND, "parameter": "Discord|banking|open"},
+                                      DONE], answers=("yes", "yes"))
+    assert marks == [("wake", "first_step")] + [
+        ("confirm", "mic_acquired"), ("confirm", "stt_done"), ("confirm", "answered")] * 2
+
+
+def test_no_marks_in_text_mode(monkeypatch):
+    assert _loop_marks(monkeypatch, [SEND, DONE], mode="text") == []

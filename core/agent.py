@@ -159,6 +159,13 @@ class AgentLoop:
             )
         return a, p, note, False
 
+    def _voice_timing(self, method, *args, **kwargs):
+        """Api._voice_start / _voice_mark ([VoiceTiming] diagnostics), when
+        the api has them."""
+        fn = getattr(self.api, method, None)
+        if fn is not None:
+            fn(*args, **kwargs)
+
     @staticmethod
     def _is_confirmation(answer):
         """Return True only for an unambiguous affirmative response.
@@ -738,6 +745,10 @@ class AgentLoop:
             said = (f" speech: {len(str(speech or '').split())} words"
                     if action == "done" else "")
             print(f"  Step {steps_taken}: {action}({step_param_for_log(action, param)}){said}")
+            if input_mode == "voice":
+                # Before any gate, so a confirmation listen is not timed as
+                # part of the spoken turn. Later steps: no-op.
+                self._voice_timing("_voice_mark", "first_step", end=True)
 
             # --- ACTION NAME VALIDATION ---------------------------------------
             # Unknown names never reach the Executor (so they don't pollute the
@@ -883,7 +894,10 @@ class AgentLoop:
                     self.api.speak(confirm_q)
                     while self.api.tts.speaking:
                         time.sleep(0.05)
+                    # Its own [VoiceTiming] turn: mic and STT time of the answer.
+                    self._voice_timing("_voice_start", "confirm")
                     answer = self.api._listen_once(timeout=10)
+                    self._voice_timing("_voice_mark", "answered", end=True)
                 else:
                     answer = self.api._get_text_answer(confirm_q, timeout=60)
 
