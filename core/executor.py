@@ -231,12 +231,11 @@ class Executor:
         api = self.api
         # Recording (single writer -- the patched AgentLoop no longer records)
         try:
-            api.memory.add_action(res.action, res.parameter, res.success)
+            api.memory.add_action(res.action, res.success)    # never the parameter
         except Exception:
             pass
         try:
-            api.task_memory.record(res.action, res.parameter, res.success,
-                                   res.detail)
+            api.task_memory.record(res.action, res.parameter, res.success)
         except Exception:
             pass
         try:

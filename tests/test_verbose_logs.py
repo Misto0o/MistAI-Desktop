@@ -230,7 +230,7 @@ def test_the_done_check_prints_the_reminder_under_the_flag(monkeypatch, capsys, 
 def test_ask_user_stores_no_question(monkeypatch, capsys):
     rows = _run(monkeypatch, [{"action": "ask_user", "parameter": f"Which {CONTACT}?"},
                               {"action": "done", "speech": "ok"}], answers=["the cousin"])
-    assert ("ask_user", "", True) in rows
+    assert ("ask_user", True) in rows
     _no_content(repr(rows))
 
 

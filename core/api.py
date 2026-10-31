@@ -39,6 +39,7 @@ from .config import (
     STATUS_URL,
     TRACKED_APPS,
     WAKE_WORDS,
+    announce_verbose_logs,
     esc,
     fuzzy_wake,
     wake_clip_dir,
@@ -146,6 +147,7 @@ class Api:
     )
 
     def __init__(self):
+        announce_verbose_logs()
         self._stop_requested = threading.Event()
         # -- Agent run gate ---------------------------------------------------
         # Exactly one AgentLoop may drive the machine at a time. The lock is
@@ -2232,7 +2234,6 @@ class Api:
             except Exception:
                 pass
             self._last_opened_app = app_lower
-            self.memory.log_app_usage(param)
             state, title = self.app_window_state(app_lower)
             self.last_result_text = f"Launched '{param}' (window '{title[:40]}', {state})"
             return True

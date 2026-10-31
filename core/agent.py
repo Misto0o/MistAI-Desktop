@@ -927,8 +927,7 @@ class AgentLoop:
                             ),
                         }
                     )
-                    # The action name only: the parameter can be a message.
-                    self.api.memory.add_action("confirm_declined", action, False)
+                    self.api.memory.add_action("confirm_declined", False)
                     continue
 
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
@@ -1011,7 +1010,7 @@ class AgentLoop:
                     # (clicking Sign In, sending a message) on its own --
                     # exactly what "use your best judgment" used to invite.
                     print("  [AskUser] No response heard -- pausing, not guessing")
-                    self.api.memory.add_action("ask_user", "", False)  # never the question
+                    self.api.memory.add_action("ask_user", False)  # never the question
                     return {
                         "success": False,
                         "error": "No response to question -- task paused",
@@ -1046,7 +1045,7 @@ class AgentLoop:
                             ),
                         }
                     )
-                self.api.memory.add_action("ask_user", "", True)
+                self.api.memory.add_action("ask_user", True)
                 continue
 
             if action == "done":

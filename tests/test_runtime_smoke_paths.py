@@ -87,7 +87,7 @@ def test_tray_only_app_is_verification_failure_not_an_open_app_success(monkeypat
     assert result.success is False
     assert result.verified is False
     assert "tray/background only" in result.detail
-    assert memory.calls == [("open_app", "Discord", False)]
+    assert memory.calls == [("open_app", False)]   # never the parameter
     assert task_memory.calls[0][:3] == ("open_app", "Discord", False)
     assert workspace.calls[0][:3] == ("open_app", "Discord", False)
     assert bus.calls[0][0] == "ActionFailed"
@@ -109,12 +109,10 @@ def test_executor_records_every_attempt_and_returns_primary_final_failure(monkey
     assert result.action == "primary"
     assert result.success is False
     assert result.escalate_to_user is True
-    assert memory.calls == [
-        ("primary", "target", False),
-        ("fallback", "target", False),
-    ]
-    assert [call[:3] for call in task_memory.calls] == memory.calls
-    assert [call[:3] for call in workspace.calls] == memory.calls
+    assert memory.calls == [("primary", False), ("fallback", False)]
+    attempts = [("primary", "target", False), ("fallback", "target", False)]
+    assert [call[:3] for call in task_memory.calls] == attempts
+    assert [call[:3] for call in workspace.calls] == attempts
     assert [call[0] for call in bus.calls] == ["ActionFailed", "ActionFailed"]
 
 

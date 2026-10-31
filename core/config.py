@@ -244,6 +244,12 @@ def verbose_logs():
     return True
 
 
+def announce_verbose_logs():
+    """Called once when the Api starts: prints the banner up front when the
+    flag is on (still once per process), instead of at the first log line."""
+    verbose_logs()
+
+
 def trace_reads_enabled():
     """MISTAI_TRACE_READS=1 (read_screen_text logs vision next to UIA text);
     always off when frozen."""
@@ -392,6 +398,23 @@ def memory_db_path():
     return os.environ.get("MISTAI_DB_PATH") or os.path.join(
         os.path.expanduser("~"), "MistAI", "memory.db"
     )
+
+
+HISTORY_HOURS_DEFAULT = 24.0
+
+
+def history_hours():
+    """How long stored conversation turns are kept: MISTAI_HISTORY_HOURS, read
+    at call time (default 24). Never below 1 hour, so the agent's 30-minute
+    recent-conversation block always has its rows; an unparsable value is the
+    default."""
+    try:
+        hours = float(os.environ.get("MISTAI_HISTORY_HOURS", HISTORY_HOURS_DEFAULT))
+    except ValueError:
+        return HISTORY_HOURS_DEFAULT
+    if hours != hours:                      # NaN
+        return HISTORY_HOURS_DEFAULT
+    return max(1.0, hours)
 
 
 def is_self_process(name, pid=None):

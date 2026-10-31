@@ -6,7 +6,7 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .config import MISTAI_FACTS, USER_FACT_CATEGORIES
 
@@ -67,6 +67,21 @@ class Memory:
                 self.conn.commit()
             except Exception:
                 pass
+        self.prune_conversations()
+
+    def prune_conversations(self):
+        """Delete conversation turns older than config.history_hours(); newer
+        rows are untouched. Runs at startup and on every insert."""
+        from .config import history_hours
+
+        try:
+            cutoff = (datetime.now() - timedelta(hours=history_hours())).isoformat()
+        except OverflowError:
+            return                                  # "keep forever"
+        with self._lock:
+            # isoformat() strings sort in time order (see get_recent_conversations)
+            self.conn.execute("DELETE FROM conversations WHERE timestamp < ?", (cutoff,))
+            self.conn.commit()
 
     def add_conversation(self, role, message):
         with self._lock:
@@ -75,6 +90,7 @@ class Memory:
                 (role, message, datetime.now().isoformat()),
             )
             self.conn.commit()
+        self.prune_conversations()
 
     def get_recent_conversations(self, limit=12, since=None):
         # since: ISO timestamp; rows are stored via isoformat(), so string order is time order.
@@ -94,11 +110,14 @@ class Memory:
         result.extend(reversed(rows))
         return result
 
-    def add_action(self, action, parameter="", success=True):
+    def add_action(self, action, success=True):
+        """One row per executed action: its name, success and time. The
+        parameter column stays empty -- a parameter can be typed text, a
+        message, a contact or a command (ToolRegistry.observed needs none)."""
         with self._lock:
             self.conn.execute(
-                "INSERT INTO actions (action,parameter,success,timestamp) VALUES (?,?,?,?)",
-                (action, parameter, 1 if success else 0, datetime.now().isoformat()),
+                "INSERT INTO actions (action,parameter,success,timestamp) VALUES (?,'',?,?)",
+                (action, 1 if success else 0, datetime.now().isoformat()),
             )
             self.conn.commit()
 

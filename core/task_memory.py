@@ -23,6 +23,17 @@ from datetime import datetime
 # "clicking 'a' has failed" hint into EVERY task containing the letter a.
 MIN_KEY_LEN = 3
 
+# task_outcomes.note is one of these fixed phrases, never an action's result
+# text (that can quote a window title, a message or on-screen words).
+OUTCOME_NOTES = {
+    ("open_app", True): "opened",
+    ("open_app", False): "did not open",
+    ("messaging", True): "sent",
+    ("messaging", False): "did not send",
+    ("clicking", True): "clicked",
+    ("clicking", False): "click failed",
+}
+
 
 class TaskMemory:
     def __init__(self, db_path=None):
@@ -101,11 +112,12 @@ class TaskMemory:
         return None  # most actions (run_command, write_file, etc) are
         # inherently task-specific -- not worth caching
 
-    def record(self, action, parameter, success, note=""):
+    def record(self, action, parameter, success):
         result = self.build_signature(action, parameter)
         if not result:
             return
         signature, category = result
+        note = OUTCOME_NOTES[(category, bool(success))]
 
         with self._lock:
             row = self.conn.execute(
@@ -127,7 +139,7 @@ class TaskMemory:
                         fc,
                         int(success),
                         action,
-                        note[:300],
+                        note,
                         datetime.now().isoformat(),
                         signature,
                     ),
@@ -145,7 +157,7 @@ class TaskMemory:
                         1 if success else 0,
                         0 if success else 1,
                         int(success),
-                        note[:300],
+                        note,
                         datetime.now().isoformat(),
                     ),
                 )

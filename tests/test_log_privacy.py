@@ -111,13 +111,13 @@ def test_ask_user_logs_asked_and_a_word_count_only(monkeypatch, capsys, mode):
     assert f"[AskUser] answered ({len(HEARD.split())} words)" in log
 
 
-def test_a_declined_message_stores_only_the_action_name(monkeypatch, capsys):
+def test_a_declined_message_stores_no_parameter(monkeypatch, capsys):
     msg = f"Discord|{CONTACT}|{MESSAGE}"
     _out, rows = _run(monkeypatch, [
         {"action": "quick_message", "parameter": msg},
         DONE,
     ], answers=["no"])
-    assert ("confirm_declined", "quick_message", False) in rows
+    assert ("confirm_declined", False) in rows
     _no_content(repr(rows))
     _no_content(capsys.readouterr().out)
 
