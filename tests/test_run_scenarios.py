@@ -26,6 +26,15 @@ def test_bundled_scenarios_load_and_cover_the_requested_cases():
     assert scenarios["plan-notifications"]["expect"]["nodes_count"] == 1
     assert scenarios["plan-research-write"]["expect"]["node_desc_any"] == ["notepad"]
     assert scenarios["delete-needs-confirmation"]["expect"]["confirmation_asked"] is True
+    # A goal that is only an app's name: switch_app, then done, never ask_user.
+    bare = scenarios["bare-app-name"]
+    assert bare["prompt"] == "Calculator"
+    assert "ui_input" in bare["tags"]          # it opens a window: never in plain stub runs
+    assert [s["action"] for s in bare["stub"][0]][:2] == ["switch_app", "done"]
+    assert "switch_app" in bare["expect"]["actions_include"]
+    assert "ask_user" in bare["expect"]["actions_exclude"]
+    assert {"require_process_absent": "calculator"} in bare["setup"]
+    assert bare["cleanup"]["close_new_processes"] == ["calculator"]
     # No GitHub-notifications desktop scenario.
     assert not any(
         "github" in json.dumps(s).lower() for s in scenarios.values() if s["type"] == "desktop"

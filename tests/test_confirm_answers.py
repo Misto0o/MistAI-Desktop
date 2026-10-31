@@ -193,6 +193,45 @@ def test_a_voice_stop_on_the_retry_is_still_a_stop(monkeypatch):
     assert rec.result == {"success": False, "error": "Stopped by user"}
 
 
+# -- the quick_message question ---------------------------------------------------------
+
+def _question(action, param):
+    return AgentLoop(SimpleNamespace(_resolve_path_placeholders=lambda p: p),
+                     None)._confirmation_question(action, param)
+
+
+def test_the_quick_message_question_names_message_contact_and_app():
+    assert _question("quick_message", f"Discord|{CONTACT}|{MESSAGE}") == (
+        f"Send '{MESSAGE}' to {CONTACT} on Discord?")
+
+
+def test_a_long_message_is_capped_with_an_ellipsis():
+    long = "word " * 30
+    q = _question("quick_message", f"Discord|Ada|{long}")
+    quoted = q[len("Send '"):q.index("' to Ada")]
+    assert len(quoted) <= 60 and quoted.endswith("…")
+    assert long.startswith(quoted[:-1])
+    exact = "x" * 60
+    assert _question("quick_message", f"Discord|Ada|{exact}") == f"Send '{exact}' to Ada on Discord?"
+
+
+@pytest.mark.parametrize("action, param, expected", [
+    ("quick_message", "Discord|Ada", "This will run: quick_message(Discord|Ada) -- "
+                                     "this can't easily be undone. Proceed?"),
+    ("window_close", "Notepad", "This will run: window_close(Notepad) -- "
+                                "this can't easily be undone. Proceed?"),
+])
+def test_other_questions_are_unchanged(action, param, expected):
+    assert _question(action, param) == expected
+
+
+@pytest.mark.parametrize("mode", ["voice", "text"])
+def test_the_question_is_asked_but_never_logged(monkeypatch, capsys, mode):
+    rec = _run(monkeypatch, [SEND, DONE], ["yes"], mode=mode)
+    assert rec.asked == [f"Send '{MESSAGE}' to {CONTACT} on Discord?"]
+    _no_content(capsys.readouterr().out)
+
+
 # -- planner._confirm --------------------------------------------------------------------
 
 @pytest.mark.parametrize("mode", ["voice", "text"])

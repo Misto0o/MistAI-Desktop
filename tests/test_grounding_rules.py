@@ -103,6 +103,22 @@ def test_agent_prompt_has_grounding_rules():
     assert "Never ask the user for API keys, tokens or passwords" in system
 
 
+def test_bare_app_name_and_message_source_clauses_are_merged_into_existing_rules():
+    system = _system()
+    # Merged into the "Prefer making a reasonable decision" rule, not a new one.
+    rule = next(l for l in system.splitlines() if "Prefer making a reasonable decision" in l)
+    assert ("A goal that is only an app's name means open or switch to it; "
+            "once it is in front, call done.") in rule
+    assert system.count("only an app's name") == 1
+    # Merged into the quick_message menu line.
+    menu = system[system.index("- quick_message      :"):]
+    menu = " ".join(menu[:menu.index("\n    - ")].split())
+    assert ("The recipient and the message must both come from the user's words; "
+            "if either is missing,") in menu
+    assert "use ask_user FIRST" in menu
+    assert system.count("must both come from the user's words") == 1
+
+
 # -- read_screen_text vision prompt -------------------------------------------
 
 

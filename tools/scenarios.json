@@ -354,6 +354,53 @@
       }
     },
     {
+      "name": "bare-app-name",
+      "type": "desktop",
+      "tags": [
+        "ui_input"
+      ],
+      "prompt": "Calculator",
+      "timeout": 90,
+      "setup": [
+        {
+          "require_process_absent": "calculator"
+        }
+      ],
+      "stub": [
+        [
+          {
+            "action": "switch_app",
+            "parameter": "calculator",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Calculator is in front."
+          },
+          {
+            "action": "done",
+            "speech": "Calculator is in front."
+          }
+        ]
+      ],
+      "cleanup": {
+        "close_new_processes": [
+          "calculator"
+        ]
+      },
+      "expect": {
+        "success": true,
+        "actions_include": [
+          "switch_app"
+        ],
+        "actions_exclude": [
+          "ask_user"
+        ],
+        "confirmation_asked": false,
+        "max_steps": 3
+      }
+    },
+    {
       "name": "create-file",
       "type": "desktop",
       "prompt": "Create a folder called notes in {tmp} and inside it a file todo.txt containing the line 'buy milk', then confirm it exists.",
