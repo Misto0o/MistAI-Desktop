@@ -3,6 +3,7 @@ core/click_handler.py — unified OCR -> UIA -> Vision fallback click resolution
 """
 
 import difflib
+import re
 import time
 
 import pyautogui
@@ -56,6 +57,13 @@ OCR_UPSCALE = 2.5
 MAX_OCR_DIMENSION = 4000  # hard cap on the upscaled image's longest side
 OCR_MIN_CONF = 25       # was 40 -- too strict for small anti-aliased UI text
 OCR_MATCH_SCORE = 65    # slightly loosened alongside the lower conf floor
+# Compact matching (spaces/punctuation removed, words joined across a line):
+# a misheard spaced name ("so can zan") against one OCR word or a 2-4 word
+# run ("SoCanXan"). Stricter than the single-word path: "sam"/"pam" scores
+# 66, a one-letter mishearing of an 8-letter name 87.
+COMPACT_MATCH_SCORE = 80
+COMPACT_MIN_LEN = 5
+COMPACT_MAX_WORDS = 4
 # Clicks must land inside the target window's rectangle plus this margin.
 TARGET_RECT_MARGIN = 8
 OCR_PSM_MODES = ("--oem 3 --psm 11",)  # trimmed from 2 modes -- wasn't finding
@@ -107,6 +115,29 @@ def _match_score(candidate_lower: str, query_lower: str) -> int:
     if abs(len(candidate_lower) - len(query_lower)) > 1:
         return 0  # too different in length to plausibly be the same word
     return int(difflib.SequenceMatcher(None, candidate_lower, query_lower).ratio() * 100)
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.lower())
+
+
+def _compact_score(candidate: str, query: str) -> int:
+    """Score two COMPACT forms, 0-100: only for queries of COMPACT_MIN_LEN+
+    characters, lengths within max(1, 15% of the query), and the same
+    suffix rules as _match_score."""
+    if len(query) < COMPACT_MIN_LEN or not candidate:
+        return 0
+    if candidate == query:
+        return 100
+    if candidate.startswith(query):
+        suffix = candidate[len(query):]
+        if suffix in _TOGGLE_SUFFIXES:
+            return 90
+        if suffix in _DERIVED_WORD_SUFFIXES:
+            return 0
+    if abs(len(candidate) - len(query)) > max(1, int(len(query) * 0.15)):
+        return 0
+    return int(difflib.SequenceMatcher(None, candidate, query).ratio() * 100)
 
 
 class ImprovedClickHandler:
@@ -463,7 +494,49 @@ class ImprovedClickHandler:
                 best_score = score
                 best_word = word
                 best_match = (x, y)
+        if best_match is None:  # a compact match never overrides a single-word one
+            compact = self._compact_match(data, query)
+            if compact:
+                best_match, best_word, best_score = compact
         return best_match, best_word, best_score, seen_words
+
+    def _compact_match(self, data, query):
+        """Best compact match over each word and each run of 2 to
+        COMPACT_MAX_WORDS adjacent words on one Tesseract line: ((x, y) centre
+        of the span, span text, score) or None."""
+        cq = _compact(query)
+        if len(cq) < COMPACT_MIN_LEN:
+            return None
+        tokens = []  # (line key, word_num, text, left, top, right, bottom)
+        for i, word in enumerate(data["text"]):
+            if not word.strip():
+                continue
+            try:
+                if int(data["conf"][i]) < OCR_MIN_CONF:
+                    continue
+                key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                num = int(data["word_num"][i])
+            except (KeyError, IndexError, ValueError, TypeError):
+                continue
+            left, top = data["left"][i], data["top"][i]
+            tokens.append((key, num, word, left, top,
+                           left + data["width"][i], top + data["height"][i]))
+        best = None
+        for n in range(1, COMPACT_MAX_WORDS + 1):
+            for start in range(len(tokens) - n + 1):
+                span = tokens[start:start + n]
+                if any(b[0] != span[0][0] or b[1] != a[1] + 1 for a, b in zip(span, span[1:])):
+                    continue  # not adjacent words on one line
+                score = _compact_score(_compact("".join(t[2] for t in span)), cq)
+                if score >= COMPACT_MATCH_SCORE and (best is None or score > best[2]):
+                    x = (min(t[3] for t in span) + max(t[5] for t in span)) // 2
+                    y = (min(t[4] for t in span) + max(t[6] for t in span)) // 2
+                    best = ((x, y), " ".join(t[2] for t in span), score, n)
+        if best is None:
+            return None
+        (x, y), text, score, n = best
+        print(f"[OCR] Compact match: {n} word(s), score={score} @ ({x}, {y})")
+        return (x, y), text, score
 
     def _prepare_frames(self, cv_frame):
         """Yields (gray_image, scale_factor) attempts, cheapest first. Later
