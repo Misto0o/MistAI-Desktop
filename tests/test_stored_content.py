@@ -106,7 +106,7 @@ def test_typed_text_a_message_and_a_command_never_reach_a_stored_row(db, monkeyp
         ("type_text", "", 1), ("quick_message", "", 1), ("run_command", "", 1),
         ("click_on_text", "", 0), ("open_app", "", 0)]
     notes = {sig: note for sig, _c, _a, _sc, _fc, _ls, note, _u in rows["task_outcomes"]}
-    assert notes == {"message:discord": "sent", "click:send": "click failed",
+    assert notes == {"message:discord": "sent", "click:click_on_text": "click failed",
                      "open:marblewooddiary": "did not open"}
     assert rows["app_usage"] == []
     # Nothing typed, sent, run or read back is anywhere else either. (The
@@ -133,7 +133,8 @@ def test_hints_still_work_from_counts_and_fixed_notes(db):
     tm.conn.close()
     assert any("'marblewood'" in h and "FAILED every time (did not open)" in h for h in hints)
     assert any("'discord'" in h and "quick_message" in h and "2 times" in h for h in hints)
-    assert any("Clicking 'settings'" in h for h in hints)
+    # A click row names the method, not the target: no per-target click hint.
+    assert not any("Clicking" in h for h in hints)
 
 
 def test_reliability_still_learns_from_the_actions_table(db):
@@ -252,3 +253,47 @@ def test_no_banner_when_off_or_frozen(monkeypatch, capsys, fresh_banner):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _start_api(monkeypatch)
     assert "verbose logs" not in capsys.readouterr().out
+
+
+# -- click signatures: the method only ------------------------------------------------
+
+
+@pytest.mark.parametrize("action", ["click_on_text", "uia_click", "click_nth"])
+def test_a_click_on_a_contact_name_stores_no_part_of_the_name(db, action):
+    tm = TaskMemory(db)
+    tm.record(action, CONTACT, True)
+    tm.record(action, "Discord|" + CONTACT, False)
+    tm.record(action, "", False)
+    tm.conn.close()
+    rows = _all_rows(db)["task_outcomes"]
+    assert [(sig, cat, sc, fc) for sig, cat, _a, sc, fc, _ls, _n, _u in rows] == [
+        (f"click:{action}", "clicking", 1, 2)]
+    assert "joanne" not in repr(rows).lower() and "quillfeather" not in repr(rows).lower()
+
+
+def test_click_counts_add_up_per_method(db):
+    tm = TaskMemory(db)
+    for target, ok in (("Send", True), ("Cancel", False), (CONTACT, True)):
+        tm.record("click_on_text", target, ok)
+    tm.record("uia_click", "Settings", False)
+    counts = {sig: (sc, fc) for sig, sc, fc in tm.conn.execute(
+        "SELECT signature, success_count, fail_count FROM task_outcomes")}
+    tm.conn.close()
+    assert counts == {"click:click_on_text": (2, 1), "click:uia_click": (0, 1)}
+
+
+def test_old_click_rows_are_kept_and_still_hint_new_ones_never_do(db):
+    tm = TaskMemory(db)
+    tm.conn.execute(
+        "INSERT INTO task_outcomes (signature, category, preferred_action, success_count, "
+        "fail_count, last_success, note, updated) VALUES "
+        "('click:settings', 'clicking', 'click_on_text', 0, 3, 0, 'click failed', 'x')")
+    tm.conn.commit()
+    for _ in range(3):
+        tm.record("click_on_text", "Settings", False)
+    hints = tm.get_hints_for_task("click settings, then click_on_text")
+    sigs = sorted(r[0] for r in tm.conn.execute("SELECT signature FROM task_outcomes"))
+    tm.conn.close()
+    assert sigs == ["click:click_on_text", "click:settings"]     # the old row is untouched
+    assert hints == ["- Clicking 'settings' via OCR/UIA has failed more than it's "
+                     "succeeded. Consider verifying with read_screen_text first."]

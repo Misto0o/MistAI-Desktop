@@ -34,6 +34,11 @@ OUTCOME_NOTES = {
     ("clicking", False): "click failed",
 }
 
+# Click rows are keyed "click:<action>" (counts per method); an action name
+# never matches a task's words, so they give no hint. Rows from before that
+# kept the target's first word ("click:settings"); they are never rewritten.
+CLICK_SIGNATURE_ACTIONS = ("uia_click", "click_on_text", "click_nth")
+
 
 class TaskMemory:
     def __init__(self, db_path=None):
@@ -96,15 +101,10 @@ class TaskMemory:
                 return None
             return f"message:{app}", "messaging"
 
-        if action in ("uia_click", "click_on_text", "click_nth"):
-            # Generalize by the FIRST word of the target text, not the
-            # whole literal string -- "Cheese" and "Wy" as Discord contacts
-            # shouldn't create separate signatures, but distinct UI concepts
-            # (e.g. "Send" button vs "Cancel" button) should.
-            key = self._normalize(param.split("|")[-1].split()[0]) if param else ""
-            if len(key) < MIN_KEY_LEN:
-                return None  # "a", "ok", "x" match everything; not worth storing
-            return f"click:{key}", "clicking"
+        if action in CLICK_SIGNATURE_ACTIONS:
+            # The click method only: a word of the target can be a
+            # contact's name or other on-screen content.
+            return f"click:{action}", "clicking"
 
         if action == "browser_search" or action == "browser_navigate":
             return None  # too variable to be worth pattern-caching
