@@ -17,10 +17,11 @@ import requests
 
 from . import planner
 from .api_manager import describe_api_error
+from .executor import Executor
 from .config import (confirmation_answer, credential_failure_reason, lazy_vision_mode,
                      log_text, step_param_for_log, verbose_logs, vision_gating_enabled)
 from .live_state import describe_open_apps
-from .tools import READ_RESULT_CHARS
+from .tools import CLICK_FAMILY, READ_RESULT_CHARS
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
 # on screen (core/api.py read_screen_text).
@@ -595,6 +596,7 @@ class AgentLoop:
         input_streak = (None, None, 0)  # (sig, foreground key, count) of identical inputs
         route_notes = []  # off-target input, cross-category fallbacks (for the done check)
         last_read = None  # result of the phase's last read_screen_text
+        unconfirmed_click = None  # a vision-resolved click no screen read followed yet
         last_executed = None  # the action the Executor really ran last this phase
         unsubmitted = False  # type_text ran and no key/click submitted it yet
         read_after_unsubmitted = False  # the last read happened in that state
@@ -1000,6 +1002,11 @@ class AgentLoop:
             # when a question is finished with no spoken answer.
             # A speech that matches its read costs nothing extra.
             unseen = self._unseen_numbers(speech, last_read) if last_read is not None else []
+            # Names the action only, never the click target or screen text.
+            done_notes = route_notes + ([
+                f"{unconfirmed_click} was resolved by vision and never confirmed: read the "
+                "screen to confirm it landed on the right item, or say you clicked but "
+                "couldn't confirm"] if unconfirmed_click else [])
             is_question = planner._is_question_goal(task) or str(task).rstrip().endswith("?")
             empty_answer = action == "done" and not str(speech or "").strip() and (
                 is_question or last_executed in EMPTY_ANSWER_READS
@@ -1007,19 +1014,19 @@ class AgentLoop:
             if (
                 action == "done"
                 and not done_reminded
-                and (route_notes or unseen or empty_answer
+                and (done_notes or unseen or empty_answer
                      or (last_read is not None and read_after_unsubmitted))
                 and steps_taken < self.MAX_STEPS
             ):
                 done_reminded = True
-                reminder = self._done_reminder(route_notes, last_read, unseen,
+                reminder = self._done_reminder(done_notes, last_read, unseen,
                                                read_after_unsubmitted, empty_answer,
                                                is_question)
                 if verbose_logs():
                     print(f"  [DoneCheck] {reminder}")
                 else:  # the reminder quotes the read and the draft speech
                     fired = [name for name, hit in (
-                        ("route notes", route_notes), ("unseen numbers", unseen),
+                        ("route notes", done_notes), ("unseen numbers", unseen),
                         ("unsubmitted read", last_read is not None and read_after_unsubmitted),
                         ("empty answer", empty_answer)) if hit]
                     print(f"  [DoneCheck] reminder sent ({', '.join(fired)})")
@@ -1249,6 +1256,17 @@ class AgentLoop:
                 unsubmitted = not str(executed_param).endswith(("\n", "\r"))
             elif success and is_input:
                 unsubmitted = False  # a key, hotkey or click after the typing
+            # A vision-resolved click stays unconfirmed until a screen read follows.
+            if success and executed_action in ("read_screen_text", "analyze_screen"):
+                unconfirmed_click = None
+            elif (
+                success
+                and executed_action in CLICK_FAMILY
+                and getattr(res, "method", "") == "Vision"
+                and getattr(res, "verified", None) is not True
+                and getattr(res, "confidence", 1.0) < Executor.CONFIDENCE_THRESHOLD
+            ):
+                unconfirmed_click = executed_action
 
             # Repetition guard: without this the model re-ran clicks it had
             # already landed (each 'maybe it didn't work' costs a step and, on
