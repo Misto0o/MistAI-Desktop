@@ -346,6 +346,23 @@ def lazy_vision_mode():
     return 1 if env_flag("MISTAI_LAZY_VISION", False) else 0
 
 
+def task_ack_enabled():
+    """MISTAI_TASK_ACK: a voice task that reaches the agent gets a spoken
+    "On it." first. On by default; read at call time."""
+    return env_flag("MISTAI_TASK_ACK", True)
+
+
+NARRATION_MODES = ("off", "milestones")
+
+
+def narration_mode():
+    """MISTAI_NARRATION: "milestones" (default) speaks a short fixed progress
+    line during a long voice task; "off" never does. Anything else means
+    "milestones". Read at call time."""
+    v = os.environ.get("MISTAI_NARRATION", "").strip().lower()
+    return v if v in NARRATION_MODES else "milestones"
+
+
 def wake_clips_enabled():
     """MISTAI_WAKE_SAVE_CLIPS=1: the wake loop saves every clip it hears (WAV
     + JSON sidecar) to wake_clip_dir() for offline tuning. Off by default."""

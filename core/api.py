@@ -48,12 +48,14 @@ from .config import (
     is_self_process,
     log_text,
     my_facts_path,
+    narration_mode,
     normalize_process_name,
     process_matches,
     restore_after_task_enabled,
     secret_output_reason,
     step_param_for_log,
     strip_wake_prefix,
+    task_ack_enabled,
     trace_reads_enabled,
     verbose_logs,
 )
@@ -99,6 +101,15 @@ def _show_window_async(hwnd, cmd):
 
     return ctypes.windll.user32.ShowWindowAsync(hwnd, cmd)
 
+
+# Voice tasks only: spoken once a task reaches the agent, and (narration
+# "milestones") while it is still running HEARTBEAT_SECONDS after Mist last
+# spoke, at most HEARTBEAT_MAX times per task. Fixed strings, never model text.
+TASK_ACK_SPEECH = "On it."
+HEARTBEAT_SPEECH = "Still working."
+HEARTBEAT_SECONDS = 20
+HEARTBEAT_MAX = 2
+HEARTBEAT_POLL_SECONDS = 1  # recheck interval while Mist is speaking or listening
 
 # What _listen_once(ptt=True) returns when a second press stopped the listen
 # before any speech: the turn ends quietly, with no recognition call.
@@ -308,11 +319,71 @@ class Api:
     def speak(self, text, interrupt=False):
         if not text:
             return
+        self._last_spoke_at = time.monotonic()  # the heartbeat counts from here
         if self.captions_enabled and self.caption_window:
             self.caption_window.show_speech(text, 8)
         self.tts.say(text, interrupt=interrupt)
 
     speak_now = speak
+
+    # -- Heartbeat ("Still working.") ------------------------------------------
+
+    def _start_heartbeat(self, gen):
+        """Start this task's heartbeat (narration "milestones" only). A chain
+        of daemon one-shot timers; no thread outlives _cancel_heartbeat."""
+        if narration_mode() != "milestones":
+            return None
+        hb = {"gen": gen, "count": 0, "since": time.monotonic(),
+              "timer": None, "cancelled": False}
+        self._schedule_heartbeat(hb, HEARTBEAT_SECONDS)
+        return hb
+
+    def _schedule_heartbeat(self, hb, delay):
+        if hb["cancelled"]:
+            return
+        timer = threading.Timer(delay, self._heartbeat_tick, args=(hb,))
+        timer.daemon = True
+        hb["timer"] = timer
+        timer.start()
+
+    @staticmethod
+    def _cancel_heartbeat(hb):
+        if hb:
+            hb["cancelled"] = True
+            if hb["timer"] is not None:
+                hb["timer"].cancel()
+
+    def _mist_is_talking_or_listening(self):
+        """Speaking, or waiting for the user (a command, conversation,
+        confirmation or ask_user listen, push-to-talk, or a typed answer)."""
+        if getattr(getattr(self, "tts", None), "speaking", False):
+            return True
+        return any(getattr(self, name, None) is not None and getattr(self, name).is_set()
+                   for name in ("_listen_waiting", "_ptt_waiting", "_awaiting_text_answer"))
+
+    def _heartbeat_tick(self, hb):
+        """Runs on a timer thread; takes no lock. Speaks HEARTBEAT_SPEECH when
+        the task has run HEARTBEAT_SECONDS since Mist last spoke or listened."""
+        if (hb["cancelled"] or hb["gen"] != self._agent_generation
+                or self._stop_requested.is_set() or not self._agent_lock.locked()):
+            return
+        now = time.monotonic()
+        if self._mist_is_talking_or_listening():
+            hb["since"] = now
+            self._schedule_heartbeat(hb, HEARTBEAT_POLL_SECONDS)
+            return
+        due = max(hb["since"], getattr(self, "_last_spoke_at", 0.0)) + HEARTBEAT_SECONDS
+        if now < due:
+            self._schedule_heartbeat(hb, due - now)
+            return
+        if hb["cancelled"] or self._stop_requested.is_set():
+            return  # the run ended or was stopped meanwhile
+        hb["count"] += 1
+        hb["since"] = now
+        print(f"[Heartbeat] {hb['count']}/{HEARTBEAT_MAX}")
+        self.speak(HEARTBEAT_SPEECH)
+        if hb["count"] < HEARTBEAT_MAX:
+            self._schedule_heartbeat(hb, HEARTBEAT_SECONDS)
 
     def _wait_for_tts(self, timeout=25):
         """Wait for Mist's own speech without letting a hung fallback engine
@@ -1357,6 +1428,7 @@ class Api:
         gate_taken = False      # did THIS call acquire the run gate?
         thread_started = False  # has the agent thread (which owns release) begun?
         minimized = False       # did THIS call minimize MistAI (restored at the end)?
+        heartbeat = None        # this task's "Still working." timer (voice only)
         # Single sources of truth: the model is the user's choice, read once
         # here so the whole request keeps it (the ``model`` argument is
         # ignored: nothing may pick a different one per call); the gender
@@ -1476,6 +1548,8 @@ class Api:
                     "busy": True,
                 }
 
+            if input_mode == "voice" and not resume_rec and task_ack_enabled():
+                self.speak(TASK_ACK_SPEECH)
             self.minimize_window()
             minimized = True
             result_holder = {}
@@ -1483,6 +1557,7 @@ class Api:
 
             def _release():
                 # Called from the agent thread when the loop really ends.
+                self._cancel_heartbeat(heartbeat)
                 with self._agent_state_lock:
                     if my_gen != self._agent_generation:
                         return  # stale callback from an older run; ignore
@@ -1517,6 +1592,8 @@ class Api:
 
             self.memory.add_conversation("user", message)
 
+            if input_mode == "voice":
+                heartbeat = self._start_heartbeat(my_gen)
             if resume_rec:
                 self.agent.resume_project(
                     resume_rec,
@@ -1572,6 +1649,7 @@ class Api:
             # owns the release) started -> release here, or Mist is "busy"
             # forever. Once the thread is running, its own callback releases.
             if gate_taken and not thread_started:
+                self._cancel_heartbeat(heartbeat)
                 with self._agent_state_lock:
                     self._agent_task = None
                     self._request_model = None

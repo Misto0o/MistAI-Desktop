@@ -255,7 +255,7 @@ def test_anything_but_a_clean_chat_reply_runs_the_agent_as_today(monkeypatch, ll
     assert result["error"] == "still_running"  # agent path, as in the smoke tests
     assert api.rec["minimized"] == 1
     assert api.rec["convo"] == [("user", "tell me a joke and open notepad")]
-    assert api.rec["spoken"] == []
+    assert api.rec["spoken"] == ["On it."]   # the fixed voice ack; the router reply never
     _finish(api)
 
 
