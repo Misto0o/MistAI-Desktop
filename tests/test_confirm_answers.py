@@ -1,11 +1,11 @@
 """Confirmation answers are "yes", "no" or "unclear" (config.confirmation_answer).
 
 - yes runs the action; an explicit no keeps today's decline path and wording.
-- unclear (empty, unrecognized, or neither a yes nor a no word): in voice mode
-  ask once more ("Sorry, yes or no?"); still unclear -> the action is not
-  run, the user hears "I didn't hear a yes, so I didn't <verb> that.", the
-  model is told the answer was not understood, and no decline signature is
-  recorded. Typed mode: unclear the same way, without the retry.
+- unclear (empty, unrecognized, or neither a yes nor a no word): ask once
+  more ("Sorry, yes or no?"), voice and typed alike; still unclear -> the
+  phase fails closed: the user hears "I didn't hear a yes, so I didn't
+  <verb> that.", the result is success False / "not confirmed", and no model
+  call, executor action or other route follows. No decline signature.
 - logs carry "[Confirm] answer=yes|no|unclear" and "(retry)", never the words.
 - planner._confirm uses the same helper.
 """
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.agent import (CONFIRM_RETRY_QUESTION, UNCLEAR_OBSERVATION, AgentLoop,
+from core.agent import (CONFIRM_RETRY_QUESTION, NOT_CONFIRMED_ERROR, AgentLoop,
                         unclear_answer_speech)
 from core.config import confirmation_answer
 from core.planner import PlanRunner
@@ -129,23 +129,46 @@ def test_unclear_then_yes_runs(monkeypatch, capsys):
     _no_content(log)
 
 
-def test_unclear_twice_runs_nothing_and_says_so(monkeypatch, capsys):
-    rec = _run(monkeypatch, [SEND, DONE], [MUMBLE, ""])
-    assert rec.calls == []
-    assert "I didn't hear a yes, so I didn't send that." in rec.spoken
-    assert any(UNCLEAR_OBSERVATION in o for o in _observations(rec))
+UNCLEAR_SEND = {"success": False, "error": "not confirmed",
+                "speech": "I didn't hear a yes, so I didn't send that.", "steps": 1}
+
+
+@pytest.mark.parametrize("mode", ["voice", "text"])
+def test_unclear_twice_fails_closed(monkeypatch, capsys, mode):
+    rec = _run(monkeypatch, [SEND, DONE], [MUMBLE, ""], mode=mode)
+    assert rec.calls == []                                # the executor never ran
+    assert rec.result == UNCLEAR_SEND and NOT_CONFIRMED_ERROR == "not confirmed"
+    assert rec.spoken[-1] == "I didn't hear a yes, so I didn't send that."
+    assert len(rec.asked) == 2 and rec.asked[1] == CONFIRM_RETRY_QUESTION   # one retry
+    assert len(rec.requests) == 1                         # no model call after the answer
     assert rec.rows == []                                 # no confirm_declined row
-    assert rec.result["success"] is True                  # the model's done ends it
     log = capsys.readouterr().out
     assert "[Confirm] answer=unclear\n" in log and "[Confirm] answer=unclear (retry)" in log
+    assert "[Confirm] not confirmed; the phase ends" in log
     _no_content(log)
     _no_content(repr(rec.rows))
 
 
-def test_unclear_records_no_decline_so_the_model_may_ask_again(monkeypatch):
-    rec = _run(monkeypatch, [SEND, SEND, DONE], [MUMBLE, MUMBLE, "yes"])
-    assert rec.calls == [("quick_message", SEND["parameter"])]
-    assert not any("REFUSED" in o for o in _observations(rec))
+@pytest.mark.parametrize("mode", ["voice", "text"])
+def test_unclear_cannot_lead_to_another_model_call_or_route(monkeypatch, mode):
+    # The model has a manual route queued; none of it may run.
+    manual = [{"action": "click_on_text", "parameter": CONTACT},
+              {"action": "type_text", "parameter": MESSAGE},
+              {"action": "press_key", "parameter": "enter"}]
+    rec = _run(monkeypatch, [SEND, *manual, DONE], [MUMBLE, MUMBLE], mode=mode)
+    assert rec.calls == [] and len(rec.requests) == 1
+    assert rec.result["error"] == "not confirmed"
+    assert not any("REFUSED" in o or "declined" in o for o in _observations(rec))
+
+
+@pytest.mark.parametrize("mode", ["voice", "text"])
+def test_enter_in_a_messaging_app_fails_closed_too(monkeypatch, mode):
+    enter = {"action": "press_key", "parameter": "enter"}
+    rec = _run(monkeypatch, [enter, DONE], ["maybe", "hmm"], mode=mode,
+               confirm=("press_key",))
+    assert rec.calls == [] and len(rec.requests) == 1
+    assert rec.result == {"success": False, "error": "not confirmed",
+                          "speech": "I didn't hear a yes, so I didn't do that.", "steps": 1}
 
 
 def test_other_actions_name_a_generic_verb(monkeypatch):
@@ -170,16 +193,21 @@ def test_no_is_unchanged(monkeypatch, capsys, mode):
     assert capsys.readouterr().out.count("[Confirm] answer=no") == 2
 
 
-def test_typed_maybe_is_unclear_without_a_retry(monkeypatch, capsys):
-    rec = _run(monkeypatch, [SEND, DONE], ["maybe"], mode="text")
+def test_typed_maybe_gets_the_one_retry_then_yes_runs(monkeypatch, capsys):
+    rec = _run(monkeypatch, [SEND, DONE], ["maybe", "yes"], mode="text")
+    assert rec.calls == [("quick_message", SEND["parameter"])]
+    assert rec.asked[1] == CONFIRM_RETRY_QUESTION and len(rec.asked) == 2
+    assert rec.result["success"] is True
+    assert "[Confirm] answer=yes (retry)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["voice", "text"])
+def test_an_explicit_no_on_the_retry_is_still_the_decline_path(monkeypatch, mode):
+    rec = _run(monkeypatch, [SEND, DONE], ["maybe", "no"], mode=mode)
     assert rec.calls == []
-    assert len(rec.asked) == 1
-    assert "I didn't hear a yes, so I didn't send that." in rec.spoken
-    assert any(UNCLEAR_OBSERVATION in o for o in _observations(rec))
-    assert rec.rows == []
-    log = capsys.readouterr().out
-    assert "[Confirm] answer=unclear" in log and "(retry)" not in log
-    _no_content(log)
+    assert rec.rows == [("confirm_declined", False)]
+    assert any("User explicitly declined this action" in o for o in _observations(rec))
+    assert rec.result["success"] is True                  # the model's done ends it
 
 
 def test_typed_yes_runs(monkeypatch):

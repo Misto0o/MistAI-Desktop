@@ -37,15 +37,14 @@ EMPTY_ANSWER_READS = frozenset(
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
 
-# A confirmation answer that is neither yes nor no: asked once more (voice),
-# then the action is not run and the user hears why.
+# A confirmation answer that is neither yes nor no: asked once more (voice
+# and typed); still unclear -> the phase ends (fails closed): the user hears
+# why, and no model call, input or other route follows.
 CONFIRM_RETRY_QUESTION = "Sorry, yes or no?"
 CONFIRM_VERBS = {"quick_message": "send"}       # anything else: "do"
 # A quick_message question quotes at most this much of the message.
 CONFIRM_MESSAGE_CHARS = 60
-UNCLEAR_OBSERVATION = (
-    "[OBSERVATION] The user's answer was not understood (not a no); the action "
-    "was not run.")
+NOT_CONFIRMED_ERROR = "not confirmed"
 
 
 def unclear_answer_speech(action):
@@ -933,7 +932,7 @@ class AgentLoop:
             ):
                 confirm_q = self._confirmation_question(action, param)
                 verdict = self._ask_confirmation(confirm_q, input_mode)
-                if verdict == "unclear" and input_mode == "voice":
+                if verdict == "unclear":
                     verdict = self._ask_confirmation(CONFIRM_RETRY_QUESTION, input_mode,
                                                      retry=True)
                 if verdict is None:
@@ -943,11 +942,14 @@ class AgentLoop:
                     on_step(steps_taken, "confirm", param, confirm_q)
 
                 if verdict == "unclear":
-                    # Not a refusal: no decline signature, the model may ask again.
-                    self.api.speak(unclear_answer_speech(action))
-                    history.append({"role": "assistant", "content": json.dumps(cmd)})
-                    history.append({"role": "user", "content": UNCLEAR_OBSERVATION})
-                    continue
+                    # Fail closed: the phase ends here. Not a refusal (no
+                    # decline signature), and nothing else is tried.
+                    speech = unclear_answer_speech(action)
+                    print("  [Confirm] not confirmed; the phase ends")
+                    self.api.speak(speech)
+                    self._print_step_times(steps_taken, step_times)
+                    return {"success": False, "error": NOT_CONFIRMED_ERROR,
+                            "speech": speech, "steps": steps_taken}
 
                 confirmed = verdict == "yes"
 
