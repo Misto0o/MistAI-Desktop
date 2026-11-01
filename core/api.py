@@ -36,10 +36,12 @@ from .config import (
     PTT_PAUSE_THRESHOLD,
     PTT_PHRASE_TIME_LIMIT,
     PTT_THRESHOLD_MAX_AGE,
+    SEARCH_ROUTES,
     STATUS_URL,
     TRACKED_APPS,
     WAKE_WORDS,
     announce_verbose_logs,
+    blocked_page_reason,
     esc,
     fuzzy_wake,
     wake_clip_dir,
@@ -3806,17 +3808,19 @@ class Api:
                 self.last_result_text = f"browser_open failed: {e}"
                 return False
 
-    def _page_excerpt(self, limit=900):
+    def _page_text(self):
+        try:
+            return " ".join((self.browser.get_text("") or "").split())
+        except Exception:
+            return ""
+
+    def _page_excerpt(self, limit=900, text=None):
         """First chunk of the current page's real DOM text, for handing back
         to the model in the same observation as a navigate/search. Without
         this the model had to *know* to call browser_get_text as a second
         step -- and a small model instead re-ran the search five times."""
-        try:
-            text = self.browser.get_text("") or ""
-            text = " ".join(text.split())
-            return text[:limit] + ("..." if len(text) > limit else "")
-        except Exception:
-            return ""
+        text = self._page_text() if text is None else text
+        return text[:limit] + ("..." if len(text) > limit else "")
 
     def _act_browser_navigate(self, param):
         if not param:
@@ -3824,7 +3828,15 @@ class Api:
             return False
         try:
             url, title = self.browser.navigate(param)
-            excerpt = self._page_excerpt()
+            text = self._page_text()
+            reason = blocked_page_reason(url, title, text)
+            if reason:
+                print(f"[Browser] browser_navigate: block page ({reason})")
+                self.last_result_text = (
+                    f"BLOCKED: {reason}. This is a block/CAPTCHA page, not the content; "
+                    f"do not try to solve it. Use browser_search for the information instead.")
+                return False
+            excerpt = self._page_excerpt(text=text)
             self.last_result_text = f"Navigated to {url} ({title})."
             if excerpt:
                 self.last_result_text += (
@@ -3842,21 +3854,36 @@ class Api:
         if not param:
             return False
         import urllib.parse
-        url = "https://www.google.com/search?q=" + urllib.parse.quote(param)
+        blocked = []  # (route name, fixed reason) of each route that showed a block page
         try:
-            self.browser.navigate(url)
-            excerpt = self._page_excerpt()
-            self.last_result_text = f"Searched Google for '{param}'."
-            if excerpt:
-                self.last_result_text += (
-                    f" RESULTS PAGE TEXT (already read -- do NOT search again; "
-                    f"answer from this, or browser_click a result): {excerpt}"
-                )
-            self.speak(f"Searching for {param}")
-            return True
+            for name, base in SEARCH_ROUTES:
+                url, title = self.browser.navigate(base + urllib.parse.quote(param))
+                text = self._page_text()
+                reason = blocked_page_reason(url, title, text)
+                if reason:
+                    print(f"[Browser] browser_search: {name} showed a block page ({reason})")
+                    blocked.append((name, reason))
+                    continue
+                excerpt = self._page_excerpt(text=text)
+                self.last_result_text = f"Searched {name} for '{param}'."
+                if blocked:
+                    self.last_result_text += (
+                        f" ({', '.join(n for n, _ in blocked)} showed a block page.)")
+                if excerpt:
+                    self.last_result_text += (
+                        f" RESULTS PAGE TEXT (already read -- do NOT search again; "
+                        f"answer from this, or browser_click a result): {excerpt}"
+                    )
+                self.speak(f"Searching for {param}")
+                return True
         except Exception as e:
             self.last_result_text = f"browser_search failed: {e}"
             return False
+        self.last_result_text = (
+            "BLOCKED: " + "; ".join(f"{n}: {r}" for n, r in blocked)
+            + ". Every search route showed a block/CAPTCHA page; do not try to solve it. "
+            "Use browser_navigate to a specific site, or tell the user.")
+        return False
 
     def _act_browser_close(self):
         try:

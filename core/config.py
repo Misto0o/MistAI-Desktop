@@ -6,6 +6,7 @@ import sys
 import os
 import re
 import difflib
+import urllib.parse
 
 VERSION = "2.0"
 STATUS_URL = "https://mist-ai.fly.dev/api/status"
@@ -662,6 +663,43 @@ def credential_failure_reason(command, output=""):
         return "the request was refused as unauthorized (401/403)"
     if _CRED_TEXT_RX.search(output):
         return "the response says a credential is missing or invalid"
+    return None
+
+
+# browser_search tries these in order; a block page moves on to the next one
+# (once). The second route's URL has not been checked against a live block.
+SEARCH_ROUTES = (
+    ("Google", "https://www.google.com/search?q="),
+    ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
+)
+
+# Generic block/CAPTCHA wording -> a fixed reason. Checked in the title and
+# text of SHORT pages only: a block page is a few lines, while an article
+# that merely mentions a CAPTCHA is long.
+_BLOCK_PAGE_RX = (
+    (re.compile(r"\bunusual traffic\b", re.I), "the page reports unusual traffic"),
+    (re.compile(r"\bnot a robot\b", re.I), "the page asks to prove you're not a robot"),
+    (re.compile(r"\bcaptcha\b", re.I), "the page shows a CAPTCHA"),
+    (re.compile(r"\bverify (?:that )?you(?: are|'re) (?:a )?human\b", re.I),
+     "the page asks to verify you are human"),
+    (re.compile(r"\baccess denied\b", re.I), "the page says access denied"),
+)
+BLOCK_PAGE_MAX_CHARS = 1500
+
+
+def blocked_page_reason(url, title, text):
+    """A short fixed reason when a loaded page is a block/CAPTCHA page, else
+    None. Never returns anything taken from the page."""
+    path = urllib.parse.urlsplit(str(url or "")).path.lower()
+    if "/sorry/" in path or path.rstrip("/").endswith("/sorry"):
+        return "the site redirected to a /sorry/ block page"
+    text = " ".join(str(text or "").split())
+    if len(text) > BLOCK_PAGE_MAX_CHARS:
+        return None
+    page = f"{title or ''} {text}"
+    for rx, reason in _BLOCK_PAGE_RX:
+        if rx.search(page):
+            return reason
     return None
 
 
