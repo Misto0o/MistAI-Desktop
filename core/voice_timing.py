@@ -25,6 +25,12 @@ class VoiceTimer:
         with self._lock:
             return self._t0 is not None
 
+    @property
+    def label(self):
+        """The active turn's label, or "" when no turn is active."""
+        with self._lock:
+            return self._label if self._t0 is not None else ""
+
     def start(self, label, t0=None):
         with self._lock:
             self._label = label

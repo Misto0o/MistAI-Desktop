@@ -353,6 +353,14 @@ def task_ack_enabled():
     return env_flag("MISTAI_TASK_ACK", True)
 
 
+def voice_diag_enabled():
+    """MISTAI_VOICE_DIAG=1: one "[VoiceDiag]" line per _listen_once with
+    numbers only (clip length, levels, sample rate, threshold, seconds since
+    TTS ended, exception type). Never audio or words. Off by default; read at
+    call time."""
+    return env_flag("MISTAI_VOICE_DIAG", False)
+
+
 NARRATION_MODES = ("off", "milestones")
 
 

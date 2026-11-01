@@ -60,6 +60,7 @@ from .config import (
     task_ack_enabled,
     trace_reads_enabled,
     verbose_logs,
+    voice_diag_enabled,
 )
 from . import conversation, file_search
 from .events import EventBus
@@ -955,13 +956,21 @@ class Api:
         waiting = getattr(self, "_listen_waiting", None)
         if waiting is not None:
             waiting.set()
+        # MISTAI_VOICE_DIAG: numbers about this listen, printed at the end.
+        diag = self._voice_diag_start(ptt) if voice_diag_enabled() else None
         try:
             with self._mic_lock:
                 self._voice_mark("mic_acquired")
+                if diag is not None:
+                    diag["mic_wait"] = time.monotonic() - diag["t0"]
                 try:
                     rec = self._ptt_recognizer() if ptt else self.recognizer
                     stream = None
                     with self.microphone as src:
+                        if diag is not None:
+                            diag.update(since_tts=self._seconds_since_tts(),
+                                        thr0=rec.energy_threshold,
+                                        sr=getattr(src, "SAMPLE_RATE", None))
                         if ptt:
                             phrase_limit = self._ptt_listen_setup(rec, src)
                             # After the adjustment, so a stop never skews the
@@ -975,6 +984,8 @@ class Api:
                             self.recognizer.non_speaking_duration = 0.5
                             self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
                             phrase_limit = 15
+                        if diag is not None:
+                            diag["thr1"] = rec.energy_threshold
                         self._voice_mark("listen_start")
                         if on_listening is not None:
                             try:
@@ -985,20 +996,74 @@ class Api:
                             src, timeout=timeout, phrase_time_limit=phrase_limit
                         )
                         self._voice_mark("speech_end")
+                        if diag is not None:
+                            diag["audio"] = audio
                         if (stream is not None and self._ptt_stop_event().is_set()
                                 and not stream.speech):
                             self._voice_mark("cancelled", end=True)
+                            if diag is not None:
+                                diag["result"] = "cancelled"
                             return _PTT_CANCELLED
                         text = rec.recognize_google(audio)
                         self._voice_mark("stt_done")
+                        if diag is not None:
+                            diag["result"] = "ok"
                         return text
                 except Exception as e:
+                    if diag is not None:
+                        diag["result"] = type(e).__name__
                     print(f"[ListenOnce] {e}")
                     self._voice_mark(f"listen_failed ({type(e).__name__})", end=True)
                     return None
         finally:
             if waiting is not None:
                 waiting.clear()
+            if diag is not None:
+                self._log_voice_diag(diag)
+
+    def _voice_diag_start(self, ptt):
+        timer = getattr(self, "voice_timer", None)
+        label = (getattr(timer, "label", "") if timer is not None else "") or "listen"
+        return {"t0": time.monotonic(), "label": label, "rec": "ptt" if ptt else "shared"}
+
+    def _seconds_since_tts(self):
+        """Seconds since Mist's last utterance finished playing, or None
+        (never spoke, or still speaking)."""
+        tts = getattr(self, "tts", None)
+        at = getattr(tts, "finished_at", None)
+        if at is None or getattr(tts, "speaking", False):
+            return None
+        return time.monotonic() - at
+
+    def _log_voice_diag(self, d):
+        """One "[VoiceDiag]" line: numbers and an exception type only, never
+        the audio or any words. since_tts is measured when the mic opened,
+        before the noise adjustment; thr is the threshold before -> after it."""
+        def num(v, fmt):
+            try:
+                return format(int(v) if fmt == "d" else float(v), fmt)
+            except (TypeError, ValueError):
+                return "na"
+
+        audio = d.get("audio")
+        clip = rms = peak = None
+        sr_ = d.get("sr")
+        if audio is not None:
+            try:
+                import audioop
+
+                clip = self._clip_seconds(audio)
+                rms = audioop.rms(audio.frame_data, audio.sample_width)
+                peak = audioop.max(audio.frame_data, audio.sample_width)
+                sr_ = audio.sample_rate
+            except Exception:
+                pass
+        print(f"[VoiceDiag] {d['label']} listen: clip={num(clip, '.2f')}s "
+              f"rms={num(rms, 'd')} peak={num(peak, 'd')} sr={num(sr_, 'd')} "
+              f"thr={num(d.get('thr0'), '.0f')}->{num(d.get('thr1'), '.0f')} "
+              f"since_tts={num(d.get('since_tts'), '.2f')}s "
+              f"mic_wait={num(d.get('mic_wait'), '.2f')}s rec={d['rec']} "
+              f"result={d.get('result', 'na')}")
 
     def _ptt_stop_event(self):
         ev = getattr(self, "_ptt_stop", None)

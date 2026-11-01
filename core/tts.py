@@ -52,6 +52,9 @@ class NeuralTTS:
         # wait_until_done() can block on it instead of polling.
         self._cv = threading.Condition()
         self._outstanding = 0
+        # Monotonic time the last utterance finished and nothing was left
+        # (diagnostics: MISTAI_VOICE_DIAG's since_tts). None until then.
+        self.finished_at = None
         # Bumped by interrupt(); an utterance whose generation is older than
         # the current one is dropped (even if its synthesis already finished).
         self._generation = 0
@@ -145,6 +148,8 @@ class NeuralTTS:
             finally:
                 with self._cv:
                     self._outstanding = max(0, self._outstanding - 1)
+                    if self._outstanding == 0:
+                        self.finished_at = time.monotonic()
                     self._cv.notify_all()
                 self._q.task_done()
 
