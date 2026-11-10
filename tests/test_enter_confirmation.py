@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from confirm_helpers import bind_confirmation
 from core.agent import AgentLoop
 from core.api import Api
 from core.tools import SPECS, ToolRegistry
@@ -114,6 +115,7 @@ def _loop(monkeypatch, safe, replies):
                         lambda *a, **k: SimpleNamespace(ok=True, status_code=200,
                                                         json=lambda: {"response": next(replies)}))
     monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
     monkeypatch.setattr(loop, "_current_foreground_key", lambda: (1, "W"))

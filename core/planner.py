@@ -700,19 +700,13 @@ class PlanRunner:
 
     def _confirm(self, question, input_mode):
         api = self.api
-        if input_mode == "voice":
-            api.speak(question)
-            while api.tts.speaking:
-                time.sleep(0.05)
-            answer = api._listen_once(timeout=10)
-        else:
-            answer = api._get_text_answer(question, timeout=60)
+        answer, source = api.ask_confirmation(question, input_mode)   # Yes/No buttons too
         if api._stop_requested.is_set():
             return False
         text = " ".join(
             re.sub(r"[^\w\s']", " ", str(answer or "").lower()).split()
         )
-        if input_mode == "voice" and text in {
+        if source == "voice" and text in {
             "stop",
             "mist stop",
             "hey mist stop",
@@ -727,7 +721,7 @@ class PlanRunner:
             api.stop_current_task()
             return False
         verdict = confirmation_answer(text, extra_yes=("continue",))
-        print(f"[Confirm] answer={verdict}")           # never the words
+        print(f"[Confirm] answer={verdict} ({source})")   # never the words
         return verdict == "yes"                        # unclear: don't continue
 
     def _persist(self, record, plan):

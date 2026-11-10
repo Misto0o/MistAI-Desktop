@@ -177,22 +177,15 @@ class AgentLoop:
         """Ask a confirmation question and classify the answer: "yes", "no",
         "unclear", or None when the user stopped the task. Logs the verdict
         only, never the words."""
-        if input_mode == "voice":
-            self.api.speak(question)
-            while self.api.tts.speaking:
-                time.sleep(0.05)
-            # Its own [VoiceTiming] turn: mic and STT time of the answer.
-            self._voice_timing("_voice_start", "confirm")
-            answer = self.api._listen_once(timeout=10)
-            self._voice_timing("_voice_mark", "answered", end=True)
-        else:
-            answer = self.api._get_text_answer(question, timeout=60)
+        # Yes/No buttons on the page in both modes; voice also listens, and a
+        # click wins over speech (Api.ask_confirmation).
+        answer, source = self.api.ask_confirmation(question, input_mode)
 
         if self.api._stop_requested.is_set():
             return None
 
         if (
-            input_mode == "voice"
+            source == "voice"
             and self.api._normalize_utterance(answer)
             in self.api._VOICE_STOP_WORDS
         ):
@@ -200,7 +193,7 @@ class AgentLoop:
             return None
 
         verdict = confirmation_answer(answer)
-        print(f"  [Confirm] answer={verdict}{' (retry)' if retry else ''}")
+        print(f"  [Confirm] answer={verdict} ({source}){' (retry)' if retry else ''}")
         return verdict
 
     def _voice_timing(self, method, *args, **kwargs):

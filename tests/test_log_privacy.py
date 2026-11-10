@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from confirm_helpers import bind_confirmation
 from core.agent import AgentLoop, step_param_for_log
 from core.tools import SPECS
 
@@ -67,6 +68,7 @@ def _run(monkeypatch, replies, answers=(), mode="voice", confirm=("quick_message
 
     monkeypatch.setattr("core.agent.requests.post", fake_post)
     monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
     monkeypatch.setattr(loop, "_current_foreground_key", lambda: (1, "Discord"))

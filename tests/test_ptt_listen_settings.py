@@ -194,4 +194,6 @@ def test_only_push_to_talk_passes_ptt():
                     found.append((rel, "ptt=True" in line))
     ptt = [rel for rel, on in found if on]
     assert ptt == ["core/api.py", "core/api.py"]
-    assert len(found) - len(ptt) >= 6                        # the other callers, all default
+    # The other callers, all default: the wake conversation (3), voice ask_user,
+    # and Api.ask_confirmation (the agent's and the planner's confirmations).
+    assert len(found) - len(ptt) >= 5

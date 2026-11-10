@@ -6,7 +6,8 @@
   phase fails closed: the user hears "I didn't hear a yes, so I didn't
   <verb> that.", the result is success False / "not confirmed", and no model
   call, executor action or other route follows. No decline signature.
-- logs carry "[Confirm] answer=yes|no|unclear" and "(retry)", never the words.
+- logs carry "[Confirm] answer=yes|no|unclear (button|voice|typed)" and
+  "(retry)", never the words.
 - planner._confirm uses the same helper.
 """
 
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from confirm_helpers import bind_confirmation
 from core.agent import (CONFIRM_RETRY_QUESTION, NOT_CONFIRMED_ERROR, AgentLoop,
                         unclear_answer_speech)
 from core.config import confirmation_answer
@@ -108,6 +110,7 @@ def _run(monkeypatch, replies, answers, mode="voice", confirm=("quick_message", 
 
     monkeypatch.setattr("core.agent.requests.post", fake_post)
     monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
     monkeypatch.setattr(loop, "_current_foreground_key", lambda: (1, "Discord"))
@@ -125,7 +128,8 @@ def test_unclear_then_yes_runs(monkeypatch, capsys):
     assert rec.calls == [("quick_message", SEND["parameter"])]
     assert rec.asked[1] == CONFIRM_RETRY_QUESTION and len(rec.asked) == 2
     log = capsys.readouterr().out
-    assert "[Confirm] answer=unclear\n" in log and "[Confirm] answer=yes (retry)" in log
+    assert "[Confirm] answer=unclear (voice)\n" in log
+    assert "[Confirm] answer=yes (voice) (retry)" in log
     _no_content(log)
 
 
@@ -143,7 +147,9 @@ def test_unclear_twice_fails_closed(monkeypatch, capsys, mode):
     assert len(rec.requests) == 1                         # no model call after the answer
     assert rec.rows == []                                 # no confirm_declined row
     log = capsys.readouterr().out
-    assert "[Confirm] answer=unclear\n" in log and "[Confirm] answer=unclear (retry)" in log
+    src = "voice" if mode == "voice" else "typed"
+    assert f"[Confirm] answer=unclear ({src})\n" in log
+    assert f"[Confirm] answer=unclear ({src}) (retry)" in log
     assert "[Confirm] not confirmed; the phase ends" in log
     _no_content(log)
     _no_content(repr(rec.rows))
@@ -198,7 +204,7 @@ def test_typed_maybe_gets_the_one_retry_then_yes_runs(monkeypatch, capsys):
     assert rec.calls == [("quick_message", SEND["parameter"])]
     assert rec.asked[1] == CONFIRM_RETRY_QUESTION and len(rec.asked) == 2
     assert rec.result["success"] is True
-    assert "[Confirm] answer=yes (retry)" in capsys.readouterr().out
+    assert "[Confirm] answer=yes (typed) (retry)" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("mode", ["voice", "text"])
@@ -271,9 +277,11 @@ def test_planner_confirm_uses_the_helper(capsys, mode, answer, expected, verdict
                           _listen_once=lambda timeout=10: answer,
                           _get_text_answer=lambda _q, timeout=60: answer,
                           _stop_requested=threading.Event())
+    bind_confirmation(api)
     runner = PlanRunner.__new__(PlanRunner)
     runner.api = api
     assert runner._confirm("Continue with the independent phases?", mode) is expected
     log = capsys.readouterr().out
-    assert f"[Confirm] answer={verdict}" in log
+    assert f"[Confirm] answer={verdict} ({'voice' if mode == 'voice' else 'typed'})" in log
+    assert api.notified[-2:] == ["showConfirmPrompt", "closeConfirmPrompt"]
     _no_content(log)

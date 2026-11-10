@@ -174,6 +174,7 @@ header{
 .modal-buttons{display:flex;gap:8px}
 .btn-save{flex:1;background:var(--accent);color:#04141c;border:none;padding:8px;border-radius:6px;cursor:pointer;font-size:.8em;font-weight:600}
 .btn-save:hover{background:var(--accent2)}
+.msg.confirm .confirm-buttons{display:flex;gap:8px;margin-top:8px}
 .btn-cancel{flex:1;background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:6px;cursor:pointer;font-size:.8em}
 .btn-cancel:hover{border-color:var(--accent)}
 .card-note{font-size:.66em;color:var(--muted2);font-family:'DM Mono',monospace;margin-top:6px}
@@ -481,7 +482,10 @@ ctrlCaption.onclick=toggleCaptions;
 
 function showAskUserPrompt(question){
   addMsg(question, 'assistant');
-  inp.placeholder = "Type your answer...";
+  unlockForAnswer("Type your answer...");
+}
+function unlockForAnswer(placeholder){
+  inp.placeholder = placeholder;
   inp.focus();
   // Unlock the input so the user can answer, but the agent is still
   // running -- keep the orb/status showing that.
@@ -489,6 +493,47 @@ function showAskUserPrompt(question){
   btnSend.disabled=inp.disabled=false;
   setMistStatus('listening','Waiting for your answer...');
   inp.dataset.answering = "true";
+}
+
+// A confirmation (Api.ask_confirmation): the question as text plus Yes and No
+// buttons. A click sends its answer once; the buttons go away after any answer
+// (a click, speech or the text box), and Python closes the prompt either way.
+// The text box keeps working as for any question.
+let confirmPrompt=null;
+function showConfirmPrompt(question){
+  closeConfirmPrompt();
+  const box=addMsg('', 'assistant confirm');
+  const q=document.createElement('div');
+  q.textContent=String(question||'');
+  box.appendChild(q);
+  const row=document.createElement('div');
+  row.className='confirm-buttons';
+  for(const [answer,label,cls] of [['yes','Yes','btn-save'],['no','No','btn-cancel']]){
+    const b=document.createElement('button');
+    b.className=cls;b.textContent=label;
+    b.onclick=()=>answerConfirm(answer,label);
+    row.appendChild(b);
+  }
+  box.appendChild(row);
+  confirmPrompt={row};
+  unlockForAnswer("Type yes or no, or press a button...");
+}
+function closeConfirmPrompt(){
+  if(!confirmPrompt)return false;
+  confirmPrompt.row.remove();
+  confirmPrompt=null;
+  if(inp.dataset.answering==="true"){
+    inp.dataset.answering="false";
+    inp.placeholder="Tell MistAI what to do...";
+    setBusy(true);
+  }
+  return true;
+}
+async function answerConfirm(answer,label){
+  if(!closeConfirmPrompt())return;     // already answered: never a second submit
+  addMsg(label,'user');
+  try{await pywebview.api.submit_answer(answer,'button');}
+  catch(e){addMsg('Error: '+e,'error');}
 }
 
 function openAPIModal(){apiModal.classList.add('open');}
@@ -560,6 +605,7 @@ async function send() {
   }
 
   if (inp.dataset.answering === "true") {
+    if (confirmPrompt) { confirmPrompt.row.remove(); confirmPrompt = null; }
     inp.dataset.answering = "false";
     inp.placeholder = "Tell MistAI what to do...";
     addMsg(msg, 'user');

@@ -353,6 +353,14 @@ def task_ack_enabled():
     return env_flag("MISTAI_TASK_ACK", True)
 
 
+def confirm_reminimize_enabled():
+    """MISTAI_CONFIRM_REMINIMIZE: a confirmation prompt restores MistAI's
+    window so its Yes/No buttons are visible, then minimizes it again once
+    answered (so later screen reads see the app, not MistAI). On by default;
+    read at call time."""
+    return env_flag("MISTAI_CONFIRM_REMINIMIZE", True)
+
+
 def voice_diag_enabled():
     """MISTAI_VOICE_DIAG=1: one "[VoiceDiag]" line per _listen_once with
     numbers only (clip length, levels, sample rate, threshold, seconds since

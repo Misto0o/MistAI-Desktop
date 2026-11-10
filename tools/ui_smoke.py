@@ -48,6 +48,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -91,6 +92,11 @@ _CHAT = """JSON.stringify(Array.from(document.querySelectorAll('#chat > *')).sli
 # A voice turn with a quote, an apostrophe and a script tag in it.
 VOICE_HEARD = """open "notes" it's </script><script>window.__x=1</script>"""
 VOICE_REPLY = 'Opened "notes" <b>bold</b>'
+CONFIRM_Q = 'Send "<b>hi</b>" to Ada on Discord?'
+_CONFIRM = """(()=>{const b=Array.from(document.querySelectorAll('#chat .confirm')).pop();
+return JSON.stringify({question: b ? b.firstChild.textContent : null,
+  buttons: b ? Array.from(b.querySelectorAll('.confirm-buttons button')).map(x => x.textContent) : []});
+})()"""
 
 # Press Save with an empty key and the box ticked (the page's default).
 _PRESS_SAVE = """window.__saveDone=false;
@@ -199,7 +205,7 @@ def main_mode(mode):
         api._window = window
         expected_options = [[m, MODEL_LABELS[m]] for m in MODEL_CHOICES]
 
-        def checks(state, saved, ptt, voice, facts):
+        def checks(state, saved, ptt, voice, facts, confirm):
             before, listening, note, after = (ptt.get(k) or {} for k in
                                               ("before", "listening", "note", "after"))
             return [
@@ -244,6 +250,13 @@ def main_mode(mode):
                 ("'Import my facts' with no file shows a plain note",
                  facts[0].startswith("No facts file found.") and facts[1] == "card-note",
                  facts),
+                ("a confirmation shows its question as text with Yes and No",
+                 (confirm.get("shown") or {}).get("question") == CONFIRM_Q
+                 and (confirm.get("shown") or {}).get("buttons") == ["Yes", "No"], confirm),
+                ("clicking Yes answers it once and the buttons go away",
+                 list(confirm.get("result") or ()) == ["yes", "button"]
+                 and (confirm.get("after") or {}).get("buttons") == []
+                 and confirm.get("window") == ["restore", "minimize"], confirm),
                 ("no page errors captured", state["errors"] == [], state["errors"]),
             ]
 
@@ -304,8 +317,29 @@ def main_mode(mode):
                         "JSON.stringify([document.getElementById('facts-note').textContent,"
                         "document.getElementById('facts-note').className])"))
                     time.sleep(0.1)
+                # A confirmation through the REAL Api.ask_confirmation (typed
+                # mode: no speech, no mic). The window stays hidden: restore and
+                # minimize are recorded on a stand-in, not done.
+                confirm = {"window": []}
+                real_window, real_minimize = api._window, api.minimize_window
+                api._window = SimpleNamespace(evaluate_js=window.evaluate_js,
+                                              restore=lambda: confirm["window"].append("restore"))
+                api.minimize_window = lambda: confirm["window"].append("minimize")
+                try:
+                    asker = threading.Thread(target=lambda: confirm.update(
+                        result=api.ask_confirmation(CONFIRM_Q, "text")), daemon=True)
+                    asker.start()
+                    confirm["shown"] = json.loads(poll(
+                        _CONFIRM, lambda v: json.loads(v)["buttons"] == ["Yes", "No"]))
+                    window.evaluate_js(
+                        "document.querySelector('#chat .confirm .confirm-buttons button').click()")
+                    asker.join(5)
+                    time.sleep(0.3)
+                    confirm["after"] = json.loads(window.evaluate_js(_CONFIRM))
+                finally:
+                    api._window, api.minimize_window = real_window, real_minimize
                 state = json.loads(window.evaluate_js(_STATE))   # errors after all of it
-                results = checks(state, saved, ptt, voice, facts)
+                results = checks(state, saved, ptt, voice, facts, confirm)
                 for name, ok, got in results:
                     print(f"{'PASS' if ok else 'FAIL'}  {name}" +
                           ("" if ok else f"  (got {got!r})"))

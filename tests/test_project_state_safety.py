@@ -5,6 +5,7 @@ import subprocess
 import threading
 from types import SimpleNamespace
 
+from confirm_helpers import bind_confirmation
 from core.agent import AgentLoop
 from core.api import Api
 from core.executor import ExecutionResult, Executor
@@ -211,6 +212,7 @@ def test_explicit_path_answer_clears_the_latched_workspace_gate(tmp_path, monkey
         "core.agent.requests.post", lambda *_args, **_kwargs: _Response(next(replies))
     )
     try:
+        bind_confirmation(api)
         loop = AgentLoop(api, None)
         loop._get_screen_context = lambda: "VS Code is open."
         result = loop._loop("Add a section to this website", "test", "none", "text", None)
@@ -299,6 +301,7 @@ def test_portfolio_path_handoff_inspects_patches_and_opens_same_project(tmp_path
         "core.agent.requests.post", lambda *_args, **_kwargs: _Response(next(replies))
     )
     try:
+        bind_confirmation(api)
         loop = AgentLoop(api, None)
         loop._get_screen_context = lambda: "VS Code is open."
         result = loop._loop("Add a section to this website", "test", "none", "text", None)
@@ -368,6 +371,7 @@ def test_existing_file_requires_inspection_before_full_replacement(tmp_path):
     finally:
         if registry._conn:
             registry._conn.close()
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     assert "REPLACE all existing content" in loop._confirmation_question(
         "write_file", f"{target}|||{{}}"
@@ -378,6 +382,7 @@ def test_write_file_documentation_does_not_describe_an_append(tmp_path):
     target = tmp_path / "index.html"
     target.write_text("<main>existing</main>", encoding="utf-8")
     api = _api_with_workspace(tmp_path)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
 
     system = loop._build_system(
@@ -434,6 +439,7 @@ def test_open_existing_trusted_project_is_allowed_without_mutation_gate(tmp_path
     api = _api_with_workspace(tmp_path)
     assert Api._establish_workspace_for_task(api, f'Project at "{project}"')
     api._workspace_required_for_task = True
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     assert not loop._workspace_mutation_is_blocked("open_project_in_vscode", str(project))
 
@@ -463,6 +469,7 @@ def test_agent_blocks_project_write_until_workspace_and_file_are_inspected(tmp_p
     target.write_text('{"scripts":{"dev":"vite"}}', encoding="utf-8")
     api = _api_with_workspace(tmp_path)
     api._workspace_required_for_task = True
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
 
     assert loop._workspace_mutation_is_blocked("write_file", f"{target}|||{{}}")

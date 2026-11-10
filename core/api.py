@@ -42,6 +42,7 @@ from .config import (
     WAKE_WORDS,
     announce_verbose_logs,
     blocked_page_reason,
+    confirm_reminimize_enabled,
     esc,
     fuzzy_wake,
     wake_clip_dir,
@@ -181,6 +182,7 @@ class Api:
         from .browser_session import BrowserSession
         self.browser = BrowserSession()
         self._pending_answer = None
+        self._pending_source = None     # "button" or "typed", with _pending_answer
         self._answer_event = threading.Event()
         self._awaiting_text_answer = threading.Event()
         self._answer_lock = threading.Lock()
@@ -947,12 +949,15 @@ class Api:
 
         print("[ConversationLoop] Ended, returning to wake-word-only mode")
 
-    def _listen_once(self, timeout=6, on_listening=None, ptt=False):
+    def _listen_once(self, timeout=6, on_listening=None, ptt=False, stop_event=None):
         # Set before waiting for the mic, so the wake loop can log a clip it
         # transcribes meanwhile ([MicCompete]). on_listening (optional) is
         # called once the mic is open, right before listening starts.
         # ptt=True: push-to-talk's own recognizer and settings (see
         # _ptt_listen_setup); every other caller is unchanged.
+        # stop_event (optional): once set, the listen ends within one chunk and
+        # nothing is recognized (a confirmation's Yes/No button). None (the
+        # default) = no change at all.
         waiting = getattr(self, "_listen_waiting", None)
         if waiting is not None:
             waiting.set()
@@ -984,6 +989,11 @@ class Api:
                             self.recognizer.non_speaking_duration = 0.5
                             self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
                             phrase_limit = 15
+                            if (stop_event is not None
+                                    and getattr(src, "stream", None) is not None):
+                                src.stream = _StoppableStream(
+                                    src.stream, stop_event, rec,
+                                    getattr(src, "SAMPLE_WIDTH", 2))
                         if diag is not None:
                             diag["thr1"] = rec.energy_threshold
                         self._voice_mark("listen_start")
@@ -1004,6 +1014,11 @@ class Api:
                             if diag is not None:
                                 diag["result"] = "cancelled"
                             return _PTT_CANCELLED
+                        if stop_event is not None and stop_event.is_set():
+                            self._voice_mark("stopped", end=True)
+                            if diag is not None:
+                                diag["result"] = "stopped"
+                            return None
                         text = rec.recognize_google(audio)
                         self._voice_mark("stt_done")
                         if diag is not None:
@@ -1012,6 +1027,9 @@ class Api:
                 except Exception as e:
                     if diag is not None:
                         diag["result"] = type(e).__name__
+                    if stop_event is not None and stop_event.is_set():
+                        self._voice_mark("stopped", end=True)
+                        return None
                     print(f"[ListenOnce] {e}")
                     self._voice_mark(f"listen_failed ({type(e).__name__})", end=True)
                     return None
@@ -1296,11 +1314,65 @@ class Api:
         except Exception:
             return {"online": False, "reason": "Connection error"}
 
-    def submit_answer(self, text):
+    def submit_answer(self, text, source=None):
+        """An answer from the page: the text box, or a confirmation's Yes/No
+        button (source="button")."""
         with self._answer_lock:
             self._pending_answer = text
+            self._pending_source = "button" if source == "button" else "typed"
             self._answer_event.set()
         return {"success": True}
+
+    CONFIRM_LISTEN_TIMEOUT = 10
+    CONFIRM_TEXT_TIMEOUT = 60
+
+    def ask_confirmation(self, question, input_mode):
+        """Ask a yes/no question with Yes/No buttons on the page; MistAI's
+        window is shown while it is pending. Voice: the question is spoken and
+        answered by speech or a button -- a click ends the listen and wins.
+        Typed: a button or the text box. Returns (answer, source), source
+        "button", "typed" or "voice"; answer None when nothing came. A stop
+        request wakes it (stop_current_task). Never logs the question."""
+        with self._answer_lock:
+            self._pending_answer = self._pending_source = None
+            self._answer_event.clear()
+            self._awaiting_text_answer.set()
+        shown = False
+        try:
+            window = getattr(self, "_window", None)
+            if window:
+                try:
+                    window.restore()
+                    shown = True
+                except Exception as e:
+                    print(f"[Confirm] window not shown ({type(e).__name__})")
+            self._notify_js(f'showConfirmPrompt("{esc(question)}")')
+            heard = None
+            if input_mode == "voice":
+                self.speak(question)
+                while self.tts.speaking and not self._answer_event.is_set():
+                    time.sleep(0.05)
+                if not self._answer_event.is_set():
+                    # Its own [VoiceTiming] turn: mic and STT time of the answer.
+                    self._voice_start("confirm")
+                    heard = self._listen_once(timeout=self.CONFIRM_LISTEN_TIMEOUT,
+                                              stop_event=self._answer_event)
+                    self._voice_mark("answered", end=True)
+            else:
+                self._answer_event.wait(timeout=self.CONFIRM_TEXT_TIMEOUT)
+            with self._answer_lock:
+                answered = self._answer_event.is_set()
+                answer, source = self._pending_answer, self._pending_source
+                self._pending_answer = self._pending_source = None
+                self._answer_event.clear()
+            if answered:                       # the page's answer wins over speech
+                return answer, source or "typed"
+            return (heard, "voice") if input_mode == "voice" else (None, "typed")
+        finally:
+            self._awaiting_text_answer.clear()
+            self._notify_js("closeConfirmPrompt()")
+            if shown and confirm_reminimize_enabled():
+                self.minimize_window()
 
     def _get_text_answer(self, question, timeout=60):
         with self._answer_lock:

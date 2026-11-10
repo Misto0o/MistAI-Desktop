@@ -720,7 +720,30 @@ class Runner:
             self._api.speak = lambda text, *a, **k: self.spoken.append(text)
             self._api.speak_now = self._api.speak
             self._api._get_text_answer = self._answer
+            if hasattr(self._api, "ask_confirmation"):
+                self._api.ask_confirmation = self._confirm_through(self._api.ask_confirmation)
         return self._api
+
+    def _confirm_through(self, real_confirm):
+        """Confirmations go through the REAL Api.ask_confirmation (its Yes/No
+        prompt); the scripted answer is submitted as the page's text box would."""
+        api = self._api
+
+        def confirm(question, input_mode):
+            notify = api._notify_js
+
+            def page(js):
+                notify(js)
+                if js.startswith("showConfirmPrompt("):
+                    api.submit_answer(self._answer(question))
+
+            api._notify_js = page
+            try:
+                return real_confirm(question, input_mode)
+            finally:
+                api._notify_js = notify
+
+        return confirm
 
     def _answer(self, question, timeout=60):
         self.questions.append(question)

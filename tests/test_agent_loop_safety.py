@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from confirm_helpers import bind_confirmation
 from core.agent import AgentLoop
 
 
@@ -99,6 +100,7 @@ def _run_loop(monkeypatch, responses, answers=()):
 
     monkeypatch.setattr("core.agent.requests.post", fake_post)
     monkeypatch.setattr("core.agent.time.sleep", lambda _seconds: None)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda: "test screen")
     return loop._loop("perform a test task", "test-model", "none", "text", None), api
@@ -114,6 +116,7 @@ def test_hints_match_hint_text_and_empty_does_not_fall_back(hint_text, expected)
         get_hints_for_task=lambda text: seen.append(text) or []
     )
     api._stop_requested.set()  # exit right after the hint lookup
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
 
     loop._loop("framed prompt", "m", "none", "text", None, hint_text=hint_text)
@@ -164,6 +167,7 @@ def test_no_key_backend_failure_is_not_masked_by_an_unauthenticated_fallback(
         return _Response(status_code=503)
 
     monkeypatch.setattr("core.agent.requests.post", failed_post)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda: "test screen")
 
@@ -184,6 +188,7 @@ def test_stop_while_model_request_is_in_flight_prevents_returned_action_dispatch
         return _Response(json.dumps({"action": "window_close", "parameter": "Test"}))
 
     monkeypatch.setattr("core.agent.requests.post", response_after_stop)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda: "test screen")
 
@@ -230,6 +235,7 @@ def test_voice_stop_at_confirmation_is_a_stop_not_a_decline(monkeypatch):
         )
 
     monkeypatch.setattr("core.agent.requests.post", fake_post)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda: "test screen")
 
@@ -278,6 +284,7 @@ def test_identical_failed_action_is_refused_after_three_attempts(monkeypatch):
         "core.agent.requests.post", lambda *_args, **_kwargs: _Response(next(response_iter))
     )
     monkeypatch.setattr("core.agent.time.sleep", lambda _seconds: None)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda: "test screen")
 
@@ -314,6 +321,7 @@ def test_recent_conversation_reaches_system_prompt_without_repeating_task(monkey
         return _Response('{"action": "done", "speech": "Finished"}')
 
     monkeypatch.setattr("core.agent.requests.post", fake_post)
+    bind_confirmation(api)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda: "test screen")
     loop._loop("perform a test task", "test-model", "none", "text", None)

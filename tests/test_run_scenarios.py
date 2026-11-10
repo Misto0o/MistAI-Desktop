@@ -505,3 +505,26 @@ def test_elevated_runs_are_warned_about(tmp_path, monkeypatch, capsys):
     rs.main(["--stub", "--yes", "--scenarios", str(scen), "--log-root", str(tmp_path / "logs")],
             api_factory=lambda: _FakeApi())
     assert "WARNING: running elevated (Administrator)" in capsys.readouterr().out
+
+
+def test_a_scripted_confirmation_goes_through_the_real_yes_no_prompt(tmp_path, capsys):
+    """Since confirmations use Api.ask_confirmation, the harness's answer is
+    submitted to that real prompt (the old _get_text_answer patch no longer
+    sees it, and the scenario timed out)."""
+    import threading
+
+    from core.api import Api
+
+    api = Api.__new__(Api)
+    api._answer_lock, api._answer_event = threading.Lock(), threading.Event()
+    api._awaiting_text_answer = threading.Event()
+    api._pending_answer = api._pending_source = None
+    api._window = None
+    shown = []
+    api._notify_js = shown.append
+    runner = rs.Runner(SimpleNamespace(stub=False), tmp_path, api_factory=lambda: api)
+    runner.answers = ["yes"]
+    assert runner.api().ask_confirmation("Delete it?", "text") == ("yes", "typed")
+    assert runner.questions == ["Delete it?"]
+    assert shown == ['showConfirmPrompt("Delete it?")', "closeConfirmPrompt()"]
+    assert api._notify_js == shown.append                  # restored afterwards
