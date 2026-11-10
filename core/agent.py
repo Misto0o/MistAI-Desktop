@@ -19,7 +19,8 @@ from . import planner
 from .api_manager import describe_api_error
 from .executor import Executor
 from .config import (BACKEND_LIMIT_WARN_RATIO, BACKEND_MESSAGES_LIMIT, BACKEND_SYSTEM_LIMIT,
-                     confirmation_answer, credential_failure_reason, lazy_vision_mode,
+                     confirm_listen_profile, confirmation_answer, credential_failure_reason,
+                     lazy_vision_mode,
                      log_text, skip_verified_read_enabled, step_param_for_log, verbose_logs,
                      vision_gating_enabled)
 from .live_state import describe_open_apps
@@ -1123,7 +1124,9 @@ class AgentLoop:
                     self.api.speak(question)
                     while self.api.tts.speaking:
                         time.sleep(0.05)
-                    answer = self.api._listen_once(timeout=10)
+                    profile = confirm_listen_profile()   # MISTAI_CONFIRM_LISTEN A/B
+                    answer = self.api._listen_once(
+                        timeout=10, **({} if profile == "shared" else {"profile": profile}))
                 else:
                     answer = self.api._get_text_answer(question, timeout=60)
 

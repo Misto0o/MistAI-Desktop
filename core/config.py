@@ -379,6 +379,21 @@ def vision_y_nudge():
     return int(v) if v.isdigit() else VISION_Y_NUDGE_DEFAULT
 
 
+CONFIRM_LISTEN_PROFILES = ("shared", "ptt", "lead")
+CONFIRM_LEAD_IN_SECONDS = 0.4      # "lead": wait this long after TTS ends
+
+
+def confirm_listen_profile():
+    """MISTAI_CONFIRM_LISTEN: how voice confirmation and ask_user listens
+    are set up, for a live A/B. "shared" (default) = unchanged; "ptt" = reuse
+    push-to-talk's stored noise threshold when fresh, pause 1.0 s, phrase
+    limit 8 s, timeout 10 s; "lead" = like shared, but wait 0.4 s after TTS
+    ends and reuse a fresh stored threshold. Invalid -> "shared". Read at
+    call time."""
+    v = os.environ.get("MISTAI_CONFIRM_LISTEN", "").strip().lower()
+    return v if v in CONFIRM_LISTEN_PROFILES else "shared"
+
+
 def confirm_reminimize_enabled():
     """MISTAI_CONFIRM_REMINIMIZE: a confirmation prompt restores MistAI's
     window so its Yes/No buttons are visible, then minimizes it again once

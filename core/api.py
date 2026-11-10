@@ -35,6 +35,7 @@ from .config import (
     MODEL_LABELS,
     PTT_PAUSE_THRESHOLD,
     PTT_PHRASE_TIME_LIMIT,
+    CONFIRM_LEAD_IN_SECONDS,
     PTT_THRESHOLD_MAX_AGE,
     SEARCH_ROUTES,
     STATUS_URL,
@@ -42,6 +43,7 @@ from .config import (
     WAKE_WORDS,
     announce_verbose_logs,
     blocked_page_reason,
+    confirm_listen_profile,
     confirm_reminimize_enabled,
     esc,
     fuzzy_wake,
@@ -951,7 +953,8 @@ class Api:
 
         print("[ConversationLoop] Ended, returning to wake-word-only mode")
 
-    def _listen_once(self, timeout=6, on_listening=None, ptt=False, stop_event=None):
+    def _listen_once(self, timeout=6, on_listening=None, ptt=False, stop_event=None,
+                     profile=None):
         # Set before waiting for the mic, so the wake loop can log a clip it
         # transcribes meanwhile ([MicCompete]). on_listening (optional) is
         # called once the mic is open, right before listening starts.
@@ -960,18 +963,28 @@ class Api:
         # stop_event (optional): once set, the listen ends within one chunk and
         # nothing is recognized (a confirmation's Yes/No button). None (the
         # default) = no change at all.
+        # profile (optional, "ptt" or "lead"): MISTAI_CONFIRM_LISTEN's set-up for
+        # a confirmation or ask_user listen, on its own recognizer
+        # (_confirm_listen_setup). None = the shared set-up, unchanged.
         waiting = getattr(self, "_listen_waiting", None)
         if waiting is not None:
             waiting.set()
+        if profile:
+            print(f"[Confirm] listen profile={profile}")
+            if profile == "lead":
+                self._lead_in_after_tts()
         # MISTAI_VOICE_DIAG: numbers about this listen, printed at the end.
         diag = self._voice_diag_start(ptt) if voice_diag_enabled() else None
+        if diag is not None and profile:
+            diag["rec"] = profile
         try:
             with self._mic_lock:
                 self._voice_mark("mic_acquired")
                 if diag is not None:
                     diag["mic_wait"] = time.monotonic() - diag["t0"]
                 try:
-                    rec = self._ptt_recognizer() if ptt else self.recognizer
+                    rec = (self._ptt_recognizer() if ptt
+                           else self._confirm_recognizer() if profile else self.recognizer)
                     stream = None
                     with self.microphone as src:
                         if diag is not None:
@@ -987,10 +1000,15 @@ class Api:
                                     src.stream, self._ptt_stop_event(), rec,
                                     getattr(src, "SAMPLE_WIDTH", 2))
                         else:
-                            self.recognizer.pause_threshold = 1.0
-                            self.recognizer.non_speaking_duration = 0.5
-                            self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
-                            phrase_limit = 15
+                            if profile:
+                                phrase_limit = self._confirm_listen_setup(rec, src, profile)
+                                if profile == "ptt":
+                                    timeout = 10
+                            else:
+                                self.recognizer.pause_threshold = 1.0
+                                self.recognizer.non_speaking_duration = 0.5
+                                self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
+                                phrase_limit = 15
                             if (stop_event is not None
                                     and getattr(src, "stream", None) is not None):
                                 src.stream = _StoppableStream(
@@ -1098,6 +1116,46 @@ class Api:
         if rec is None:
             rec = self.ptt_recognizer = sr.Recognizer()
         return rec
+
+    def _confirm_recognizer(self):
+        """The confirmation/ask_user recognizer of MISTAI_CONFIRM_LISTEN's
+        "ptt" and "lead" profiles (created on first use): the shared and the
+        push-to-talk recognizers are never changed by them."""
+        rec = getattr(self, "confirm_recognizer", None)
+        if rec is None:
+            rec = self.confirm_recognizer = sr.Recognizer()
+        return rec
+
+    def _fresh_ptt_threshold(self):
+        """Push-to-talk's stored noise threshold if measured less than
+        PTT_THRESHOLD_MAX_AGE (10 minutes) ago, else None. Read only."""
+        at = getattr(self, "_ptt_calibrated_at", None)
+        ptt_rec = getattr(self, "ptt_recognizer", None)
+        if at is None or ptt_rec is None or time.monotonic() - at >= PTT_THRESHOLD_MAX_AGE:
+            return None
+        return ptt_rec.energy_threshold
+
+    def _confirm_listen_setup(self, rec, src, profile):
+        """Settings of a "ptt" or "lead" confirmation listen (mic open, under
+        _mic_lock): a fresh stored threshold skips the 0.3 s adjustment.
+        Returns the phrase limit (8 s for "ptt", 15 s as shared for "lead")."""
+        rec.pause_threshold = 1.0
+        rec.non_speaking_duration = 0.5
+        stored = self._fresh_ptt_threshold()
+        if stored is not None:
+            rec.energy_threshold = stored
+        else:
+            rec.adjust_for_ambient_noise(src, duration=0.3)
+        return 8 if profile == "ptt" else 15
+
+    def _lead_in_after_tts(self):
+        """"lead": open the mic CONFIRM_LEAD_IN_SECONDS after TTS finished."""
+        tts = getattr(self, "tts", None)
+        while getattr(tts, "speaking", False):
+            time.sleep(0.05)
+        since = self._seconds_since_tts()
+        if since is not None and since < CONFIRM_LEAD_IN_SECONDS:
+            time.sleep(CONFIRM_LEAD_IN_SECONDS - since)
 
     def _ptt_listen_setup(self, rec, src):
         """Settings for a push-to-talk listen, with the mic already open
@@ -1357,8 +1415,11 @@ class Api:
                 if not self._answer_event.is_set():
                     # Its own [VoiceTiming] turn: mic and STT time of the answer.
                     self._voice_start("confirm")
+                    profile = confirm_listen_profile()   # MISTAI_CONFIRM_LISTEN A/B
                     heard = self._listen_once(timeout=self.CONFIRM_LISTEN_TIMEOUT,
-                                              stop_event=self._answer_event)
+                                              stop_event=self._answer_event,
+                                              **({} if profile == "shared"
+                                                 else {"profile": profile}))
                     self._voice_mark("answered", end=True)
             else:
                 self._answer_event.wait(timeout=self.CONFIRM_TEXT_TIMEOUT)
