@@ -9,7 +9,7 @@ import time
 
 import pyautogui
 
-from .config import log_text, verbose_logs
+from .config import log_text, verbose_logs, vision_y_nudge
 
 try:
     import cv2
@@ -842,8 +842,16 @@ class ImprovedClickHandler:
             if y < 5 or y > sh - 5 or x < 5 or x > sw - 5:
                 return False
 
-            if self.last_method == "Vision" and y < 80:
-                y = min(y + 30, sh - 20)
+            if self.last_method == "Vision":
+                # Added in the V2 split (e82d1cd) without a comment; the OCR
+                # pass treats the top 80px as window chrome too. Numbers only.
+                nudge = vision_y_nudge()
+                if y < 80 and nudge:
+                    new_y = min(y + nudge, sh - 20)
+                    print(f"[Click] Vision y-nudge applied: +{nudge}px (y {y} -> {new_y})")
+                    y = new_y
+                else:
+                    print(f"[Click] Vision y-nudge not applied (y={y}, nudge={nudge}px)")
 
             refusal = self.outside_target(x, y, self.last_method or "direct")
             if refusal:

@@ -367,6 +367,18 @@ def skip_verified_read_enabled():
     return env_flag("MISTAI_SKIP_VERIFIED_READ", True)
 
 
+VISION_Y_NUDGE_DEFAULT = 30
+
+
+def vision_y_nudge():
+    """MISTAI_VISION_Y_NUDGE: pixels added to y for a vision-resolved click
+    with y < 80 (click_handler._execute_click). Default 30 (unchanged
+    behaviour); 0 turns it off; anything but a whole number >= 0 means the
+    default. Read at call time."""
+    v = os.environ.get("MISTAI_VISION_Y_NUDGE", "").strip()
+    return int(v) if v.isdigit() else VISION_Y_NUDGE_DEFAULT
+
+
 def confirm_reminimize_enabled():
     """MISTAI_CONFIRM_REMINIMIZE: a confirmation prompt restores MistAI's
     window so its Yes/No buttons are visible, then minimizes it again once
