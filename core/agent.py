@@ -20,7 +20,8 @@ from .api_manager import describe_api_error
 from .executor import Executor
 from .config import (BACKEND_LIMIT_WARN_RATIO, BACKEND_MESSAGES_LIMIT, BACKEND_SYSTEM_LIMIT,
                      confirmation_answer, credential_failure_reason, lazy_vision_mode,
-                     log_text, step_param_for_log, verbose_logs, vision_gating_enabled)
+                     log_text, skip_verified_read_enabled, step_param_for_log, verbose_logs,
+                     vision_gating_enabled)
 from .live_state import describe_open_apps
 from .tools import CLICK_FAMILY, READ_RESULT_CHARS
 
@@ -301,6 +302,19 @@ class AgentLoop:
                 "parameters, a narrower query, or an absolute path."
             )
         return "It already ran without error. Do not run it again -- move on or call 'done'."
+
+    def _verified_launch(self, action, param, res):
+        """open_app/switch_app that succeeded, verified True at confidence
+        >= 0.93, with that app now the foreground window."""
+        if action not in ("open_app", "switch_app") or not getattr(res, "success", False):
+            return False
+        if getattr(res, "verified", None) is not True or getattr(res, "confidence", 0) < 0.93:
+            return False
+        in_front = getattr(self.api, "_foreground_process_matches", None)
+        try:
+            return bool(in_front(param)) if callable(in_front) else False
+        except Exception:
+            return False
 
     def _enter_safe(self, action, param):
         """press_key Enter/Return only: may it skip confirmation? Asks the
@@ -618,6 +632,9 @@ class AgentLoop:
         lazy_first = lazy_vision_mode()
         first_read = True
         screen_stale = True  # gated mode: must re-read before the next step
+        # Gated mode: after a verified open_app/switch_app the next read is
+        # title + Open apps instead of vision, once per phase.
+        verified_read_skip = verified_skip_used = False
         screen_cache_key = None  # gated mode: foreground (hwnd, title) at last read
         screen_cache_time = 0.0
         print(
@@ -682,6 +699,7 @@ class AgentLoop:
                     print(f"  [Screen] re-read: {read_reason}")
             else:
                 need_read = screen_cache_age == 0 or screen_cache_age > cache_ttl
+            skip_now, verified_read_skip = verified_read_skip, False
             if need_read:
                 t0 = time.monotonic()
                 if lazy_first and first_read:
@@ -690,6 +708,9 @@ class AgentLoop:
                         + (" + UIA" if lazy_first == 1 else "") + ", no vision"
                     )
                     screen_context = self._get_screen_context(lazy=lazy_first)
+                elif skip_now:
+                    print("  [Screen] after a verified launch: title + Open apps, no vision")
+                    screen_context = self._get_screen_context(lazy=2)
                 else:
                     screen_context = self._get_screen_context()
                 first_read = False
@@ -1212,6 +1233,9 @@ class AgentLoop:
             }
             if gating:
                 refresh_screen_next_step = self._changes_ui(executed_action, categories)
+                if (not verified_skip_used and skip_verified_read_enabled()
+                        and self._verified_launch(executed_action, executed_param, res)):
+                    verified_read_skip = verified_skip_used = True
             else:
                 refresh_screen_next_step = bool(
                     (categories & stateful_categories)

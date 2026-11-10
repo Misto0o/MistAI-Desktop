@@ -360,6 +360,13 @@ BACKEND_MESSAGES_LIMIT = 64_000
 BACKEND_LIMIT_WARN_RATIO = 0.8
 
 
+def skip_verified_read_enabled():
+    """MISTAI_SKIP_VERIFIED_READ: in gated mode, the read right after a
+    verified open_app/switch_app (that app in front) is title + Open apps
+    instead of vision, once per phase. On by default; read at call time."""
+    return env_flag("MISTAI_SKIP_VERIFIED_READ", True)
+
+
 def confirm_reminimize_enabled():
     """MISTAI_CONFIRM_REMINIMIZE: a confirmation prompt restores MistAI's
     window so its Yes/No buttons are visible, then minimizes it again once
