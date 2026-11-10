@@ -19,7 +19,7 @@ import pytest
 import core.api as api_mod
 from core import config
 from core.api import Api
-from test_conversation_layer import CHAT, _routing_api
+from test_conversation import CHAT, _routing_api
 
 HWND = 0x1234
 SW_SHOWNOACTIVATE = 4

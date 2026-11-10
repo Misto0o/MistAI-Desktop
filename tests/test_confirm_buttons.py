@@ -20,7 +20,7 @@ import pytest
 import core.api as api_mod
 from core.api import Api
 from core.planner import PlanRunner
-from test_ui_model_card import _HARNESS, _real_outputs, _script, needs_node
+from test_ui_page import _HARNESS, _real_outputs, _script, needs_node
 
 
 def _api(listen=None, speaking=False):

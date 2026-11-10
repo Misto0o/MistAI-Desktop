@@ -4,16 +4,15 @@ Startup writes no rows: built-in hotkeys and MistAI's facts about itself are
 read from code (config.DEFAULT_HOTKEYS, config.MISTAI_FACTS). Facts count and
 recall only what the user saved (remember) or imported (Import my facts);
 rows an older version seeded stay in old databases but are ignored.
-"""
+
+Merged by area (pure moves, no test changed) from: test_memory_seeding.py, test_task_memory_regressions.py."""
 
 import inspect
 import json
 import os
 import sqlite3
 from types import SimpleNamespace
-
 import pytest
-
 import core.api as api_mod
 from core import config
 from core.api import Api
@@ -21,6 +20,12 @@ from core.memory import Memory, recall_builtin
 from core.task_memory import TaskMemory
 from core.task_store import TaskStore
 from core.tools import ToolRegistry
+
+
+
+# ==========================================================================
+# moved from tests/test_memory_seeding.py
+# ==========================================================================
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -278,3 +283,56 @@ def test_hotkey_fallback_learned_value_wins_and_unknown_apps_ask_once(api, monke
     assert api._get_app_search_hotkey("SomeNewChat") == "ctrl+shift+j"
     assert asked == ["somenewchat"]
     assert api.memory.get_profile("hotkey_somenewchat") == "ctrl+shift+j"
+
+
+
+# ==========================================================================
+# moved from tests/test_task_memory_regressions.py
+# TaskMemory must be usable in tests and avoid substring-based hints.
+# ==========================================================================
+
+def test_memory_database_target_is_usable_without_a_parent_directory():
+    memory = TaskMemory(":memory:")
+    try:
+        memory.record("open_app", "Code", False)
+
+        hints = memory.get_hints_for_task("Please open Code.")
+
+        assert len(hints) == 1
+        assert "code" in hints[0].lower()
+    finally:
+        memory.conn.close()
+
+
+def test_task_memory_matches_signature_keys_as_words_not_substrings():
+    memory = TaskMemory(":memory:")
+    try:
+        memory.record("open_app", "code", False)
+
+        assert memory.get_hints_for_task("Decode this base64 string.") == []
+        assert memory.get_hints_for_task("Can you open code for me?")
+    finally:
+        memory.conn.close()
+
+
+def test_task_memory_matches_normalized_multiword_app_names():
+    memory = TaskMemory(":memory:")
+    try:
+        memory.record("open_app", "Apple Music", False)
+
+        hints = memory.get_hints_for_task("Open Apple Music, please.")
+
+        assert len(hints) == 1
+        assert "applemusic" in hints[0].lower()
+    finally:
+        memory.conn.close()
+
+
+def test_task_store_in_memory_database_needs_no_parent_directory():
+    store = TaskStore(":memory:")
+    try:
+        record = store.create("Test", "A test goal", {"nodes": []})
+
+        assert store.get(record.task_id).goal == "A test goal"
+    finally:
+        store.conn.close()

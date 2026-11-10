@@ -188,7 +188,7 @@ def test_wake_match_starts_a_voice_turn(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["voice", "text"])
 def test_router_and_first_step_are_marked_in_voice_mode_only(monkeypatch, mode):
-    from test_conversation_layer import _routing_api
+    from test_conversation import _routing_api
 
     api = _routing_api(monkeypatch, '{"route": "task", "reply": ""}')
     lines = []
