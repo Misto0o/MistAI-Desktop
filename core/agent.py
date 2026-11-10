@@ -473,7 +473,7 @@ class AgentLoop:
                 if on_done:
                     on_done(result)
             except Exception as e:
-                print(f"[AgentLoop] Fatal: {e}")
+                print(f"[AgentLoop] Fatal: {e if verbose_logs() else type(e).__name__}")
                 if on_error:
                     on_error(str(e))
 
@@ -506,7 +506,7 @@ class AgentLoop:
                 if on_done:
                     on_done(result)
             except Exception as e:
-                print(f"[Planner] Fatal: {e}")
+                print(f"[Planner] Fatal: {e if verbose_logs() else type(e).__name__}")
                 if on_error:
                     on_error(str(e))
             finally:
@@ -537,7 +537,7 @@ class AgentLoop:
                 if on_done:
                     on_done(result)
             except Exception as e:
-                print(f"[Planner] Resume fatal: {e}")
+                print(f"[Planner] Resume fatal: {e if verbose_logs() else type(e).__name__}")
                 if on_error:
                     on_error(str(e))
             finally:
@@ -649,7 +649,7 @@ class AgentLoop:
         read_after_unsubmitted = False  # the last read happened in that state
         done_reminded = False
 
-        print(f"\n[AgentLoop] Task: {task}")
+        print(f"\n[AgentLoop] Task: {log_text(task)}")
         if self.api.caption_window and self.api.captions_enabled:
             self.api.caption_window.show_status(
                 f"\U0001f916 Starting: {task[:60]}...", 3

@@ -2022,7 +2022,8 @@ class Api:
                 except FileNotFoundError:
                     continue
         except Exception as e:
-            print(f"[ResolveApp] Registry lookup failed for '{name}': {e}")
+            print(f"[ResolveApp] Registry lookup failed for '{name}': "
+                  f"{e if verbose_logs() else type(e).__name__}")
         return None
 
     @staticmethod
@@ -2051,7 +2052,8 @@ class Api:
             app_id = result.stdout.strip()
             return app_id or None
         except Exception as e:
-            print(f"[ResolveApp] Get-StartApps lookup failed for '{name}': {e}")
+            print(f"[ResolveApp] Get-StartApps lookup failed for '{name}': "
+                  f"{e if verbose_logs() else type(e).__name__}")
             return None
 
     def _normalize_app_name(self, name):
@@ -2306,7 +2308,7 @@ class Api:
                 print(f"[SwitchApp] Window for '{app_name}' exists but refused focus: "
                       f"{refused}")
         except Exception as e:
-            print(f"[SwitchApp] win32gui tier failed: {e}")
+            print(f"[SwitchApp] win32gui tier failed: {e if verbose_logs() else type(e).__name__}")
 
         # Fallback: PowerShell's generic AppActivate (works via substring
         # match against window titles, independent of win32gui quirks).
@@ -2329,7 +2331,8 @@ class Api:
                 self.last_result_text = f"Switched to '{app_name}' (via AppActivate){note}"
                 return True
         except Exception as e:
-            print(f"[SwitchApp] PowerShell AppActivate failed: {e}")
+            print(f"[SwitchApp] PowerShell AppActivate failed: "
+                  f"{e if verbose_logs() else type(e).__name__}")
 
         if hwnds:
             self.last_result_text = (
@@ -2722,7 +2725,7 @@ class Api:
         report, on_target = self._ensure_input_target("text")
         if not on_target:
             self.last_result_text = report
-            print(f"[TypeText] {report}")
+            print(f"[TypeText] {self._input_report_for_log(report, False)}")
             return False
         # Replace the field only in an app this phase opened/switched to;
         # anywhere else, never select-all + delete someone's content.
@@ -2757,10 +2760,10 @@ class Api:
             pyautogui.hotkey("ctrl", "v")
             time.sleep(0.15)
             self.last_result_text = report
-            print(f"[TypeText] {report}")
+            print(f"[TypeText] {self._input_report_for_log(report, True)}")
             return True
         except Exception as e:
-            print(f"[TypeText] Error: {e}")
+            print(f"[TypeText] Error: {e if verbose_logs() else type(e).__name__}")
             return False
         finally:
             # Preserve the user's clipboard even if UI input itself fails.
@@ -3115,6 +3118,15 @@ class Api:
             )
         return f"The {what} went to '{title}'.", True
 
+    @staticmethod
+    def _input_report_for_log(report, sent):
+        """The console's view of an input report: it names the window that got
+        the input (a title can hold a contact's name), so the full text prints
+        only under verbose_logs(). The model's observation keeps it."""
+        if verbose_logs():
+            return report
+        return "typed into the input target" if sent else "NOT SENT (the input target is not in front)"
+
     def _act_press_key(self, param):
         report, on_target = self._ensure_input_target(f"key '{param}'")
         self.last_result_text = report
@@ -3136,7 +3148,7 @@ class Api:
             time.sleep(0.3)
             return True
         except Exception as e:
-            print(f"[Hotkey] Error with {param}: {e}")
+            print(f"[Hotkey] Error with {param}: {e if verbose_logs() else type(e).__name__}")
             return False
 
     def _act_scroll(self, param):
@@ -3191,11 +3203,12 @@ class Api:
                     shutil.move(full_path, os.path.join(dest_dir, entry))
                     moved.setdefault(target_folder, []).append(entry)
                 except Exception as e:
-                    print(f"[Organize] Could not move {entry}: {e}")
+                    print(f"[Organize] Could not move {log_text(entry)}: "
+                          f"{e if verbose_logs() else type(e).__name__}")
                     skipped.append(entry)
         except Exception as e:
             self.last_result_text = f"organize_desktop crashed: {e}"
-            print(f"[Organize] Fatal error: {e}")
+            print(f"[Organize] Fatal error: {e if verbose_logs() else type(e).__name__}")
             return False
 
         summary = (
@@ -3463,7 +3476,7 @@ class Api:
             time.sleep(2.5)
             return True
         except Exception as e:
-            print(f"[URL] Error: {e}")
+            print(f"[URL] Error: {e if verbose_logs() else type(e).__name__}")
             return False
 
     def screenshot_to_file(self, filename="screenshot.png"):
@@ -3821,7 +3834,7 @@ class Api:
             time.sleep(2.0)
             return True
         except Exception as e:
-            print(f"[FindFile] Error: {e}")
+            print(f"[FindFile] Error: {e if verbose_logs() else type(e).__name__}")
             return False
 
     def take_notes(self, note_text):
@@ -3914,7 +3927,7 @@ class Api:
             win = (self.window_mgr.find_window(param)
                    or self.window_mgr.find_window_normalized(param))
         except Exception as e:
-            print(f"[WindowActivate] lookup failed: {e}")
+            print(f"[WindowActivate] lookup failed: {e if verbose_logs() else type(e).__name__}")
         hwnd = getattr(win, "_hWnd", None)
         if not hwnd:
             self.last_result_text = f"Could not find window: {param}"

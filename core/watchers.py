@@ -20,6 +20,7 @@ import threading
 import time
 
 from . import events
+from .config import log_text, verbose_logs
 
 try:
     from watchdog.observers import Observer
@@ -189,10 +190,11 @@ class FileWatcher:
         try:
             self._observer.schedule(self._handler, path, recursive=True)
             self._watched.add(path)
-            print(f"[FileWatcher] Watching {path}")
+            print(f"[FileWatcher] Watching {log_text(path)}")
             return True
         except Exception as e:
-            print(f"[FileWatcher] Could not watch {path}: {e}")
+            print(f"[FileWatcher] Could not watch {log_text(path)}: "
+                  f"{e if verbose_logs() else type(e).__name__}")
             return False
 
     def stop(self):

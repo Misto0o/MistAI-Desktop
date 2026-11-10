@@ -34,7 +34,7 @@ import requests
 
 from . import events
 from .api_manager import describe_api_error
-from .config import confirmation_answer
+from .config import confirmation_answer, log_text, verbose_logs
 
 PENDING = "pending"
 RUNNING = "running"
@@ -181,7 +181,9 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback
             # (one phase / the agent), which then report the same error.
             print(f"[{label}] {describe_api_error(r, model)}")
         except Exception as e:
-            print(f"[{label}] LLM call via {url} failed: {e}")
+            # The URL and message only under verbose logs (the message can quote the URL).
+            print(f"[{label}] LLM call failed: "
+                  f"{(f'via {url}: {e}') if verbose_logs() else type(e).__name__}")
     return ""
 
 
@@ -443,7 +445,7 @@ def make_plan(api, goal, model):
             f"({', '.join(n.id for n in nodes)}) -- collapsing to one phase"
         )
         nodes = [PlanNode("main", goal)]
-    print(f"[Planner] Plan: {len(nodes)} node(s)" + (f" for '{name}'" if name else ""))
+    print(f"[Planner] Plan: {len(nodes)} node(s)" + (f" for {log_text(name)}" if name else ""))
     for n in nodes:
         deps = f" <- {n.depends_on}" if n.depends_on else ""
         print(f"    {n.id}: {n.desc[:60]}{deps}")

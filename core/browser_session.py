@@ -57,6 +57,8 @@ except ImportError:
 import configparser
 import shutil
 
+from .config import verbose_logs
+
 # Only the pieces that actually carry logins/sessions -- deliberately NOT a
 # full profile copy (cache2/, storage/default's non-essential origins, etc
 # can be gigabytes and add nothing but copy time). storage/ is included
@@ -302,7 +304,8 @@ class BrowserSession:
                     else self._context.new_page()
                 )
                 self._ready.set()
-                print(f"[Browser] Firefox started (profile: {self.profile_dir})")
+                print("[Browser] Firefox started" + (f" (profile: {self.profile_dir})"
+                                                     if verbose_logs() else ""))
 
                 while True:
                     item = self._req_q.get()

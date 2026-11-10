@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 
 from . import planner
-from .config import CHAT_TIMEOUT, DEFAULT_MODEL
+from .config import CHAT_TIMEOUT, DEFAULT_MODEL, verbose_logs
 
 _PROMPT = """You are Mist, a desktop assistant inspired by JARVIS: quick, confident, dry and a little playful, natural when spoken aloud, never robotic, and you don't narrate yourself.{address}
 
@@ -88,7 +88,8 @@ def try_chat(api, message, gender="none", model=None):
         )
         reply = parse_route(raw)
     except Exception as e:
-        print(f"[Conversation] Router failed ({e}) -- routing to agent")
+        print(f"[Conversation] Router failed ({e if verbose_logs() else type(e).__name__}) "
+              "-- routing to agent")
         reply = None
     print(
         f"[Conversation] route={'chat' if reply else 'task'} "
