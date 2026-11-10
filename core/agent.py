@@ -18,7 +18,8 @@ import requests
 from . import planner
 from .api_manager import describe_api_error
 from .executor import Executor
-from .config import (confirmation_answer, credential_failure_reason, lazy_vision_mode,
+from .config import (BACKEND_LIMIT_WARN_RATIO, BACKEND_MESSAGES_LIMIT, BACKEND_SYSTEM_LIMIT,
+                     confirmation_answer, credential_failure_reason, lazy_vision_mode,
                      log_text, step_param_for_log, verbose_logs, vision_gating_enabled)
 from .live_state import describe_open_apps
 from .tools import CLICK_FAMILY, READ_RESULT_CHARS
@@ -36,6 +37,41 @@ EMPTY_ANSWER_READS = frozenset(
     {"read_screen_text", "analyze_screen", "browser_get_text", "inspect_file", "find_file"})
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
+# The agent call failed at the network level (error and speech of the result).
+NETWORK_FAILURE_SPEECH = "I couldn't reach my server, so I stopped. Please try again in a moment."
+
+
+def _is_network_error(exc):
+    return isinstance(exc, (requests.exceptions.RequestException, OSError))
+
+
+def _is_reset_or_refused(exc):
+    """A connection reset or refused anywhere in the exception's chain
+    (requests wraps the socket error); never a timeout."""
+    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)):
+        return False
+    todo, seen = [exc], set()
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, (ConnectionResetError, ConnectionRefusedError)):
+            return True
+        todo.extend([e.__cause__, e.__context__, getattr(e, "reason", None)])
+        todo.extend(a for a in getattr(e, "args", ()) if isinstance(a, BaseException))
+    return False
+
+
+def _post(url, **kwargs):
+    """requests.post with ONE immediate retry on a connection reset/refused."""
+    try:
+        return requests.post(url, **kwargs)
+    except Exception as e:
+        if not _is_reset_or_refused(e):
+            raise
+        print(f"[AgentLoop] {type(e).__name__} (connection reset/refused); retrying once")
+        return requests.post(url, **kwargs)
 
 # A confirmation answer that is neither yes nor no: asked once more (voice
 # and typed); still unclear -> the phase ends (fails closed): the user hears
@@ -524,8 +560,27 @@ class AgentLoop:
         )
         print(f"  [Timing] step {step}: {parts}")
 
+    _size_warned = set()   # which backend limits were already warned about (once each)
+
+    def _check_request_size(self, system, messages):
+        """Print the system prompt's size (a number only) once per phase, and
+        warn once per process when it or the history passes 80% of the
+        backend's limits."""
+        sys_chars = len(system or "")
+        if not getattr(self, "_size_printed", False):
+            self._size_printed = True
+            print(f"[AgentLoop] System prompt: {sys_chars} chars")
+        hist_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        for name, size, limit in (("system prompt", sys_chars, BACKEND_SYSTEM_LIMIT),
+                                  ("message history", hist_chars, BACKEND_MESSAGES_LIMIT)):
+            if size > limit * BACKEND_LIMIT_WARN_RATIO and name not in self._size_warned:
+                AgentLoop._size_warned.add(name)
+                print(f"[AgentLoop] WARNING: {name} is {size} chars, over "
+                      f"{int(BACKEND_LIMIT_WARN_RATIO * 100)}% of the backend's {limit} limit")
+
     def _loop(self, task, model, gender, input_mode, on_step, hint_text=None):
         self._phase_timing = Timings()
+        self._size_printed = False
         try:
             return self._loop_steps(task, model, gender, input_mode, on_step, hint_text)
         finally:
@@ -684,7 +739,8 @@ class AgentLoop:
                     "messages": messages,
                 }
 
-                r = requests.post(url, json=request_data, headers=headers, timeout=30)
+                self._check_request_size(system, messages)
+                r = _post(url, json=request_data, headers=headers, timeout=30)
 
                 if not r.ok:
                     primary_status = r.status_code
@@ -694,7 +750,7 @@ class AgentLoop:
                     )
                     fallback_url = self.api.api_manager.get_fallback_url()
                     if fallback_url and fallback_url != url:
-                        r = requests.post(
+                        r = _post(
                             fallback_url,
                             json=request_data,
                             headers=headers,
@@ -725,12 +781,18 @@ class AgentLoop:
 
                 raw = r.json().get("response", "")
             except Exception as e:
-                print(f"[AgentLoop] Network error: {e}")
+                # Type and time only: the message can carry the URL.
+                elapsed = time.monotonic() - llm_t0
+                if not _is_network_error(e):
+                    print(f"[AgentLoop] Agent call failed: {type(e).__name__} after {elapsed:.1f}s")
+                    return {"success": False, "error": f"Agent call failed ({type(e).__name__})"}
+                print(f"[AgentLoop] Network error: {type(e).__name__} after {elapsed:.1f}s")
                 if self.api.caption_window and self.api.captions_enabled:
-                    self.api.caption_window.show_error(
-                        f"Network error: {str(e)[:40]}", 5
-                    )
-                return {"success": False, "error": str(e)}
+                    self.api.caption_window.show_error(NETWORK_FAILURE_SPEECH, 5)
+                if input_mode == "voice":
+                    self.api.speak(NETWORK_FAILURE_SPEECH)
+                return {"success": False, "error": NETWORK_FAILURE_SPEECH,
+                        "speech": NETWORK_FAILURE_SPEECH}
             self.record_time("llm", time.monotonic() - llm_t0, step_times)
 
             # A model request cannot be forcibly pre-empted, but a Stop that

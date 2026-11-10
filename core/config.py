@@ -353,6 +353,13 @@ def task_ack_enabled():
     return env_flag("MISTAI_TASK_ACK", True)
 
 
+# The backend's request limits (characters): AgentLoop warns once when the
+# system prompt or the message history passes 80% of them.
+BACKEND_SYSTEM_LIMIT = 32_000
+BACKEND_MESSAGES_LIMIT = 64_000
+BACKEND_LIMIT_WARN_RATIO = 0.8
+
+
 def confirm_reminimize_enabled():
     """MISTAI_CONFIRM_REMINIMIZE: a confirmation prompt restores MistAI's
     window so its Yes/No buttons are visible, then minimizes it again once
