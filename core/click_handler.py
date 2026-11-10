@@ -3,6 +3,7 @@ core/click_handler.py — unified OCR -> UIA -> Vision fallback click resolution
 """
 
 import difflib
+import os
 import re
 import time
 
@@ -153,6 +154,9 @@ class ImprovedClickHandler:
         # land in, or None for no check (no known target app, or it is not in
         # front). Set by Api; None = guard off.
         self.target_rect_fn = None
+        # () -> MistAI's own top-level window handle, or None. Set by Api
+        # (Api._own_window_handle); without it, this process's windows are used.
+        self.own_window_fn = None
         self.last_refusal = ""          # why the last click was not made, if refused
         self._refused = False
 
@@ -252,25 +256,48 @@ class ImprovedClickHandler:
             return ""
 
     def _get_mistai_window_rect(self):
-        """Find MistAI's own window rect so we can exclude it from OCR/click
-        search -- otherwise the agent can find and click its own echoed task
-        text, mistaking its own UI for a real target."""
+        """MistAI's own window rect, so OCR/click search skips it -- otherwise
+        the agent can find and click its own echoed task text. Found by HANDLE
+        (own_window_fn) or, without one, by this process's PID; never by title
+        text, which another app's window can contain (a VS Code window on a
+        project named after MistAI). None when minimized, hidden or not found."""
         try:
             import win32gui
-            results = []
-            def _cb(h, _):
-                if win32gui.IsWindowVisible(h) and "MistAI" in win32gui.GetWindowText(h):
-                    results.append(h)
-                return True
-            win32gui.EnumWindows(_cb, None)
-            if results:
-                rect = win32gui.GetWindowRect(results[0])
-                print(f"[OCR] MistAI-window mask rect: {rect} "
-                     f"(title: {log_text(win32gui.GetWindowText(results[0]))})")
-                return rect
+
+            if self.own_window_fn is not None:
+                try:
+                    hwnd = self.own_window_fn()
+                except Exception:
+                    hwnd = None
+            else:
+                hwnd = self._own_process_window(win32gui)
+            if not hwnd or not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return None
+            rect = win32gui.GetWindowRect(hwnd)
+            print(f"[OCR] MistAI-window mask rect: {rect}")
+            return rect
         except Exception as e:
-            print(f"[OCR] MistAI-window rect lookup failed: {e}")
+            print(f"[OCR] MistAI-window rect lookup failed: {type(e).__name__}")
         return None
+
+    @staticmethod
+    def _own_process_window(win32gui):
+        """The first visible, unowned top-level window of this process."""
+        import win32process
+
+        found = []
+
+        def _cb(h, _):
+            try:
+                if (win32process.GetWindowThreadProcessId(h)[1] == os.getpid()
+                        and win32gui.IsWindowVisible(h) and not win32gui.GetWindow(h, 4)):
+                    found.append(h)                         # 4 = GW_OWNER
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(_cb, None)
+        return found[0] if found else None
 
     def _sane_mask_rect(self, rect, frame_shape):
         """GetWindowRect and the actual captured pixels can disagree badly

@@ -225,6 +225,8 @@ class Api:
             live_state=self.live, vision_engine=self.vision, screen_buffer=self.screen
         )
         self.click_handler.target_rect_fn = self._click_target_rect
+        # The OCR mask finds MistAI's own window by handle, never by title.
+        self.click_handler.own_window_fn = self._own_window_handle
         self.uia_nav = EnhancedUIANavigator()
         self.agent = AgentLoop(self, self.uia_nav)
 
