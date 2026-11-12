@@ -759,6 +759,18 @@ class AgentLoop:
             if acc is not None:
                 acc.add(key, secs)
 
+    def _publish_step(self, action, speech=None):
+        """events.AGENT_STEP for the orb's panels (never logged)."""
+        from .events import AGENT_STEP
+
+        data = {"action": str(action)}
+        if speech is not None:
+            data["speech"] = str(speech)
+        try:
+            self.api.bus.publish(AGENT_STEP, data, "AgentLoop")
+        except Exception:
+            pass
+
     @staticmethod
     def _print_step_times(step, step_times):
         parts = " ".join(
@@ -1434,6 +1446,7 @@ class AgentLoop:
                     return {"success": False, "error": "no answer",
                             "speech": NO_ANSWER_SPEECH, "steps": steps_taken}
                 if speech:
+                    self._publish_step("done", speech)
                     self.api.speak(speech)
                     if self.api.caption_window and self.api.captions_enabled:
                         self.api.caption_window.show_speech(speech, 6)
@@ -1443,6 +1456,7 @@ class AgentLoop:
             if self.api.caption_window and self.api.captions_enabled:
                 self.api.caption_window.show_action(action, str(param)[:50], 4)
 
+            self._publish_step(action)
             t0 = time.monotonic()
             if deferred_send is not None:
                 self.api._send_confirm = deferred_send["hook"]

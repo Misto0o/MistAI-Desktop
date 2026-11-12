@@ -39,6 +39,9 @@ PROCESS_EXITED = "ProcessExited"
 
 ACTION_EXECUTED = "ActionExecuted"
 ACTION_FAILED = "ActionFailed"
+# AgentLoop: {"action"} just before a step runs; {"action": "done", "speech"}
+# for the final answer. For on-screen panels only; never logged.
+AGENT_STEP = "AgentStep"
 
 TASK_STARTED = "TaskStarted"
 TASK_PHASE_DONE = "TaskPhaseDone"

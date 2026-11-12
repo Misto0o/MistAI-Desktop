@@ -369,6 +369,41 @@ def uia_first_enabled():
     return env_flag("MISTAI_UIA_FIRST", True)
 
 
+# Floating orb (core/floating_orb.py): window sides in logical px (scaled by
+# the monitor DPI) per state, and the flat frosted-glass tint of its page.
+ORB_SIZE_BIG = 110       # idle, listening (at home)
+ORB_SIZE_MEDIUM = 94     # thinking, moving, speaking
+ORB_SIZE_SMALL = 36      # docked beside the window the task works in
+ORB_TINT = {
+    "center": "rgba(238,252,255,.84)",
+    "mid": "rgba(168,222,238,.445)",     # at 58%
+    "edge": "rgba(105,165,225,.265)",
+    "border": "rgba(235,252,255,.65)",
+    "glow": "rgba(130,220,240,.35)",
+}
+
+
+def _env_or_saved(name, saved):
+    """An env switch when set (1/0), else the saved Settings value ("on")."""
+    flag = env_flag(name, None)
+    return flag if flag is not None else str(saved or "").lower() == "on"
+
+
+def orb_flight_enabled(saved=None):
+    """MISTAI_ORB_FLIGHT, else Settings "Orb follows the task" (default off)."""
+    return _env_or_saved("MISTAI_ORB_FLIGHT", saved)
+
+
+def orb_panels_enabled(saved=None):
+    """MISTAI_ORB_PANELS, else Settings "Task panels" (default off)."""
+    return _env_or_saved("MISTAI_ORB_PANELS", saved)
+
+
+def panel_blur_enabled():
+    """MISTAI_PANEL_BLUR (default off): try the Windows 11 DWM backdrop."""
+    return env_flag("MISTAI_PANEL_BLUR", False)
+
+
 def task_ack_enabled():
     """MISTAI_TASK_ACK: a voice task that reaches the agent gets a spoken
     "On it." first. On by default; read at call time."""

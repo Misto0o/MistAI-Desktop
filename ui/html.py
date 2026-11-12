@@ -236,6 +236,8 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
       <div class="toggle-row"><span>Wake word (beta)</span><div class="sw" id="sw-wake"></div></div>
       <div class="toggle-row"><span>Captions</span><div class="sw" id="sw-cap"></div></div>
       <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works"></div></div>
+      <div class="toggle-row"><span>Orb follows the task</span><div class="sw" id="sw-orb_flight" title="The floating orb flies beside the window Mist is working in"></div></div>
+      <div class="toggle-row"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Small panels beside the floating orb: current step, steps, answer"></div></div>
     </div>
 
     <div class="card">
@@ -540,6 +542,19 @@ async function loadOrbSetting(){
   if(typeof pywebview.api.get_floating_orb!=='function')return;
   orbOn=!!(await pywebview.api.get_floating_orb());
   swOrb.classList.toggle('on',orbOn);
+  if(typeof pywebview.api.get_orb_options!=='function')return;
+  const opts=(await pywebview.api.get_orb_options())||{};
+  for(const name of ['orb_flight','orb_panels']){
+    const sw=document.getElementById('sw-'+name);
+    sw.classList.toggle('on',!!opts[name]);
+    sw.onclick=async()=>{
+      try{
+        const r=await pywebview.api.set_orb_option(name,!sw.classList.contains('on'));
+        sw.classList.toggle('on',!!(r&&r.enabled));
+        if(r&&r.error)addMsg('Orb: '+r.error,'error');
+      }catch(e){console.error('Orb option toggle error:',e);}
+    };
+  }
 }
 swOrb.onclick=async()=>{
   if(!ready)return;
@@ -968,33 +983,54 @@ btnStop.onclick = async () => {
 </html>"""
 
 
-def _orb_css():
-    """The main page's orb CSS block (between the orb:start / orb:end markers)."""
-    return HTML[HTML.index("/* orb:start"):HTML.index("/* orb:end */")]
-
-
 # The floating orb window (core/floating_orb.py): only the orb, no fonts, no
-# external resources; its js_api is OrbBridge, whose one method is orb_state().
-ORB_HTML = (
-    """<!DOCTYPE html>
+# external resources; its js_api is OrbBridge. A flat frosted-glass disc
+# (config.ORB_TINT) sized in vmin, so it follows the window through the three
+# sizes: idle breathes, listening pulses a ring, thinking spins an arc,
+# speaking ripples. Static under prefers-reduced-motion.
+def _orb_page():
+    from core.config import ORB_TINT as t
+
+    css = (
+        "html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05080f}"
+        "body{display:flex;align-items:center;justify-content:center;user-select:none;"
+        "-webkit-user-select:none;cursor:default}"
+        ".orb-wrap{position:relative;width:78vmin;height:78vmin}"
+        ".disc,.ring,.arc,.ripple{position:absolute;inset:0;border-radius:50%;pointer-events:none}"
+        f".disc{{background:radial-gradient(circle,{t['center']} 0%,{t['mid']} 58%,{t['edge']} 100%);"
+        f"border:1px solid {t['border']};box-shadow:0 0 10vmin {t['glow']};"
+        "animation:breathe 3.2s ease-in-out infinite}"
+        f".ring,.ripple{{border:1px solid {t['border']};opacity:0}}"
+        f".arc{{inset:12%;border:2px solid transparent;border-top-color:{t['border']};"
+        f"border-right-color:{t['mid']};opacity:0}}"
+        "@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.035)}}"
+        "@keyframes pulse{0%{transform:scale(1);opacity:.85}100%{transform:scale(1.22);opacity:0}}"
+        "@keyframes spin{to{transform:rotate(360deg)}}"
+        "@keyframes ripple{0%{transform:scale(.7);opacity:.7}100%{transform:scale(1.2);opacity:0}}"
+        '.orb-wrap[data-state="listening"] .ring{animation:pulse 1.1s ease-out infinite}'
+        '.orb-wrap[data-state="thinking"] .arc{opacity:1;animation:spin 1.2s linear infinite}'
+        '.orb-wrap[data-state="speaking"] .ripple{animation:ripple 1.6s ease-out infinite}'
+        '.orb-wrap[data-state="speaking"] .ripple.r2{animation-delay:.8s}'
+        "@media (prefers-reduced-motion: reduce){"
+        ".disc,.ring,.arc,.ripple{animation:none !important}"
+        '.orb-wrap[data-state="listening"] .ring{opacity:.8;transform:scale(1.1)}'
+        '.orb-wrap[data-state="thinking"] .arc{opacity:1}'
+        '.orb-wrap[data-state="speaking"] .ripple{opacity:.5;transform:scale(1.12)}'
+        '.orb-wrap[data-state="speaking"] .ripple.r2{opacity:0}}'
+    )
+    return """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <title></title>
 <style>
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05080f}
-body{display:flex;align-items:center;justify-content:center;user-select:none;-webkit-user-select:none;cursor:default}
-"""
-    + _orb_css()
-    + """.orb-wrap{width:64px;height:64px}
-.orb-wrap::before{inset:-9px}
-.orb-wrap::after{inset:-18px}
+""" + css + """
 </style>
 </head>
 <body>
 <div class="orb-wrap" id="orb-wrap" data-state="idle">
-  <span class="orb-ripple"></span><span class="orb-ripple r2"></span>
-  <div class="orb" id="orb"><div class="orb-swirl"></div></div>
+  <span class="ripple"></span><span class="ripple r2"></span>
+  <div class="disc"></div><span class="ring"></span><span class="arc"></span>
 </div>
 <script>
 window.addEventListener('pywebviewready',()=>{
@@ -1009,8 +1045,110 @@ window.addEventListener('pywebviewready',()=>{
   }
   poll();
   setInterval(poll,500);
+  // Hold to talk: a press held HOLD_MS without moving starts push-to-talk and
+  // the release sends it; a quick tap toggles (start, then a second tap
+  // sends). Moving more than DRAG_PX is a drag (pywebview easy_drag), never talk.
+  const HOLD_MS=280,DRAG_PX=6;
+  let down=null,moved=false,holding=false,holdTimer=null;
+  const talk=(kind)=>{try{pywebview.api.talk(kind);}catch(e){}};
+  document.addEventListener('pointerdown',(e)=>{
+    if(e.button!==0)return;
+    down={x:e.screenX,y:e.screenY};moved=false;holding=false;
+    clearTimeout(holdTimer);
+    holdTimer=setTimeout(()=>{if(down&&!moved){holding=true;talk('start');}},HOLD_MS);
+  });
+  document.addEventListener('pointermove',(e)=>{
+    if(down&&!moved&&Math.hypot(e.screenX-down.x,e.screenY-down.y)>DRAG_PX){
+      moved=true;clearTimeout(holdTimer);
+    }
+  });
+  document.addEventListener('pointerup',()=>{
+    if(!down)return;
+    clearTimeout(holdTimer);
+    if(holding)talk('stop');
+    else if(!moved)talk('toggle');
+    down=null;holding=false;
+  });
 });
 </script>
 </body>
 </html>"""
-)
+
+
+ORB_HTML = _orb_page()
+
+
+# A task panel window (core/orb_panels.py): dark translucent glass, rounded,
+# a close button, a short scale-in from the orb's side. Its js_api is
+# PanelBridge (panel_state, dismiss). Text goes in through textContent only.
+PANEL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title></title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#10141c}
+body{font:13px/1.4 'Segoe UI',system-ui,sans-serif;color:#e6f4f8;user-select:none;-webkit-user-select:none;cursor:default}
+.panel{box-sizing:border-box;position:absolute;inset:0;padding:10px 34px 10px 14px;border-radius:14px;
+  background:rgba(22,28,38,.92);border:1px solid rgba(235,252,255,.14);overflow:hidden;
+  animation:pop .18s ease-out both;transform-origin:left center}
+body[data-side="left"] .panel{transform-origin:right center}
+@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:scale(1);opacity:1}}
+.close{position:absolute;top:6px;right:8px;width:20px;height:20px;border:0;border-radius:50%;
+  background:rgba(255,255,255,.08);color:#cfe7ee;font-size:13px;line-height:20px;padding:0;cursor:pointer}
+.close:hover{background:rgba(255,255,255,.18)}
+.pill{display:flex;align-items:center;height:100%;padding-top:0;padding-bottom:0;white-space:nowrap;text-overflow:ellipsis}
+.pill::before{content:'';width:7px;height:7px;border-radius:50%;background:rgba(168,222,238,.9);margin-right:9px;flex:none;
+  animation:blink 1.2s ease-in-out infinite}
+@keyframes blink{50%{opacity:.35}}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;gap:8px;padding:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+li .t{width:14px;flex:none;color:rgba(168,222,238,.9)}
+li.fail .t{color:#f8a3a3}
+li.run{opacity:.75}
+.answer{overflow:auto;height:100%}
+@media (prefers-reduced-motion: reduce){.panel,.pill::before{animation:none !important}}
+</style>
+</head>
+<body data-side="right">
+<div class="panel" id="panel"><div id="body"></div><button class="close" id="close" title="Close">&times;</button></div>
+<script>
+window.addEventListener('pywebviewready',()=>{
+  const body=document.getElementById('body'),panel=document.getElementById('panel');
+  const MARK={ok:'\u2713',fail:'\u2717',run:'\u2022'};
+  let last='';
+  document.getElementById('close').onclick=()=>{pywebview.api.dismiss();};
+  function render(s){
+    const key=JSON.stringify(s);
+    if(key===last)return;
+    last=key;
+    document.body.dataset.side=s.side==='left'?'left':'right';
+    body.textContent='';
+    if(s.kind==='pill'){
+      panel.classList.add('pill');
+      body.textContent=String(s.label||'');
+    }else if(s.kind==='steps'){
+      const ul=document.createElement('ul');
+      for(const st of (s.steps||[])){
+        const li=document.createElement('li');
+        const state=['ok','fail','run'].includes(st.state)?st.state:'run';
+        li.className=state;
+        const t=document.createElement('span');t.className='t';t.textContent=MARK[state];
+        const l=document.createElement('span');l.textContent=String(st.label||'');
+        li.appendChild(t);li.appendChild(l);ul.appendChild(li);
+      }
+      body.appendChild(ul);
+    }else{
+      body.className='answer';
+      body.textContent=String(s.text||'');
+    }
+  }
+  async function poll(){
+    try{render(await pywebview.api.panel_state());}catch(e){}
+  }
+  poll();
+  setInterval(poll,300);
+});
+</script>
+</body>
+</html>"""

@@ -39,6 +39,8 @@ from .config import (
     GENDER_CHOICES,
     MODEL_CHOICES,
     MODEL_LABELS,
+    orb_flight_enabled,
+    orb_panels_enabled,
     PTT_PAUSE_THRESHOLD,
     PTT_PHRASE_TIME_LIMIT,
     CONFIRM_LEAD_IN_SECONDS,
@@ -1425,6 +1427,36 @@ class Api:
         except Exception:
             pass
         return {"success": False, "enabled": False, "error": "The orb window could not be opened"}
+
+    # "Orb follows the task" and "Task panels" (default off; an env flag,
+    # MISTAI_ORB_FLIGHT / MISTAI_ORB_PANELS, overrides the saved value).
+    _ORB_OPTIONS = {"orb_flight": orb_flight_enabled, "orb_panels": orb_panels_enabled}
+
+    def orb_option(self, name):
+        """Is this orb option on? Read four times a second by the orb, so the
+        saved value is cached and refreshed by set_orb_option."""
+        cache = self.__dict__.setdefault("_orb_option_cache", {})
+        if name not in cache:
+            try:
+                cache[name] = self.memory.get_profile(name, "off")
+            except Exception:
+                cache[name] = "off"
+        return self._ORB_OPTIONS[name](cache[name])
+
+    def get_orb_options(self):
+        return {name: self.orb_option(name) for name in self._ORB_OPTIONS}
+
+    def set_orb_option(self, name, enabled):
+        if name not in self._ORB_OPTIONS:
+            return {"success": False, "error": "Unknown option"}
+        value = "on" if enabled else "off"
+        try:
+            self.memory.set_profile(name, value)
+        except Exception:
+            return {"success": False, "enabled": self.orb_option(name),
+                    "error": "Could not save the setting"}
+        self.__dict__.setdefault("_orb_option_cache", {})[name] = value
+        return {"success": True, "enabled": self.orb_option(name)}
 
     def start_floating_orb_if_enabled(self):
         if self.get_floating_orb():
