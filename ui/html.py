@@ -1095,9 +1095,8 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#161c26}
 body{font:12.5px/1.4 'Segoe UI',system-ui,sans-serif;color:#e6f4f8;user-select:none;-webkit-user-select:none;cursor:default}
 .panel{box-sizing:border-box;position:absolute;inset:0;padding:10px 30px 10px 12px;border-radius:12px;
   background:#161c26;border:1px solid rgba(235,252,255,.14);overflow:hidden;
-  animation:pop .18s ease-out both;transform-origin:left center}
-body[data-side="left"] .panel{transform-origin:right center}
-@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:scale(1);opacity:1}}
+  animation:drop .22s ease-out both}
+@keyframes drop{from{transform:translateY(-28px);opacity:0}to{transform:none;opacity:1}}
 .close{position:absolute;top:6px;right:6px;width:18px;height:18px;border:0;border-radius:50%;
   background:rgba(255,255,255,.08);color:#cfe7ee;font-size:12px;line-height:18px;padding:0;cursor:pointer}
 .close:hover{background:rgba(255,255,255,.18)}
@@ -1110,7 +1109,7 @@ li.run{opacity:.75}
 @media (prefers-reduced-motion: reduce){.panel{animation:none !important}}
 </style>
 </head>
-<body data-side="right">
+<body>
 <div class="panel" id="panel"><div id="body"></div><button class="close" id="close" title="Close">&times;</button></div>
 <script>
 window.addEventListener('pywebviewready',()=>{
@@ -1122,7 +1121,6 @@ window.addEventListener('pywebviewready',()=>{
     const key=JSON.stringify(s);
     if(key===last)return;
     last=key;
-    document.body.dataset.side=s.side==='left'?'left':'right';
     body.textContent='';
     if(s.kind==='steps'){
       const ul=document.createElement('ul');

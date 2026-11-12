@@ -432,6 +432,16 @@ def orb_panels_enabled(saved=None):
     return _env_or_saved("MISTAI_ORB_PANELS", saved)
 
 
+PANEL_ANCHORS = ("top-right", "top-left", "top-center")   # also the fallback order
+
+
+def panel_anchor():
+    """MISTAI_PANEL_ANCHOR = top-right (default) | top-center | top-left, read at
+    call time; anything else is the default."""
+    v = os.environ.get("MISTAI_PANEL_ANCHOR", "").strip().lower()
+    return v if v in PANEL_ANCHORS else "top-right"
+
+
 def panel_blur_enabled():
     """MISTAI_PANEL_BLUR (default off): try the Windows 11 DWM backdrop."""
     return env_flag("MISTAI_PANEL_BLUR", False)

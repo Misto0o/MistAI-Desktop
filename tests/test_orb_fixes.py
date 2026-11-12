@@ -392,7 +392,7 @@ def test_a_maximized_target_without_an_element_docks_at_its_nearest_inner_edge()
     orb.tick()
     x, y, s = played[0][-1][1]
     assert orb.dock == "inner-edge"
-    assert (x, y) == (1727, 1040 - 28 - 8)            # bottom edge: nearest the orb's center
+    assert (x, y) == (946, 1040 - 28 - 8)             # mid bottom edge, not the corner
 
 
 def test_a_click_point_from_before_this_task_is_ignored():
@@ -447,10 +447,12 @@ def test_dock_inside_beside_the_element_on_the_emptier_side(element, where):
 
 
 def test_dock_inside_without_an_element_hugs_the_nearest_inner_edge():
-    assert ol.dock_inside(MAXED, W, 28, near=(1890, 600)) == (1884, 586)
-    assert ol.dock_inside(MAXED, W, 28, near=(30, 500)) == (8, 486)
-    assert ol.dock_inside(MAXED, W, 28, near=(900, 10)) == (886, 8)
-    assert ol.dock_inside(MAXED, W, 28, near=(900, 1030)) == (886, 1004)
+    # The middle of the nearest edge, never at the orb's spot (a corner from home).
+    assert ol.dock_inside(MAXED, W, 28, near=(1890, 600)) == (1884, 506)
+    assert ol.dock_inside(MAXED, W, 28, near=(1900, 1030)) == (946, 1004)   # bottom-right
+    assert ol.dock_inside(MAXED, W, 28, near=(30, 500)) == (8, 506)
+    assert ol.dock_inside(MAXED, W, 28, near=(900, 10)) == (946, 8)
+    assert ol.dock_inside(MAXED, W, 28, near=(900, 1030)) == (946, 1004)
 
 
 def test_dock_inside_a_window_on_a_second_monitor():
@@ -468,28 +470,6 @@ def test_an_element_filling_the_window_still_keeps_the_orb_inside():
 # -- 6. panels ------------------------------------------------------------------------------
 
 SIZES = [(240, 176), (280, 140)]
-
-
-def test_panels_avoid_the_target_and_mistais_own_window():
-    orb = (1008, 108, 28)
-    target = (100, 100, 1000, 800)
-    own = (1040, 0, 1600, 500)                        # MistAI's window right of the orb
-    spots = ol.panel_spots(orb, SIZES, W, target, avoid=[target, own])
-    for (x, y), (w, h) in zip(spots, SIZES):
-        r = (x, y, x + w, y + h)
-        assert not ol.overlaps(r, target) and not ol.overlaps(r, own)
-        assert 0 <= x and x + w <= 1920 and 0 <= y and y + h <= 1040
-        assert not ol.overlaps(r, (1008, 108, 1036, 136))     # never over the orb
-    assert spots[0][0] >= 1036                                # still on the away side
-
-
-def test_panels_keep_the_away_side_when_it_is_clear_and_fall_back_when_nothing_is():
-    orb, target = (1008, 108, 28), (100, 100, 1000, 800)
-    assert ol.panel_spots(orb, SIZES, W, target, [target]) == ol.panel_stack(
-        orb, SIZES, W, target)
-    everything = (0, 0, 1920, 1040)
-    assert ol.panel_spots(orb, SIZES, W, target, [everything]) == ol.panel_stack(
-        orb, SIZES, W, target)
 
 
 def test_failure_pause_and_the_network_sentence_close_everything():
@@ -693,3 +673,254 @@ def test_every_step_is_followed_by_fast_polling():
         orb._fast_until = 0
         orb._on_bus(events.Event(events.ACTION_FAILED, {"action": action}))
         assert orb._fast_until > time.monotonic() and orb._last_action == action
+
+
+# -- minimum dwell (c) ---------------------------------------------------------------------
+
+def test_a_docked_arrival_dwells_even_if_the_task_ends_sooner():
+    orb, played = _orb()
+    now = [100.0]
+    orb._clock = lambda: now[0]
+    orb.tick()                                        # flies to the dock beside the target
+    plan = played[-1]
+    flight = sum(seg[2] for seg in plan)
+    assert orb._dwell_until == pytest.approx(100.0 + flight + 1.5)
+    orb.square = plan[-1][1]
+    orb._api._agent_lock.release()                    # the task ends at once
+    now[0] += flight + 1.0
+    orb.tick()
+    assert len(played) == 1                           # still docked: dwell not over
+    now[0] += 1.0
+    orb.tick()
+    assert played[-1][-1][1] == (1700, 900, 82)       # then home
+
+
+def test_stop_cuts_the_dwell_short():
+    orb, played = _orb()
+    orb._clock = lambda: 100.0
+    orb.tick()
+    orb.square = played[-1][-1][1]
+    orb._api._stop_requested.set()
+    orb.tick()
+    assert played[-1][-1][1] == (1700, 900, 82)
+
+
+# -- (b) browser element rects mapped to the screen ---------------------------------------------
+
+def _info(dpr=1.0, rects=None, sx=100, sy=50):
+    return dict(screenX=sx, screenY=sy, outerWidth=1216, innerWidth=1200, outerHeight=900,
+                innerHeight=800, dpr=dpr,
+                rects=rects if rects is not None else [[20, 100, 400, 120], [20, 200, 400, 220]])
+
+
+@pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5])
+def test_page_rects_map_to_physical_screen_pixels(dpr):
+    window = (0, 0, 4000, 3000)
+    got = ol.map_page_rects(_info(dpr), window)
+    # x: screenX + border (8) + left; y: screenY + toolbar (100) + top; times the dpr
+    assert got[0] == (round(128 * dpr), round(250 * dpr), round(508 * dpr), round(270 * dpr))
+
+
+def test_rects_outside_the_browser_window_or_empty_mean_no_rects():
+    assert ol.map_page_rects(_info(), (0, 0, 300, 300)) is None          # outside the window
+    assert ol.map_page_rects(_info(rects=[[20, 100, 20, 120]]), (0, 0, 4000, 3000)) is None
+    assert ol.map_page_rects(_info(rects=[]), (0, 0, 4000, 3000)) is None
+    assert ol.map_page_rects({"dpr": "x"}, (0, 0, 10, 10)) is None
+    below = _info(rects=[[20, 100, 400, 120], [20, 900, 400, 920]])     # 2nd below the fold
+    assert len(ol.map_page_rects(below, (0, 0, 4000, 3000))) == 1
+
+
+def test_the_margin_spot_prefers_the_right_then_the_left():
+    area = (0, 0, 1000, 800)
+    assert ol.margin_spot((100, 100, 500, 120), area, 28) == (508, 96)
+    assert ol.margin_spot((100, 100, 990, 120), area, 28) == (64, 96)
+
+
+def test_a_tour_hop_moves_medium_and_lands_small():
+    plan = ol.tour_plan((500, 100, 28), (500, 300, 28), 70)
+    assert plan[0][1][2] == 70 and plan[1][0][2] == plan[1][1][2] == 70
+    assert plan[-1][1] == (500, 300, 28)
+
+
+# -- 2. the search tour ------------------------------------------------------------------------
+
+class _TourBrowser:
+    def __init__(self, info):
+        self.info, self.calls = info, []
+
+    def link_boxes(self, selector, n=4):
+        self.calls.append((selector, n))
+        return self.info
+
+
+def _tour_orb(info, browser_hwnd=77):
+    orb, played = _task(fg=10, browser=browser_hwnd)
+    orb._win.RECTS = {**_SeqWin.RECTS, 77: (0, 0, 1900, 1040)}
+    orb._api.browser = _TourBrowser(info)
+    orb._api.orb_option = lambda n: n == "orb_flight"
+    now = [100.0]
+    orb._clock = lambda: now[0]
+    orb._tween.running = False
+    return orb, played, now
+
+
+FOUR = [[20, 100 + 90 * i, 600, 124 + 90 * i] for i in range(4)]
+
+
+def test_the_tour_hops_down_the_results_in_order_with_a_dwell(capsys):
+    orb, played, now = _tour_orb(_info(rects=FOUR, sx=0, sy=0))
+    orb._prepare_tour(orb._tour_gen)
+    assert orb._api.browser.calls == [(fo.RESULT_LINKS, 4)]
+    assert len(orb._tour["stops"]) == 4
+    played.clear()
+    orb.tick()
+    first = played[-1]
+    assert first[-1][1] == orb._tour["stops"][0]
+    hop = sum(s[2] for s in first)
+    orb.tick()
+    assert len(played) == 1                                  # dwelling 0.7 s
+    now[0] += hop + fo.TOUR_DWELL_S
+    orb.tick()
+    assert played[-1][-1][1] == orb._tour["stops"][1]
+    ys = [s[1] for s in orb._tour["stops"]]
+    assert ys == sorted(ys) and all(s[2] == 28 for s in orb._tour["stops"])
+    assert all(s[0] >= 608 for s in orb._tour["stops"])     # right margin of the results
+    log = capsys.readouterr().out
+    assert "[FloatingOrb] tour stops 4" in log
+
+
+def test_a_new_action_or_done_cancels_the_tour():
+    for action in ("browser_click", "done"):
+        orb, played, now = _tour_orb(_info(rects=FOUR, sx=0, sy=0))
+        orb._prepare_tour(orb._tour_gen)
+        orb.tick()
+        cancelled = []
+        orb._tween.cancel = lambda: cancelled.append(1)
+        orb._on_bus(events.Event(events.AGENT_STEP, {"action": action}))
+        assert orb._tour is None and cancelled == [1]
+
+
+def test_a_tour_prepared_after_a_new_step_is_dropped():
+    orb, played, now = _tour_orb(_info(rects=FOUR, sx=0, sy=0))
+    gen = orb._tour_gen
+    orb._on_bus(events.Event(events.AGENT_STEP, {"action": "browser_click"}))
+    orb._prepare_tour(gen)
+    assert orb._tour is None
+
+
+@pytest.mark.parametrize("info, hwnd", [
+    (None, 77),                                               # browser not running
+    (_info(rects=[]), 77),                                    # no result links
+    (_info(rects=FOUR, sx=5000), 77),                         # rects outside the window
+    (_info(rects=FOUR, sx=0, sy=0), None),                    # no browser window
+])
+def test_missing_or_bad_rects_skip_the_tour(info, hwnd, capsys):
+    orb, played, now = _tour_orb(info, browser_hwnd=hwnd)
+    orb._prepare_tour(orb._tour_gen)
+    assert orb._tour is None
+    assert "[FloatingOrb] tour skipped (no-rects)" in capsys.readouterr().out
+
+
+def test_the_tour_adds_no_steps_or_events():
+    src = inspect.getsource(fo.FloatingOrb._prepare_tour) + inspect.getsource(
+        fo.FloatingOrb._tour_step)
+    assert "publish" not in src and "AGENT_STEP" not in src
+
+
+def test_only_a_successful_search_with_flight_on_starts_a_tour(monkeypatch):
+    orb, played, now = _tour_orb(_info(rects=FOUR, sx=0, sy=0))
+    started = []
+    monkeypatch.setattr(fo.threading, "Thread",
+                        lambda target, args, **k: SimpleNamespace(
+                            start=lambda: started.append(target.__name__)))
+    orb._on_bus(events.Event(events.ACTION_FAILED, {"action": "browser_search"}))
+    orb._on_bus(events.Event(events.ACTION_EXECUTED, {"action": "browser_get_text"}))
+    assert started == []
+    orb._on_bus(events.Event(events.ACTION_EXECUTED, {"action": "browser_search"}))
+    assert started == ["_prepare_tour"]
+    orb._api.orb_option = lambda n: False
+    orb._on_bus(events.Event(events.ACTION_EXECUTED, {"action": "browser_search"}))
+    assert started == ["_prepare_tour"]
+
+
+# -- 3. the answer flow ------------------------------------------------------------------------
+
+ANSWER_PANEL = (1600, 220, 1880, 360)
+
+
+def test_answer_spot_left_of_the_panel_else_right():
+    assert ol.answer_spot(ANSWER_PANEL, 70, W) == (1518, 255)
+    assert ol.answer_spot((16, 220, 296, 360), 70, W) == (308, 255)      # no room on the left
+
+
+def _answer_orb(tts=True):
+    orb, played = _orb(busy=False)
+    now = [100.0]
+    orb._clock = lambda: now[0]
+    orb.square = (1008, 108, 28)
+    orb.panels = SimpleNamespace(rects={"answer": ANSWER_PANEL}, handles=lambda: [],
+                                 hide_all=lambda: None, update=lambda *a, **k: None)
+    if tts:
+        orb._api.tts = SimpleNamespace(speaking=False)
+    else:
+        orb._api.tts = SimpleNamespace()
+    orb._on_bus(events.Event(events.AGENT_STEP, {"action": "done",
+                                                 "speech": "one two three four five six "
+                                                           "seven eight nine ten"}))
+    return orb, played, now
+
+
+def test_the_orb_speaks_beside_the_answer_panel_then_flies_home():
+    orb, played, now = _answer_orb()
+    assert "speech" not in orb._answer and orb._answer["words"] == 10   # no text kept
+    orb.tick()                                        # voice about to start
+    assert played[-1][-1][1] == (1518, 255, 70) and orb.dock == "answer"
+    orb.square = played[-1][-1][1]
+    orb._api.tts.speaking = True
+    now[0] += 5
+    orb.tick()
+    assert len(played) == 1                           # stays while speaking
+    orb._api.tts.speaking = False
+    orb.tick()
+    assert played[-1][-1][1] == (1700, 900, 82)       # home, big
+
+
+def test_without_a_tts_flag_the_speech_length_is_estimated():
+    orb, played, now = _answer_orb(tts=False)
+    orb.tick()
+    orb.square = played[-1][-1][1]
+    now[0] += 3.0                                     # 10 words / 2.5 = 4 s
+    orb.tick()
+    assert len(played) == 1
+    now[0] += 1.5
+    orb.tick()
+    assert played[-1][-1][1] == (1700, 900, 82)
+
+
+def test_the_estimate_is_capped():
+    orb, played, now = _answer_orb(tts=False)
+    orb._answer["words"] = 1000
+    now[0] += fo.SPEECH_CAP_S + 0.1
+    assert orb._answer_speaking() is False
+
+
+def test_stop_during_the_answer_sends_the_orb_home_at_once():
+    orb, played, now = _answer_orb()
+    orb._api.tts.speaking = True
+    orb._api._stop_requested.set()
+    orb.tick()
+    assert played[-1][-1][1] == (1700, 900, 82) and orb._answer is None
+
+
+def test_panels_close_eight_seconds_after_the_speech_ends():
+    clock = [100.0]
+    m = op.PanelModel(lambda: clock[0])
+    m.on_event(events.Event(events.AGENT_STEP, {"action": "open_app"}))
+    m.on_event(events.Event(events.AGENT_STEP, {"action": "done", "speech": "hi"}))
+    clock[0] += 20                                     # a long answer, still speaking
+    m.mark_speaking(True)
+    assert not m.expired()
+    clock[0] += op.ANSWER_S - 0.5
+    assert not m.expired() and m.visible("answer", False)
+    clock[0] += 1
+    assert m.expired() and not m.visible("answer", False)

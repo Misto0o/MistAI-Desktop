@@ -101,33 +101,86 @@ def test_never_over_the_target_when_any_side_fits_randomized():
             assert not ol.overlaps((x, y, x + side, y + side), target), (work, target)
 
 
-# -- panel stack (Stage 3) -------------------------------------------------------------------
+# -- panels anchored to the top of the target's monitor --------------------------------------
 
-SIZES = [(240, 44), (260, 196), (300, 150)]
-
-
-def test_panels_stack_away_from_the_target_without_overlapping_it():
-    target, orb = (100, 100, 1000, 800), (1008, 108, 45)
-    spots = ol.panel_stack(orb, SIZES, W, target)
-    assert [x for x, _ in spots] == [1061, 1061, 1061]
-    assert [y for _, y in spots] == [108, 160, 364]
-    for (x, y), (w, h) in zip(spots, SIZES):
-        assert not ol.overlaps((x, y, x + w, y + h), target)
-    left = ol.panel_stack((847, 108, 45), SIZES, W, (900, 100, 1900, 800))
-    assert all(x + w <= 839 for (x, _), (w, _h) in zip(left, SIZES))
+PANELS = [(240, 176), (280, 140)]                      # steps above answer
+WORK = (0, 0, 1920, 1040)
 
 
-def test_panels_flip_when_their_side_has_no_room_and_stay_inside():
-    spots = ol.panel_stack((1867, 8, 45), SIZES, W, (0, 300, 1700, 1000))
-    for (x, y), (w, h) in zip(spots, SIZES):
-        assert x + w <= 1867 - 8 + 1 and W[0] <= x and y + h <= W[3]
-    low = ol.panel_stack((1762, 900, 138), SIZES, W)          # home, bottom right
-    assert all(x + w <= 1762 for (x, _), (w, _h) in zip(low, SIZES))
-    assert low[-1][1] + SIZES[-1][1] <= W[3]                  # moved up to fit
+def _rects(spots, sizes=PANELS):
+    return [(x, y, x + w, y + h) for (x, y), (w, h) in zip(spots, sizes)]
 
 
-def test_panels_on_a_second_monitor_stay_on_it():
-    work = (-1920, 0, 0, 1040)
-    spots = ol.panel_stack((-60, 20, 45), SIZES, work, (-1900, 0, -100, 1000))
-    for (x, y), (w, h) in zip(spots, SIZES):
-        assert work[0] <= x and x + w <= work[2] and work[1] <= y and y + h <= work[3]
+@pytest.mark.parametrize("anchor, xs", [
+    ("top-right", [1664, 1624]), ("top-left", [16, 16]), ("top-center", [840, 820]),
+])
+def test_each_anchor_stacks_down_from_the_top_with_inset_and_gap(anchor, xs):
+    spots, used = ol.anchored_panels(PANELS, WORK, anchor)
+    assert used == anchor and [x for x, _ in spots] == xs
+    assert [y for _, y in spots] == [16, 16 + 176 + 12]
+
+
+@pytest.mark.parametrize("scale, inset, gap", [(1.0, 16, 12), (1.25, 20, 15), (1.5, 24, 18)])
+def test_inset_and_gap_scale_with_dpi(scale, inset, gap):
+    sizes = [(round(240 * scale), round(176 * scale)), (round(280 * scale), round(140 * scale))]
+    spots, _ = ol.anchored_panels(sizes, WORK, "top-right", scale)
+    assert spots[0] == (1920 - inset - sizes[0][0], inset)
+    assert spots[1][1] == inset + sizes[0][1] + gap
+
+
+@pytest.mark.parametrize("orb", [(100, 900, 82), (1700, 900, 82), (900, 500, 28)])
+def test_the_position_does_not_depend_on_the_orb(orb):
+    assert ol.anchored_panels(PANELS, WORK, "top-right", orb=orb)[0] == \
+        ol.anchored_panels(PANELS, WORK, "top-right")[0]
+
+
+def test_panels_never_cover_the_orb():
+    orb = (1700, 20, 82)                                # docked in the top-right corner
+    spots, used = ol.anchored_panels(PANELS, WORK, "top-right", orb=orb)
+    assert not any(ol.overlaps(r, (1700, 20, 1782, 102)) for r in _rects(spots))
+    assert used == "top-right" and spots[0][1] == 102 + 12   # moved below the orb
+
+
+def test_a_target_covering_the_corner_moves_the_panels_to_the_next_anchor():
+    target = (1000, 0, 1920, 800)                       # covers the top-right
+    spots, used = ol.anchored_panels(PANELS, WORK, "top-right", target_rect=target)
+    assert used == "top-left"
+    assert not any(ol.overlaps(r, target) for r in _rects(spots))
+    both = (0, 0, 700, 800), (1200, 0, 1920, 800)       # left and right covered: centre
+    for t in both:
+        assert ol.anchored_panels(PANELS, WORK, "top-left", target_rect=t)[1] in (
+            "top-left", "top-right", "top-center")
+    wide = (0, 0, 1920, 600)                            # covers every anchor
+    assert ol.anchored_panels(PANELS, WORK, "top-center", target_rect=wide)[1] == "top-center"
+
+
+def test_a_maximized_target_keeps_the_configured_anchor():
+    spots, used = ol.anchored_panels(PANELS, WORK, "top-left", target_rect=(-8, -8, 1928, 1048),
+                                     maximized=True)
+    assert used == "top-left" and spots[0] == (16, 16)
+
+
+@pytest.mark.parametrize("work", [(-1920, 0, 0, 1040), (1920, -200, 3840, 880),
+                                  (0, 0, 2560, 1400)])
+def test_multi_monitor_offsets(work):
+    spots, _ = ol.anchored_panels(PANELS, work, "top-right")
+    assert spots[0] == (work[2] - 16 - 240, work[1] + 16)
+    for x, y, r, b in _rects(spots):
+        assert work[0] <= x and r <= work[2] and work[1] <= y and b <= work[3]
+
+
+def test_a_small_work_area_keeps_every_panel_inside():
+    work = (0, 0, 300, 250)
+    spots, _ = ol.anchored_panels(PANELS, work, "top-right")
+    for x, y, r, b in _rects(spots):
+        assert 0 <= x and r <= 300 and 0 <= y and b <= 250
+
+
+def test_the_anchor_setting_is_read_at_call_time_and_validated(monkeypatch):
+    from core.config import panel_anchor
+    monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
+    assert panel_anchor() == "top-right"
+    for raw, want in (("top-left", "top-left"), (" TOP-CENTER ", "top-center"),
+                      ("bottom-left", "top-right"), ("", "top-right")):
+        monkeypatch.setenv("MISTAI_PANEL_ANCHOR", raw)
+        assert panel_anchor() == want

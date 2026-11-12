@@ -35,8 +35,9 @@ import time
 
 from . import events
 from .config import orb_background, orb_debug_capture, orb_sizes
-from .orb_layout import (coverage, dock_inside, dock_position, dock_side, flight_plan,
-                         resize_about_center, square_at)
+from .orb_layout import (answer_spot, coverage, dock_inside, dock_position, dock_side, flight_plan,
+                         map_page_rects, margin_spot, resize_about_center, square_at,
+                         tour_plan)
 
 ORB_MARGIN = 16           # logical px from the work area's right and bottom edges
 MIN_SIZE = (1, 1)         # pywebview's default min_size (200, 100) clamps every resize
@@ -50,6 +51,13 @@ SHELL_CLASSES = frozenset({"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman",
 IGNORED_PROCESSES = ("taskmgr",)
 # MistAI's dedicated browser is Playwright's Firefox, run from its own folder.
 PLAYWRIGHT_PATH_HINTS = ("ms-playwright", ".local-browsers")
+# Organic result title links: DuckDuckGo (normal page, HTML endpoint), Google.
+RESULT_LINKS = 'a[data-testid="result-title-a"], a.result__a, #search a:has(h3)'
+TOUR_STOPS = 4
+TOUR_DWELL_S = 0.7
+SPEECH_START_S = 1.0      # the voice may start a moment after the answer arrives
+WORDS_PER_S = 2.5         # speech-length estimate when the TTS has no speaking flag
+SPEECH_CAP_S = 20.0
 
 WDA_MONITOR = 0x1
 WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -571,8 +579,14 @@ class FloatingOrb:
         self._acted = False                # the task has run an action
         self._last_action = ""             # its most recent action id
         self._pre_task_fg = None           # the window in front when it started
+        self._dwell_until = 0.0            # hold a dock until then (minimum dwell)
+        self._tour = None                  # {"stops": [...], "i", "next_at"} while touring
+        self._tour_gen = 0                 # bumped by every step: stale tours are dropped
+        self._answer = None                # {"at", "words"} from the final AgentStep
+        self._clock = time.monotonic
 
     TICK_S = 0.25
+    DWELL_S = 1.5             # a docked arrival stays put this long
     FAST_TICK_S = 0.1
     LAUNCH_POLL_S = 2.0
 
@@ -703,7 +717,16 @@ class FloatingOrb:
         if not self._flight_on():
             return resize_about_center(x, y, side, round(size_for(state) * self.scale))
         if self.aborted or self._stop_requested():
+            self._answer = None
             return self.home                         # failed, paused or stopped: home now
+        if self._answer_speaking():
+            panel = self.panels.rects.get("answer") if self.panels is not None else None
+            medium = round(orb_sizes()[1] * self._here_scale())
+            if panel:                                # beside the answer panel, speaking
+                self.dock = "answer"
+                work, _scale = self._win.monitor_for_rect(panel)
+                return answer_spot(panel, medium, work) + (medium,)
+            return resize_about_center(x, y, side, medium)
         busy = self._busy()
         target = self._cur_target
         _big, medium, small_l = orb_sizes()
@@ -723,6 +746,23 @@ class FloatingOrb:
             return resize_about_center(x, y, side, round(medium * self._here_scale()))
         return self.home
 
+    def _answer_speaking(self):
+        """Is the final answer being spoken? The TTS's own flag when it has
+        one (plus a moment before the voice starts), else an estimate from
+        the word count, capped. Clears the answer once it is over."""
+        a = self._answer
+        if a is None:
+            return False
+        elapsed = self._clock() - a["at"]
+        tts = getattr(self._api, "tts", None)
+        if tts is not None and hasattr(tts, "speaking"):
+            on = bool(tts.speaking) or elapsed < SPEECH_START_S
+        else:
+            on = elapsed < min(SPEECH_CAP_S, max(SPEECH_START_S, a["words"] / WORDS_PER_S))
+        if not on:
+            self._answer = None
+        return on
+
     def _stop_requested(self):
         try:
             return self._api._stop_requested.is_set()
@@ -741,12 +781,81 @@ class FloatingOrb:
                 self._acted = True
                 self._last_action = str(data.get("action", ""))
                 self._fast_until = time.monotonic() + self.LAUNCH_POLL_S
+            if name == events.AGENT_STEP:
+                self._cancel_tour()                  # the next real action or "done"
+                if data.get("action") == "done" and data.get("speech"):
+                    # Only the length is kept (for the estimate), never the text.
+                    self._answer = {"at": self._clock(),
+                                    "words": len(str(data["speech"]).split())}
+            if (name == events.ACTION_EXECUTED and data.get("action") == "browser_search"
+                    and self._flight_on()):
+                gen = self._tour_gen
+                threading.Thread(target=self._prepare_tour, args=(gen,), daemon=True,
+                                 name="OrbTour").start()
             if name in (events.TASK_FAILED, events.TASK_PAUSED) or (
                     name == events.AGENT_STEP and data.get("action") == "failed"):
                 self.aborted = True
             self._kick.set()
         except Exception:
             pass
+
+    # -- the search tour ---------------------------------------------------------
+    # Choreography only: while the agent waits on its next model call after a
+    # browser_search, the orb hops down the first results. It does NOT mean the
+    # results were read: it adds no step, tick or event, never delays an action,
+    # and the next AgentStep (a real action or "done") cancels it.
+
+    def _cancel_tour(self):
+        self._tour_gen += 1
+        if self._tour is not None:
+            self._tour = None
+            try:
+                self._tween.cancel()
+            except Exception:
+                pass
+
+    def _prepare_tour(self, gen):
+        """Worker thread: read the result link boxes and build the stops; any
+        missing or invalid rect skips the tour (the normal docking stays)."""
+        try:
+            info = self._api.browser.link_boxes(RESULT_LINKS, TOUR_STOPS)
+            hwnd = self._win.browser_window()
+            window = self._win.window_rect(hwnd) if hwnd else None
+            rects = map_page_rects(info, window) if info and window else None
+        except Exception:
+            rects, window = None, None
+        if gen != self._tour_gen:
+            return                                   # a step arrived meanwhile
+        if not rects:
+            print("[FloatingOrb] tour skipped (no-rects)")
+            return
+        work, scale = self._win.monitor_for_rect(window)
+        _big, medium, small = orb_sizes()
+        small, medium = round(small * (scale or 1.0)), round(medium * (scale or 1.0))
+        area = (max(window[0], work[0]), max(window[1], work[1]),
+                min(window[2], work[2]), min(window[3], work[3]))
+        stops = [margin_spot(r, area, small) + (small,) for r in rects]
+        self._tour = {"stops": stops, "i": 0, "next_at": 0.0, "medium": medium}
+        print(f"[FloatingOrb] tour stops {len(stops)}")
+        self._kick.set()
+
+    def _tour_step(self):
+        """Play the next hop when the last one has dwelt; True while touring."""
+        tour = self._tour
+        if tour is None:
+            return False
+        if self._clock() < tour["next_at"]:
+            return True
+        if tour["i"] >= len(tour["stops"]):
+            self._tour = None
+            return False
+        stop = tour["stops"][tour["i"]]
+        plan = tour_plan(self.square, stop, tour["medium"])
+        tour["i"] += 1
+        tour["next_at"] = self._clock() + sum(s[2] for s in plan) + TOUR_DWELL_S
+        self.dock = "tour"
+        self._tween.play(plan, on_frame=self._set_square)
+        return True
 
     def _sync_panels(self, busy):
         """Task panels (Settings "Task panels"): created on first use, placed
@@ -763,22 +872,17 @@ class FloatingOrb:
             from .orb_panels import OrbPanels
 
             self.panels = OrbPanels(self._api, self._win)
-        x, y, s = self.square
-        rect = self._cur_target["rect"] if self._cur_target else None
-        work, scale = self._win.monitor_for_rect((x, y, x + s, y + s))
-        avoid = [r for r in (rect, self._own_rect()) if r]
+        if self._cur_target:                          # the target's monitor
+            t = self._cur_target
+            rect, work, scale, maximized = t["rect"], t["work"], t["scale"], t["inside"]
+        else:                                         # else the primary monitor
+            rect, maximized = None, False
+            monitor, work = self._win.primary_work_area()
+            scale = self._win.monitor_scale(monitor)
+        speaking = bool(getattr(getattr(self._api, "tts", None), "speaking", False))
         self.panels.update(self.square, rect, work, scale or self.scale, busy,
-                           avoid=avoid, ended=self.aborted or self._stop_requested())
-
-    def _own_rect(self):
-        """MistAI's own main window rect while it is not minimized, else None."""
-        try:
-            hwnd = self._api._own_window_handle()
-            if hwnd and not self._win.is_minimized(hwnd):
-                return self._win.window_rect(hwnd)
-        except Exception:
-            pass
-        return None
+                           maximized=maximized, ended=self.aborted or self._stop_requested(),
+                           speaking=speaking)
 
     def _sync_click_through(self):
         """Click-through while flight is on and the agent acts, so the orb can
@@ -818,6 +922,7 @@ class FloatingOrb:
             busy = self._busy()
             if busy and not self._was_busy:          # a new task
                 self.aborted = False
+                self._answer = None
                 self._busy_since = time.monotonic()
                 self._acted, self._last_action = False, ""
                 try:
@@ -835,6 +940,11 @@ class FloatingOrb:
             self._sync_panels(busy)
             if self._tween.running:
                 return
+            if busy and self._tour_step():
+                return                               # touring the results
+            if self._clock() < self._dwell_until and not (self.aborted
+                                                          or self._stop_requested()):
+                return                               # minimum dwell at a dock
             self._adopt_drag()
             goal = self._goal(orb_state(self._api))
             if self.dock != self._logged_dock:
@@ -842,7 +952,10 @@ class FloatingOrb:
                 print(f"[FloatingOrb] dock {self.dock or 'none'} size {goal[2]}")
             if max(abs(a - b) for a, b in zip(goal, self.square)) <= 2:
                 return
-            self._tween.play(flight_plan(self.square, goal), on_frame=self._set_square)
+            plan = flight_plan(self.square, goal)
+            if self.dock:                            # a flight to a dock: finish, then dwell
+                self._dwell_until = self._clock() + sum(s[2] for s in plan) + self.DWELL_S
+            self._tween.play(plan, on_frame=self._set_square)
         except Exception as e:
             print(f"[FloatingOrb] tick error ({type(e).__name__})")
 

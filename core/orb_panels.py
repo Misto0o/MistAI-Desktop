@@ -23,8 +23,8 @@ import threading
 import time
 
 from . import events
-from .config import orb_debug_capture, panel_blur_enabled
-from .orb_layout import panel_spots
+from .config import orb_debug_capture, panel_anchor, panel_blur_enabled
+from .orb_layout import anchored_panels
 
 KINDS = ("steps", "answer")
 SIZES = {"steps": (240, 176), "answer": (280, 140)}   # logical px
@@ -79,6 +79,7 @@ class PanelModel:
             self.steps = []           # [{"label", "action", "state": run|ok|fail}]
             self.answer = ""
             self.answer_at = None
+            self.spoken_until = None  # when Mist last spoke the answer
             self.closed = set()
             self.ended = False        # failed, paused, stopped: close all now
 
@@ -108,8 +109,16 @@ class PanelModel:
         except Exception:
             pass
 
+    def mark_speaking(self, speaking):
+        """Panels close ANSWER_S after the answer's speech ENDS."""
+        if speaking and self.answer_at is not None:
+            self.spoken_until = self._clock()
+
     def expired(self):
-        return self.answer_at is not None and self._clock() - self.answer_at > ANSWER_S
+        if self.answer_at is None:
+            return False
+        last = max(self.answer_at, self.spoken_until or self.answer_at)
+        return self._clock() - last > ANSWER_S
 
     def visible(self, kind, busy):
         """Should this panel be on screen now?"""
@@ -193,7 +202,8 @@ class OrbPanels:
         self.windows = {}             # kind -> pywebview window
         self.hwnds = {}               # kind -> hwnd once shown
         self.shown = {}               # kind -> bool
-        self.side = "right"
+        self.side = "top-right"       # the anchor in use (the page slides in from above)
+        self.rects = {}               # kind -> (l, t, r, b) while shown
         self.style = None
         self.sizes = {}               # kind -> actual (w, h) the corners were cut for
         self._was_busy = False
@@ -259,22 +269,26 @@ class OrbPanels:
             print(f"[OrbPanels] {kind} requested {w},{h} actual {aw},{ah}")
         return aw, ah
 
-    def update(self, orb, target_rect, work, scale, busy, avoid=(), ended=False):
-        """Show, place or hide the panels for this tick. Never raises."""
+    def update(self, orb, target_rect, work, scale, busy, maximized=False, ended=False,
+               speaking=False):
+        """Show, place or hide the panels for this tick: anchored to the top of
+        ``work`` (the target's monitor, else the primary), never over the orb.
+        Never raises."""
         try:
             if busy and not self._was_busy:
                 self.model.reset()
             self._was_busy = busy
             if ended:
                 self.model.ended = True
+            self.model.mark_speaking(speaking)
             if self.model.expired() and not busy:
                 self.model.reset()
             kinds = [k for k in KINDS if self.model.visible(k, busy)]
             sizes = [tuple(round(v * scale) for v in SIZES[k]) for k in kinds]
-            spots = panel_spots(orb, sizes, work, target_rect, avoid)
-            ox, _oy, s = orb
-            self.side = "right" if spots and spots[0][0] >= ox + s else "left"
+            spots, self.side = anchored_panels(sizes, work, panel_anchor(), scale,
+                                               target_rect, maximized, orb)
             for kind, (x, y), (w, h) in zip(kinds, spots, sizes):
+                self.rects[kind] = (x, y, x + w, y + h)
                 hwnd = self.hwnds.get(kind)
                 if kind not in self.windows:
                     self._create(kind, x, y, w, h, scale)
@@ -296,6 +310,7 @@ class OrbPanels:
                     if self.hwnds.get(kind):
                         self._win.show(self.hwnds[kind], False)
                     self.shown[kind] = False
+                    self.rects.pop(kind, None)
                     print(f"[OrbPanels] hide {kind}")
         except Exception as e:
             print(f"[OrbPanels] update error ({type(e).__name__})")

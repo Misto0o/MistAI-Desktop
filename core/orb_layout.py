@@ -95,30 +95,59 @@ def overlaps(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
-def panel_stack(orb, sizes, work, target_rect=None, gap=8):
-    """(x, y) for each panel (sizes: [(w, h), ...], top to bottom) stacked
-    beside the orb square ``orb`` (x, y, side) on the side AWAY from the
-    target (right of the orb when the orb is right of the target's center,
-    else left); with no target, toward the middle of the work area. A side
-    without room flips; the stack starts level with the orb's top and stays
-    inside ``work``."""
+PANEL_INSET = 16      # logical px from the work area's edges
+PANEL_GAP = 12        # logical px between stacked panels
+PANEL_ORDER = ("top-right", "top-left", "top-center")
+
+
+def _panel_column(sizes, work, anchor, inset, gap, y0=None):
     wl, wt, wr, wb = (int(v) for v in work)
-    ox, oy, side = orb
-    ocx = ox + side / 2.0
-    if target_rect is not None:
-        right = ocx >= (target_rect[0] + target_rect[2]) / 2.0
-    else:
-        right = ocx < (wl + wr) / 2.0
-    total = sum(h for _w, h in sizes) + gap * max(0, len(sizes) - 1)
-    y = _clamp(oy, wt, wb - total)
+    y = wt + inset if y0 is None else y0
     out = []
     for w, h in sizes:
-        x = ox + side + gap if right else ox - gap - w
-        if (right and x + w > wr) or (not right and x < wl):
-            x = ox - gap - w if right else ox + side + gap
+        if anchor == "top-left":
+            x = wl + inset
+        elif anchor == "top-center":
+            x = (wl + wr) // 2 - w // 2
+        else:
+            x = wr - inset - w
         out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
         y += h + gap
     return out
+
+
+def _hits(spots, sizes, rect):
+    return rect is not None and any(overlaps((x, y, x + w, y + h), rect)
+                                    for (x, y), (w, h) in zip(spots, sizes))
+
+
+def anchored_panels(sizes, work, anchor="top-right", scale=1.0, target_rect=None,
+                    maximized=False, orb=None):
+    """((x, y) per panel, anchor used): panels stacked downward from the top
+    of ``work`` (the target's monitor), inset PANEL_INSET and PANEL_GAP apart
+    (x ``scale``), at ``anchor``. Independent of the orb, except that they
+    never cover it (the stack moves below the orb, else to another anchor).
+    A non-maximized target covering the stack moves it to the first anchor of
+    PANEL_ORDER that is clear of it; a maximized one keeps ``anchor``."""
+    inset, gap = round(PANEL_INSET * scale), round(PANEL_GAP * scale)
+    order = [anchor] + [a for a in PANEL_ORDER if a != anchor]
+    choice = anchor
+    if target_rect is not None and not maximized:
+        choice = next((a for a in order
+                       if not _hits(_panel_column(sizes, work, a, inset, gap), sizes,
+                                    target_rect)), anchor)
+    orb_rect = (orb[0], orb[1], orb[0] + orb[2], orb[1] + orb[2]) if orb else None
+    spots = _panel_column(sizes, work, choice, inset, gap)
+    if not _hits(spots, sizes, orb_rect):
+        return spots, choice
+    below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[3] + gap)
+    if not _hits(below, sizes, orb_rect):
+        return below, choice
+    for a in order:
+        spots = _panel_column(sizes, work, a, inset, gap)
+        if not _hits(spots, sizes, orb_rect):
+            return spots, a
+    return spots, choice
 
 
 # -- time-based flights (fix: smooth movement) ------------------------------------------
@@ -176,8 +205,8 @@ def dock_inside(window_rect, work, side, element=None, near=None, gap=8):
     """(x, y) for a small orb INSIDE a (maximized) window. With ``element``
     (the rect the current step touches): beside it on the emptier side
     (right/left by the room inside the window, then below/above), not over
-    it when a side fits. Without one: against the window's inner edge
-    nearest ``near`` (the orb's current center), at that point along it.
+    it when a side fits. Without one: at the MIDDLE of the window's inner
+    edge nearest ``near`` (the orb's current center), never in a corner.
     Always inside both the window and the work area."""
     area = _clip([int(v) for v in window_rect], [int(v) for v in work])
     al, at, ar, ab = area
@@ -202,8 +231,8 @@ def dock_inside(window_rect, work, side, element=None, near=None, gap=8):
     cx, cy = near if near is not None else ((al + ar) / 2.0, (at + ab) / 2.0)
     dists = {"left": cx - al, "right": ar - cx, "top": cy - at, "bottom": ab - cy}
     edge = min(dists, key=dists.get)
-    x = _clamp(int(cx - side / 2), al + gap, ar - side - gap)
-    y = _clamp(int(cy - side / 2), at + gap, ab - side - gap)
+    x = _clamp(int((al + ar) / 2 - side / 2), al + gap, ar - side - gap)
+    y = _clamp(int((at + ab) / 2 - side / 2), at + gap, ab - side - gap)
     if edge == "left":
         x = al + gap
     elif edge == "right":
@@ -215,48 +244,65 @@ def dock_inside(window_rect, work, side, element=None, near=None, gap=8):
     return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
 
 
-def panel_spots(orb, sizes, work, target_rect=None, avoid=(), gap=8):
-    """Like panel_stack, but searches for a spot where no panel overlaps any
-    rect in ``avoid`` (the target, MistAI's own window) or the orb itself:
-    the side away from the target, then the other side, each level with the
-    orb's top, its bottom, the work area's bottom and top; then below and
-    above the orb. When none is clear: panel_stack's away side. Always
-    inside ``work``."""
-    first = panel_stack(orb, sizes, work, target_rect, gap)
-    if not avoid or not sizes:
-        return first
+# -- browser page rects and the search tour ---------------------------------------------------
+
+def map_page_rects(info, window_rect):
+    """Physical screen rects for the viewport rects in ``info`` (from
+    BrowserSession.link_boxes: CSS px plus the window's screenX/Y, outer and
+    inner sizes and devicePixelRatio, which in Firefox already includes the
+    Windows display scale). Content origin = screenX + side border
+    ((outerWidth - innerWidth) / 2), screenY + toolbar height (outerHeight -
+    innerHeight). Rects below the fold are dropped; None when a remaining
+    rect is empty or not inside ``window_rect`` (the mapping can't be trusted)."""
+    try:
+        dpr = float(info["dpr"]) or 1.0
+        ox = float(info["screenX"]) + (float(info["outerWidth"]) - float(info["innerWidth"])) / 2
+        oy = float(info["screenY"]) + float(info["outerHeight"]) - float(info["innerHeight"])
+        inner_h = float(info["innerHeight"])
+        out = []
+        for left, top, right, bottom in info["rects"]:
+            if bottom > inner_h or top < 0:
+                continue                                  # not on screen now
+            r = (round((ox + left) * dpr), round((oy + top) * dpr),
+                 round((ox + right) * dpr), round((oy + bottom) * dpr))
+            wl, wt, wr, wb = window_rect
+            if r[2] - r[0] < 2 or r[3] - r[1] < 2 or not (
+                    wl <= r[0] and r[2] <= wr and wt <= r[1] and r[3] <= wb):
+                return None
+            out.append(r)
+        return out or None
+    except Exception:
+        return None
+
+
+def margin_spot(element, area, side, gap=8):
+    """(x, y) for a small orb beside ``element`` inside ``area`` (the page):
+    in the right margin when it has room, else the left, vertically centred
+    on the element; kept inside ``area``."""
+    el, et, er, eb = element
+    al, at, ar, ab = area
+    x = er + gap if ar - er >= side + 2 * gap else el - gap - side
+    y = (et + eb) // 2 - side // 2
+    return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+
+
+def tour_plan(start, goal, medium, hop_s=0.35):
+    """Segments for one tour hop: grow to ``medium`` in place, fly (a slight
+    bow) to ``goal``'s center, shrink to ``goal``'s side there."""
+    x0, y0, s0 = start
+    x1, y1, s1 = goal
+    big = resize_about_center(x0, y0, s0, medium)
+    land = resize_about_center(x1, y1, s1, medium)
+    segs = [] if big == start else [(start, big, RESIZE_S, 0.0)]
+    segs.append((big, land, hop_s, 0.15))
+    return segs + ([(land, goal, RESIZE_S, 0.0)] if land != goal else [])
+
+
+def answer_spot(panel, side, work, gap=12):
+    """(x, y) for the orb beside the answer panel: to its left, vertically
+    centred, else to its right when the left has no room; inside ``work``."""
+    pl, pt, pr, pb = panel
     wl, wt, wr, wb = (int(v) for v in work)
-    ox, oy, s = orb
-    total = sum(h for _w, h in sizes) + gap * (len(sizes) - 1)
-    away_right = first[0][0] >= ox + s
-
-    def column(right, y0):
-        out, y = [], _clamp(y0, wt, wb - total)
-        for w, h in sizes:
-            x = ox + s + gap if right else ox - gap - w
-            out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
-            y += h + gap
-        return out
-
-    def row(y0):
-        out, y = [], y0
-        for w, h in sizes:
-            x = ox if away_right else ox + s - w
-            out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
-            y += h + gap
-        return out
-
-    cands = [first]
-    for right in (away_right, not away_right):
-        for y0 in (oy, oy + s - total, wb - total, wt):
-            cands.append(column(right, y0))
-    cands += [row(oy + s + gap), row(oy - gap - total)]
-    blockers = [a for a in avoid if a] + [(ox, oy, ox + s, oy + s)]
-
-    def clear(spots):
-        rects = [(x, y, x + w, y + h) for (x, y), (w, h) in zip(spots, sizes)]
-        if any(overlaps(a, b) for i, a in enumerate(rects) for b in rects[i + 1:]):
-            return False
-        return not any(overlaps(r, a) for r in rects for a in blockers)
-
-    return next((c for c in cands if clear(c)), first)
+    x = pl - gap - side if pl - gap - side >= wl else pr + gap
+    y = (pt + pb) // 2 - side // 2
+    return _clamp(x, wl, wr - side), _clamp(y, wt, wb - side)

@@ -215,7 +215,7 @@ def test_panels_open_untitled_unfocused_beside_the_orb_away_from_the_target(monk
     for x, y, w, h in moves:
         assert not overlaps((x, y, x + w, y + h), TARGET)
         assert x >= ORB[0] + ORB[2]                          # right of the orb
-    assert panels.side == "right"
+    assert panels.side == "top-right"                        # anchored at the top
     bus.publish(events.AGENT_STEP, {"action": "done", "speech": "The total is 42."})
     panels.update(ORB, TARGET, WORK, 1.0, busy=False)
     assert len(wv.created) == 2                              # + answer

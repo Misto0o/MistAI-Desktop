@@ -432,6 +432,28 @@ class BrowserSession:
 
         return self._call(_do)
 
+    # Read-only geometry for the floating orb's search tour: the window's
+    # screen metrics and the viewport rects of the first ``n`` matches, in CSS
+    # px (core/orb_layout.map_page_rects maps them to the screen). No text.
+    _LINK_BOXES_JS = """([sel, n]) => ({
+      screenX: window.screenX, screenY: window.screenY,
+      outerWidth: window.outerWidth, innerWidth: window.innerWidth,
+      outerHeight: window.outerHeight, innerHeight: window.innerHeight,
+      dpr: window.devicePixelRatio,
+      rects: Array.from(document.querySelectorAll(sel)).slice(0, n).map(e => {
+        const r = e.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]; })
+    })"""
+
+    def link_boxes(self, selector, n=4):
+        """None when the browser is not running (never starts it)."""
+        if self._context is None:
+            return None
+
+        def _do():
+            return self._page.evaluate(self._LINK_BOXES_JS, [selector, n])
+
+        return self._call(_do, timeout=2)
+
     def current_url(self):
         def _do():
             return self._page.url
