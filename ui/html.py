@@ -989,33 +989,37 @@ btnStop.onclick = async () => {
 # sizes: idle breathes, listening pulses a ring, thinking spins an arc,
 # speaking ripples. Static under prefers-reduced-motion.
 def _orb_page():
-    from core.config import ORB_TINT as t
+    from core.config import ORB_TINT as t, orb_background
 
+    # The disc fills the window (the round region is the disc's edge) and the
+    # page and window background is the rim colour (config.orb_background),
+    # so a frame the page has not painted yet never shows black.
+    bg = orb_background()
     css = (
-        "html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05080f}"
+        f"html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:{bg}}}"
         "body{display:flex;align-items:center;justify-content:center;user-select:none;"
         "-webkit-user-select:none;cursor:default}"
-        ".orb-wrap{position:relative;width:78vmin;height:78vmin}"
+        ".orb-wrap{position:relative;width:100vmin;height:100vmin}"
         ".disc,.ring,.arc,.ripple{position:absolute;inset:0;border-radius:50%;pointer-events:none}"
         f".disc{{background:radial-gradient(circle,{t['center']} 0%,{t['mid']} 58%,{t['edge']} 100%);"
-        f"border:1px solid {t['border']};box-shadow:0 0 10vmin {t['glow']};"
+        f"border:1px solid {t['border']};box-sizing:border-box;"
         "animation:breathe 3.2s ease-in-out infinite}"
-        f".ring,.ripple{{border:1px solid {t['border']};opacity:0}}"
+        f".ring,.ripple{{inset:8%;border:2px solid {t['glow']};opacity:0}}"
         f".arc{{inset:12%;border:2px solid transparent;border-top-color:{t['border']};"
         f"border-right-color:{t['mid']};opacity:0}}"
-        "@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.035)}}"
-        "@keyframes pulse{0%{transform:scale(1);opacity:.85}100%{transform:scale(1.22);opacity:0}}"
+        "@keyframes breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.08)}}"
+        "@keyframes pulse{0%{transform:scale(.7);opacity:.9}100%{transform:scale(1.05);opacity:0}}"
         "@keyframes spin{to{transform:rotate(360deg)}}"
-        "@keyframes ripple{0%{transform:scale(.7);opacity:.7}100%{transform:scale(1.2);opacity:0}}"
+        "@keyframes ripple{0%{transform:scale(.5);opacity:.7}100%{transform:scale(1.05);opacity:0}}"
         '.orb-wrap[data-state="listening"] .ring{animation:pulse 1.1s ease-out infinite}'
         '.orb-wrap[data-state="thinking"] .arc{opacity:1;animation:spin 1.2s linear infinite}'
         '.orb-wrap[data-state="speaking"] .ripple{animation:ripple 1.6s ease-out infinite}'
         '.orb-wrap[data-state="speaking"] .ripple.r2{animation-delay:.8s}'
         "@media (prefers-reduced-motion: reduce){"
         ".disc,.ring,.arc,.ripple{animation:none !important}"
-        '.orb-wrap[data-state="listening"] .ring{opacity:.8;transform:scale(1.1)}'
+        '.orb-wrap[data-state="listening"] .ring{opacity:.8;transform:scale(.95)}'
         '.orb-wrap[data-state="thinking"] .arc{opacity:1}'
-        '.orb-wrap[data-state="speaking"] .ripple{opacity:.5;transform:scale(1.12)}'
+        '.orb-wrap[data-state="speaking"] .ripple{opacity:.5;transform:scale(.9)}'
         '.orb-wrap[data-state="speaking"] .ripple.r2{opacity:0}}'
     )
     return """<!DOCTYPE html>
@@ -1087,27 +1091,23 @@ PANEL_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <title></title>
 <style>
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#10141c}
-body{font:13px/1.4 'Segoe UI',system-ui,sans-serif;color:#e6f4f8;user-select:none;-webkit-user-select:none;cursor:default}
-.panel{box-sizing:border-box;position:absolute;inset:0;padding:10px 34px 10px 14px;border-radius:14px;
-  background:rgba(22,28,38,.92);border:1px solid rgba(235,252,255,.14);overflow:hidden;
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#161c26}
+body{font:12.5px/1.4 'Segoe UI',system-ui,sans-serif;color:#e6f4f8;user-select:none;-webkit-user-select:none;cursor:default}
+.panel{box-sizing:border-box;position:absolute;inset:0;padding:10px 30px 10px 12px;border-radius:12px;
+  background:#161c26;border:1px solid rgba(235,252,255,.14);overflow:hidden;
   animation:pop .18s ease-out both;transform-origin:left center}
 body[data-side="left"] .panel{transform-origin:right center}
 @keyframes pop{from{transform:scale(.6);opacity:0}to{transform:scale(1);opacity:1}}
-.close{position:absolute;top:6px;right:8px;width:20px;height:20px;border:0;border-radius:50%;
-  background:rgba(255,255,255,.08);color:#cfe7ee;font-size:13px;line-height:20px;padding:0;cursor:pointer}
+.close{position:absolute;top:6px;right:6px;width:18px;height:18px;border:0;border-radius:50%;
+  background:rgba(255,255,255,.08);color:#cfe7ee;font-size:12px;line-height:18px;padding:0;cursor:pointer}
 .close:hover{background:rgba(255,255,255,.18)}
-.pill{display:flex;align-items:center;height:100%;padding-top:0;padding-bottom:0;white-space:nowrap;text-overflow:ellipsis}
-.pill::before{content:'';width:7px;height:7px;border-radius:50%;background:rgba(168,222,238,.9);margin-right:9px;flex:none;
-  animation:blink 1.2s ease-in-out infinite}
-@keyframes blink{50%{opacity:.35}}
 ul{list-style:none;margin:0;padding:0}
 li{display:flex;gap:8px;padding:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 li .t{width:14px;flex:none;color:rgba(168,222,238,.9)}
 li.fail .t{color:#f8a3a3}
 li.run{opacity:.75}
 .answer{overflow:auto;height:100%}
-@media (prefers-reduced-motion: reduce){.panel,.pill::before{animation:none !important}}
+@media (prefers-reduced-motion: reduce){.panel{animation:none !important}}
 </style>
 </head>
 <body data-side="right">
@@ -1124,10 +1124,7 @@ window.addEventListener('pywebviewready',()=>{
     last=key;
     document.body.dataset.side=s.side==='left'?'left':'right';
     body.textContent='';
-    if(s.kind==='pill'){
-      panel.classList.add('pill');
-      body.textContent=String(s.label||'');
-    }else if(s.kind==='steps'){
+    if(s.kind==='steps'){
       const ul=document.createElement('ul');
       for(const st of (s.steps||[])){
         const li=document.createElement('li');

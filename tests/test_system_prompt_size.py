@@ -36,14 +36,15 @@ STATES = {
 }
 
 # Recorded from the indented template (before the strip) for each state;
-# updated on purpose for the batched-steps LOOP rule (default on).
+# updated on purpose for the batched-steps LOOP rule (default on), then for the
+# merged BROWSER search rule (DuckDuckGo; two nearby rules tightened to make room).
 PROMPT_HASHES = {
-    "plain": "7fdac63552afdd3cd7923e7a136463fb2ee4b2690aa7c912ac227cd37a3a363a",
-    "project": "8189cbf282aac2b5e0352441eea70b706395ee1b5dbbe81f1b95f4f239dc3be5",
-    "long-screen": "3e1c4d84c25ee91546b4f1038e4071b6a69167b7a64e80dcc889ec32f5400f07",
-    "hints-and-conversation": "95447f8efd581d1af97b6b1ed83b55f535e4d82e69c717ffeabc2c300898c469",
+    "plain": "74ad6f891aee0966b5aa39e69d32c921489cb555c34ea6729ff5c4c04b1f168e",
+    "project": "a05cb2e3f97c2dc98fbfff3e73aa80a682ade04472a12f686f145b55052b46c6",
+    "long-screen": "a52a886e5bb1f3ddb53bfe69a2164071b978d175686e5c4d70454f364d41cd43",
+    "hints-and-conversation": "3686c6e165ce23a46348a671156802bf648aeb805730b47900fa7a76c1863a8c",
 }
-PLAIN_LENGTH = 20945            # 20,749 before the batched-steps rule (MISTAI_BATCH_STEPS)
+PLAIN_LENGTH = 20933            # 20,945 before the BROWSER search rule (net -12 chars)
 
 
 def build(state):

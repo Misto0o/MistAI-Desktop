@@ -27,6 +27,14 @@ from test_ui_page import _HARNESS, _real_outputs, _script
 needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 
 
+@pytest.fixture(autouse=True)
+def _pinned_sizes(monkeypatch):
+    """The geometry below was worked out for 110/94/36 px; MISTAI_ORB_SIZES pins
+    it (the 82/70/28 defaults are tested in test_orb_fixes.py)."""
+    monkeypatch.setenv("MISTAI_ORB_SIZES", "110,94,36")
+    monkeypatch.delenv("MISTAI_ORB_DEBUG_CAPTURE", raising=False)
+
+
 def _state_api(ptt=False, speaking=False, busy=False):
     lock = threading.Lock()
     if busy:
@@ -130,8 +138,24 @@ class _Win:
         self.calls.append(("affinity", mode))
         return (mode == fo.WDA_EXCLUDEFROMCAPTURE and self.exclude_ok) or mode == fo.WDA_MONITOR
 
+    style = 0
+
     def add_exstyle(self, hwnd, bits):
         self.calls.append(("exstyle", bits))
+
+    def set_exstyle(self, hwnd, add=0, remove=0):
+        self.calls.append(("exstyle", add))
+        self.style = (self.style | add) & ~remove
+
+    def exstyle(self, hwnd):
+        return self.style
+
+    def show(self, hwnd, on):
+        self.calls.append(("show", on))
+
+    def move_only(self, hwnd, x, y):
+        self.calls.append(("move_only", (x, y)))
+        return True
 
     def primary_work_area(self):
         return "mon", self.work
@@ -176,8 +200,9 @@ def test_harden_places_it_in_the_work_area_and_cuts_a_physical_circle(scale, rec
     assert ("ellipse", (0, 0, side + 1, side + 1)) in win.calls       # physical, not logical
     assert ("exstyle", fo.WS_EX_TOOLWINDOW | fo.WS_EX_NOACTIVATE) in win.calls
     log = capsys.readouterr().out
-    assert f"[FloatingOrb] at {rect[0]},{rect[1]} size {side},{side} monitor-scale {scale:.2f}" \
-        in log
+    assert (f"[FloatingOrb] at {rect[0]},{rect[1]} requested {side},{side} actual "
+            f"{side},{side} monitor-scale {scale:.2f}") in log
+    assert "[FloatingOrb] taskbar: hidden" in log
     assert "failed" not in log
 
 
@@ -268,7 +293,7 @@ class _Webview:
 
 
 def test_the_window_is_small_frameless_on_top_untitled_and_unfocused(monkeypatch):
-    monkeypatch.setattr(fo, "_corner_position", lambda size=fo.ORB_SIZE: (10, 20))
+    monkeypatch.setattr(fo, "_corner_position", lambda size=None: (10, 20))
     wv = _Webview()
     api = _state_api()
     orb = fo.FloatingOrb(api, webview=wv)
@@ -279,7 +304,10 @@ def test_the_window_is_small_frameless_on_top_untitled_and_unfocused(monkeypatch
     assert kw["html"] == ORB_HTML
     assert isinstance(kw["js_api"], fo.OrbBridge)            # never the full Api
     assert kw["js_api"] is not api
-    assert (kw["width"], kw["height"], kw["x"], kw["y"]) == (fo.ORB_SIZE, fo.ORB_SIZE, 10, 20)
+    assert (kw["width"], kw["height"], kw["x"], kw["y"]) == (110, 110, 10, 20)
+    assert kw["min_size"] == (1, 1)                          # pywebview's (200, 100) clamps
+    from core.config import orb_background
+    assert kw["background_color"] == orb_background()
     assert kw["frameless"] and kw["on_top"] and not kw["focus"] and not kw["resizable"]
     assert "transparent" not in kw                           # opaque + round region instead
 
@@ -551,21 +579,34 @@ def test_apply_square_frees_a_region_that_was_not_taken():
     assert fo.apply_square(SimpleNamespace(), 7, 0, 0, 40) is False      # never raises
 
 
-def test_the_tween_plays_every_frame_and_can_be_cancelled(monkeypatch):
+class _StepClock:
+    """Advances a fixed step each time it is read."""
+
+    def __init__(self, step):
+        self.t, self.step = 0.0, step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+def test_the_tween_is_time_based_and_can_be_cancelled(monkeypatch):
     monkeypatch.setattr(fo.Tween, "FRAME_S", 0)
     win, seen, done = _Win(), [], []
-    tw = fo.Tween(win, 7)
-    tw.play([(0, 0, 10), (1, 1, 12), (2, 2, 14)], on_frame=seen.append,
+    tw = fo.Tween(win, 7, clock=_StepClock(0.05))
+    tw.play([((0, 0, 10), (100, 0, 10), 0.2, 0.0)], on_frame=seen.append,
             done=lambda: done.append(1)).join(2)
-    assert seen == [(0, 0, 10), (1, 1, 12), (2, 2, 14)] and done == [1]
+    assert seen[-1] == (100, 0, 10) and done == [1]
+    assert 2 <= len(seen) <= 4                     # ~0.2 s at 0.05 s per frame
     gate = threading.Event()
-    slow = fo.Tween(win, 7)
+    slow = fo.Tween(win, 7, clock=_StepClock(0.001))
     seen.clear()
-    t = slow.play([(0, 0, 10)] * 50, on_frame=lambda sq: (seen.append(sq), gate.wait(1)))
+    t = slow.play([((0, 0, 10), (500, 0, 10), 10.0, 0.0)],
+                  on_frame=lambda sq: (seen.append(sq), gate.wait(1)))
     slow.cancel()
     gate.set()
     t.join(2)
-    assert len(seen) < 50 and not slow.running
+    assert len(seen) < 5 and not slow.running
 
 
 def test_tick_resizes_toward_the_state_size(monkeypatch):
@@ -576,9 +617,9 @@ def test_tick_resizes_toward_the_state_size(monkeypatch):
     orb._tween = SimpleNamespace(running=False,
                                  play=lambda sq, on_frame=None, done=None: played.append(sq))
     orb.tick()
-    (squares,) = played
-    assert squares[-1] == (1772, 872, 118)                    # medium, same center
-    orb.square = squares[-1]
+    (segments,) = played
+    assert segments[-1][1] == (1772, 872, 118)                # medium, same center
+    orb.square = segments[-1][1]
     played.clear()
     orb.tick()
     assert played == []                                       # already there
@@ -603,6 +644,12 @@ class _FlightWin(_Win):
     def set_click_through(self, hwnd, on):
         self.styles.append(on)
 
+    def window_info(self, hwnd):
+        return (1234, "notepad.exe", "Notepad")
+
+    def browser_window(self):
+        return None
+
 
 def _flight_orb(flight=True, busy=True, speaking=False, app="notepad", **kw):
     api = _state_api(busy=busy, speaking=speaking)
@@ -614,6 +661,7 @@ def _flight_orb(flight=True, busy=True, speaking=False, app="notepad", **kw):
     orb.square = orb.home = (1762, 862, 138)
     orb._win = _FlightWin(**kw)
     orb._win.rect = (1762, 862, 1900, 1000)
+    orb._acted, orb._was_busy = True, busy        # mid-task: a step has already run
     played = []
     orb._tween = SimpleNamespace(running=False, play=lambda sq, on_frame=None,
                                  done=None: played.append(sq))
@@ -623,11 +671,14 @@ def _flight_orb(flight=True, busy=True, speaking=False, app="notepad", **kw):
 def test_a_task_with_a_target_window_docks_small_beside_it(capsys):
     orb, played = _flight_orb()
     orb.tick()
-    (path,) = played
-    assert path[-1] == (1008, 108, 45)                     # right of the target, 36 * 1.25
-    assert len(path) == orb.FLIGHT_FRAMES
-    straight_mid_y = (862 + 108) / 2
-    assert path[len(path) // 2][1] < straight_mid_y - 50   # bowed upward
+    (plan,) = played
+    assert plan[-1][1] == (1008, 108, 45)                  # right of the target, 36 * 1.25
+    assert plan[0][1][2] == 45 and plan[0][3] == 0.0        # shrinks first, in place
+    fly = plan[-1]
+    assert fly[0][2] == fly[1][2] == 45 and fly[3] > 0      # same size all flight, bowed
+    from core.orb_layout import square_at
+    straight_mid_y = (fly[0][1] + fly[1][1]) / 2
+    assert square_at(fly[0], fly[1], 0.5, fly[3])[1] < straight_mid_y - 50
     assert orb.dock == "right"
     assert orb._win.styles == [True]                        # click-through while acting
     log = capsys.readouterr().out
@@ -636,16 +687,18 @@ def test_a_task_with_a_target_window_docks_small_beside_it(capsys):
 
 def test_a_task_without_a_target_goes_medium_at_home():
     orb, played = _flight_orb(app=None)
+    orb._acted = False                                       # no step has run yet
     orb.tick()
-    assert played[0][-1] == (1772, 872, 118) and orb.dock is None
+    assert played[0][-1][1] == (1772, 872, 118) and orb.dock is None
 
 
 def test_a_target_not_in_front_or_the_orb_itself_is_not_a_target():
-    orb, played = _flight_orb(fg=99)                         # another window in front
-    assert orb._target() is None
+    orb, played = _flight_orb(fg=99)                         # the user's window, as before
+    orb._pre_task_fg = 99
+    assert orb._target() == (None, "unrelated-window")
     orb, played = _flight_orb(fg=4242)                       # the orb itself
     orb.hwnd = 4242
-    assert orb._target() is None
+    assert orb._target() == (None, "no-window")
 
 
 def test_after_the_task_it_speaks_medium_then_flies_home_big():
@@ -655,12 +708,12 @@ def test_after_the_task_it_speaks_medium_then_flies_home_big():
     orb.click_through = True
     orb.tick()
     assert orb._win.styles == [False]                        # restored after acting
-    assert played[-1][-1] == resize_about_center_(1008, 108, 45, 118)
+    assert played[-1][-1][1] == resize_about_center_(1008, 108, 45, 118)
     orb2, played2 = _flight_orb(busy=False)
     orb2.square = (1008, 108, 45)
     orb2._win.rect = (1008, 108, 1053, 153)
     orb2.tick()
-    assert played2[-1][-1] == (1762, 862, 138)              # home, big
+    assert played2[-1][-1][1] == (1762, 862, 138)           # home, big
 
 
 def resize_about_center_(x, y, s, n):
@@ -671,7 +724,7 @@ def resize_about_center_(x, y, s, n):
 def test_flight_off_never_docks_or_goes_click_through():
     orb, played = _flight_orb(flight=False)
     orb.tick()
-    assert played[0][-1] == (1772, 872, 118) and orb.dock is None
+    assert played[0][-1][1] == (1772, 872, 118) and orb.dock is None
     assert orb._win.styles == []
 
 

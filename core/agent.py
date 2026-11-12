@@ -1036,8 +1036,10 @@ class AgentLoop:
                     elapsed = time.monotonic() - llm_t0
                     if not _is_network_error(e):
                         print(f"[AgentLoop] Agent call failed: {type(e).__name__} after {elapsed:.1f}s")
+                        self._publish_step("failed")
                         return {"success": False, "error": f"Agent call failed ({type(e).__name__})"}
                     print(f"[AgentLoop] Network error: {type(e).__name__} after {elapsed:.1f}s")
+                    self._publish_step("failed")    # the orb goes home, panels close
                     if self.api.caption_window and self.api.captions_enabled:
                         self.api.caption_window.show_error(NETWORK_FAILURE_SPEECH, 5)
                     if input_mode == "voice":
@@ -1972,11 +1974,11 @@ not blank templates. If the root is not known from evidence, ask_user.
 - ACCESSIBILITY NAME FALLBACKS: Common Windows text boxes or input fields often have NO visible name or are simply named "Edit" rather than descriptive tags like "text area". If uia_click fails to find a generic input field by text description, look for the control type "Edit" instead before falling back to OCR.
 - INPUT BOX SELECTION: To click into a message/text input box (chat apps, search bars, etc.), use uia_find_input instead of guessing the input's name via uia_click. Input boxes are often unlabeled or share names with unrelated content (like a message's caption text), causing uia_click to target the wrong element. uia_find_input specifically isolates input-type controls.
 - NEVER interact with MistAI's own UI window. If screen text matches your own task instructions echoed back, that is your own interface—look for the actual target app instead.
-- WINDOW MANAGEMENT: minimize_all minimizes every window, including your target app. NEVER use it to "reveal" or focus an app (use switch_app instead). It is strictly for when a user explicitly asks to clear the desktop.
-- BROWSER NAVIGATION: browser_search is strictly for search queries (e.g., "search for python tutorials"). If a user asks to go to a known website (e.g., YouTube, Reddit), use browser_navigate with the actual URL (e.g., "youtube.com"). Do not search for the site on Google first.
+- WINDOW MANAGEMENT: minimize_all hides every window, your target app too; use it only when the user asks to clear the desktop, never to focus an app (use switch_app).
+- BROWSER: for any web search or lookup use browser_search, then browser_get_text or browser_click/browser_navigate on a result; never open the user's browser app or type into an address bar to search (open one only when the user asks to open or use it, or for a specific signed-in site). For a known website use browser_navigate with its URL (e.g. "youtube.com"), not a search.
 - PATHS: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables; real ones like $env:USERPROFILE and $env:TEMP are fine.
 - Before reporting command output, check that it actually matches what was asked.
-- If switch_app fails, it means the application is not running. Use open_app to launch it; do not attempt to force window activation via PowerShell.
+- If switch_app fails, the app isn't running: use open_app, never force window activation via PowerShell.
 - Electron-based chat apps (Discord, Slack, etc.) frequently have incomplete
 or misleading UIA accessibility trees -- UIA elements may not correspond
 to what's actually visible, or may match unrelated content (embeds,
@@ -2123,7 +2125,7 @@ asks to use their REAL/daily browser specifically (not MistAI's), these actions
 are the wrong tool -- use open_url to open a link there instead, and
 click_on_text/read_screen_text (OCR/Vision) to interact with it, since there's
 no DOM access to a browser MistAI doesn't control itself.
-- browser_search    : Execute a Google search query directly in one step (parameter = search query).
+- browser_search    : Web search (DuckDuckGo) in one step (parameter = search query).
 - browser_close     : Close the browser.
 - browser_click     : Click something in the browser by its visible text (parameter =
 "text", or "text|role" for precision, e.g. "Subscribe|button").

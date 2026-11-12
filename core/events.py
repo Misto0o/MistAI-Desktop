@@ -40,7 +40,8 @@ PROCESS_EXITED = "ProcessExited"
 ACTION_EXECUTED = "ActionExecuted"
 ACTION_FAILED = "ActionFailed"
 # AgentLoop: {"action"} just before a step runs; {"action": "done", "speech"}
-# for the final answer. For on-screen panels only; never logged.
+# for the final answer; {"action": "failed"} when the agent call fails (the network
+# sentence). For the floating orb and its panels only; never logged.
 AGENT_STEP = "AgentStep"
 
 TASK_STARTED = "TaskStarted"

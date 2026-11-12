@@ -313,6 +313,9 @@ class EnhancedUIANavigator:
             rect = element.rectangle()
             x = (rect.left + rect.right) // 2
             y = (rect.top + rect.bottom) // 2
+            # The floating orb docks beside the control the task touches.
+            self.last_element_rect = ((rect.left, rect.top, rect.right, rect.bottom),
+                                      time.monotonic())
             pyautogui.moveTo(x, y, duration=0.15)
             time.sleep(0.05)
             pyautogui.click()

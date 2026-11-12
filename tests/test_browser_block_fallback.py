@@ -6,7 +6,15 @@ import pytest
 
 from core import config
 from core.api import Api
-from core.config import SEARCH_ROUTES, blocked_page_reason
+from core.config import SEARCH_ENGINES, blocked_page_reason
+
+GOOGLE_ROUTES = SEARCH_ENGINES["google"]
+
+
+@pytest.fixture
+def google(monkeypatch):
+    """MISTAI_SEARCH_ENGINE=google: the old order (Google, then DuckDuckGo HTML)."""
+    monkeypatch.setenv("MISTAI_SEARCH_ENGINE", "google")
 
 RESULTS = "Marblewood lighthouse opening hours 9am to 5pm daily " * 5
 GOOGLE_SORRY = ("https://www.google.com/sorry/index?continue=x", "https://www.google.com/",
@@ -82,21 +90,22 @@ def test_the_reason_never_quotes_the_page():
                        "the page shows a CAPTCHA"}     # the first rule that matches wins
 
 
-def test_routes_google_first_then_one_other_engine():
-    assert [n for n, _ in SEARCH_ROUTES][0] == "Google" and len(SEARCH_ROUTES) == 2
-    assert all(u.startswith("https://") and u.endswith("q=") for _, u in SEARCH_ROUTES)
+def test_google_mode_routes_google_first_then_duckduckgo_html():
+    assert [n for n, _ in GOOGLE_ROUTES] == ["Google", "DuckDuckGo HTML"]
+    for routes in SEARCH_ENGINES.values():
+        assert all(u.startswith("https://") and u.endswith("q=") for _, u in routes)
 
 
 # -- browser_search -------------------------------------------------------------------
 
 
-def test_google_blocked_then_the_second_route_works(capsys):
+def test_google_blocked_then_the_second_route_works(capsys, google):
     api = _api([GOOGLE_SORRY, ("https://html.duckduckgo.com/html/?q=x", "results", RESULTS)])
     assert Api._act_browser_search(api, "marblewood hours") is True
-    assert api.browser.visited == [SEARCH_ROUTES[0][1] + "marblewood%20hours",
-                                   SEARCH_ROUTES[1][1] + "marblewood%20hours"]
+    assert api.browser.visited == [GOOGLE_ROUTES[0][1] + "marblewood%20hours",
+                                   GOOGLE_ROUTES[1][1] + "marblewood%20hours"]
     result = api.last_result_text
-    assert result.startswith("Searched DuckDuckGo for 'marblewood hours'. "
+    assert result.startswith("Searched DuckDuckGo HTML for 'marblewood hours'. "
                              "(Google showed a block page.) RESULTS PAGE TEXT (already read")
     _content_free(result)
     log = capsys.readouterr().out
@@ -104,20 +113,21 @@ def test_google_blocked_then_the_second_route_works(capsys):
     assert "marblewood" not in log and "Quillfeather" not in log
 
 
-def test_both_routes_blocked_is_a_failure_with_no_page_content():
+def test_both_routes_blocked_is_a_failure_with_no_page_content(google):
     api = _api([GOOGLE_SORRY, CF_BLOCK])
     assert Api._act_browser_search(api, "marblewood hours") is False
     assert len(api.browser.visited) == 2                       # each route once
     assert api.last_result_text == (
-        "BLOCKED: Google: the site redirected to a /sorry/ block page; DuckDuckGo: the page "
-        "shows a CAPTCHA. Every search route showed a block/CAPTCHA page; do "
-        "not try to solve it. Use browser_navigate to a specific site, or tell the user.")
+        "BLOCKED: the search was blocked (Google: the site redirected to a /sorry/ block "
+        "page; DuckDuckGo HTML: the page shows a CAPTCHA). Do not try to solve it or search "
+        "another way (no browser app, no address bar); tell the user the web search was "
+        "blocked.")
     assert "already read" not in api.last_result_text
     _content_free(api.last_result_text)
     assert api.spoken == []
 
 
-def test_a_normal_results_page_is_untouched():
+def test_a_normal_results_page_is_untouched(google):
     api = _api([("https://www.google.com/search?q=x", "x - Google Search", RESULTS)])
     assert Api._act_browser_search(api, "marblewood hours") is True
     assert len(api.browser.visited) == 1

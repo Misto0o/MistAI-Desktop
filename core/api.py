@@ -45,7 +45,8 @@ from .config import (
     PTT_PHRASE_TIME_LIMIT,
     CONFIRM_LEAD_IN_SECONDS,
     PTT_THRESHOLD_MAX_AGE,
-    SEARCH_ROUTES,
+    search_routes,
+    search_url,
     STATUS_URL,
     TRACKED_APPS,
     WAKE_WORDS,
@@ -4362,13 +4363,13 @@ class Api:
     def _act_browser_search(self, param):
         if not param:
             return False
-        import urllib.parse
-        blocked = []  # (route name, fixed reason) of each route that showed a block page
+        blocked = []  # (route name, fixed reason) of each route that was blocked or empty
         try:
-            for name, base in SEARCH_ROUTES:
-                url, title = self.browser.navigate(base + urllib.parse.quote(param))
+            for name, base in search_routes():
+                url, title = self.browser.navigate(search_url(base, param))
                 text = self._page_text()
-                reason = blocked_page_reason(url, title, text)
+                reason = blocked_page_reason(url, title, text) or (
+                    "the results page was empty" if not text.strip() else None)
                 if reason:
                     print(f"[Browser] browser_search: {name} showed a block page ({reason})")
                     blocked.append((name, reason))
@@ -4389,9 +4390,10 @@ class Api:
             self.last_result_text = f"browser_search failed: {e}"
             return False
         self.last_result_text = (
-            "BLOCKED: " + "; ".join(f"{n}: {r}" for n, r in blocked)
-            + ". Every search route showed a block/CAPTCHA page; do not try to solve it. "
-            "Use browser_navigate to a specific site, or tell the user.")
+            "BLOCKED: the search was blocked ("
+            + "; ".join(f"{n}: {r}" for n, r in blocked)
+            + "). Do not try to solve it or search another way (no browser app, no "
+            "address bar); tell the user the web search was blocked.")
         return False
 
     def _act_browser_close(self):

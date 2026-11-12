@@ -27,24 +27,31 @@ def _ev(name, **data):
 
 
 @pytest.mark.parametrize("action, label", [
-    ("open_app", "Open app"), ("browser_get_text", "Browser get text"),
-    ("press_key", "Press key"), ("", "Working"), (None, "Working"),
+    ("open_app", "Opening an app"), ("click_on_text", "Clicking"), ("type_text", "Typing"),
+    ("press_key", "Typing"), ("read_screen_text", "Reading the screen"),
+    ("analyze_screen", "Reading the screen"), ("run_command", "Running a command"),
+    ("browser_get_text", "Reading the screen"), ("not_a_tool", "Working"), ("", "Working"),
 ])
-def test_labels_come_from_the_action_id_generically(action, label):
-    assert op.label_for(action) == label
+def test_labels_come_from_the_tools_category_never_the_action_id(action, label):
+    from core.tools import ToolRegistry
+    api = SimpleNamespace(tools=ToolRegistry())
+    got = op.label_for(action, op.tool_categories(api, action))
+    assert got == label
+    assert "_" not in got
+    assert op.tool_categories(SimpleNamespace(), action) == ()      # never raises
 
 
 def test_the_model_follows_steps_ticks_and_the_answer():
     clock = _Clock()
-    m = op.PanelModel(clock)
+    cats = {"open_app": ("app",), "type_text": ("type",)}
+    m = op.PanelModel(clock, lambda a: cats.get(a, ()))
     m.on_event(_ev(events.AGENT_STEP, action="open_app"))
-    assert m.state("pill")["label"] == "Open app"
-    assert m.state("steps")["steps"] == [{"label": "Open app", "state": "run"}]
+    assert m.state("steps")["steps"] == [{"label": "Opening an app", "state": "run"}]
     m.on_event(_ev(events.ACTION_EXECUTED, action="open_app", parameter="secret"))
     m.on_event(_ev(events.AGENT_STEP, action="type_text"))
     m.on_event(_ev(events.ACTION_FAILED, action="type_text"))
     assert [s["state"] for s in m.state("steps")["steps"]] == ["ok", "fail"]
-    assert m.visible("pill", True) and m.visible("steps", True)
+    assert m.visible("steps", True) and op.KINDS == ("steps", "answer")       # no pill
     assert not m.visible("answer", True)
     m.on_event(_ev(events.AGENT_STEP, action="done", speech="It says 42."))
     assert m.state("answer")["text"] == "It says 42." and m.visible("answer", False)
@@ -70,7 +77,8 @@ def test_the_bridge_exposes_only_its_own_state_and_close():
     panels.model.answer = "hi"
     bridge.dismiss()
     assert panels.model.closed == {"answer"}
-    assert not panels.model.visible("answer", True) and panels.model.visible("pill", True)
+    panels.model.steps = [{"label": "Typing", "action": "type_text", "state": "run"}]
+    assert not panels.model.visible("answer", True) and panels.model.visible("steps", True)
 
 
 # -- windows ------------------------------------------------------------------------------
@@ -83,8 +91,26 @@ class _Win:
         self.calls.append(("affinity", hwnd, mode))
         return True
 
+    style = 0
+
     def add_exstyle(self, hwnd, bits):
         self.calls.append(("exstyle", hwnd, bits))
+
+    def set_exstyle(self, hwnd, add=0, remove=0):
+        self.calls.append(("exstyle", hwnd, add))
+        self.style = (self.style | add) & ~remove
+
+    def exstyle(self, hwnd):
+        return self.style
+
+    def move_only(self, hwnd, x, y):
+        self.calls.append(("move_only", hwnd, (x, y)))
+        return True
+
+    rects = {}
+
+    def window_rect(self, hwnd):
+        return self.rects.get(hwnd)
 
     def dwm_set(self, hwnd, attr, value):
         self.calls.append(("dwm", attr, value))
@@ -102,6 +128,8 @@ class _Win:
 
     def move(self, hwnd, x, y, w, h):
         self.calls.append(("move", hwnd, (x, y, w, h)))
+        self.rects = dict(self.rects)
+        self.rects[hwnd] = (x, y, x + w, y + h)
         return True
 
     def show(self, hwnd, on):
@@ -111,7 +139,7 @@ class _Win:
 def test_plain_style_is_a_rounded_region_and_blur_needs_the_flag_and_dwm():
     win = _Win()
     assert op.harden_panel(7, win, 300, 44, 1.25, blur=False) == "plain"
-    assert ("roundrect", (0, 0, 301, 45, 35, 35)) in win.calls
+    assert ("roundrect", (0, 0, 301, 45, 30, 30)) in win.calls
     assert ("exstyle", 7, fo.WS_EX_TOOLWINDOW | fo.WS_EX_NOACTIVATE) in win.calls
     assert ("affinity", 7, fo.WDA_EXCLUDEFROMCAPTURE) in win.calls
     assert not any(c[0] == "dwm" for c in win.calls)
@@ -173,16 +201,16 @@ def test_panels_open_untitled_unfocused_beside_the_orb_away_from_the_target(monk
                                                                              capsys):
     panels, bus, wv, win, clock = _panels(monkeypatch)
     panels.update(ORB, TARGET, WORK, 1.0, busy=True)
-    assert len(wv.created) == 1                              # the pill: "Working"
+    assert len(wv.created) == 0                              # nothing before a step
     bus.publish(events.AGENT_STEP, {"action": "open_app"})
     panels.update(ORB, TARGET, WORK, 1.0, busy=True)
-    assert len(wv.created) == 2                              # pill + steps
+    assert len(wv.created) == 1                              # steps
     for w in wv.created:
         kw = w.kw
         assert w.title == "" and kw["frameless"] and kw["on_top"] and not kw["focus"]
         assert isinstance(kw["js_api"], op.PanelBridge)
     _show_all(wv)
-    assert sorted(panels.handles()) == [500, 501]
+    assert sorted(panels.handles()) == [500]
     moves = [c[2] for c in win.calls if c[0] == "move"]
     for x, y, w, h in moves:
         assert not overlaps((x, y, x + w, y + h), TARGET)
@@ -190,7 +218,7 @@ def test_panels_open_untitled_unfocused_beside_the_orb_away_from_the_target(monk
     assert panels.side == "right"
     bus.publish(events.AGENT_STEP, {"action": "done", "speech": "The total is 42."})
     panels.update(ORB, TARGET, WORK, 1.0, busy=False)
-    assert len(wv.created) == 3
+    assert len(wv.created) == 2                              # + answer
     _show_all(wv)
     log = capsys.readouterr().out
     assert log.count("[OrbPanels] panel style: plain") == 1

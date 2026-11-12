@@ -371,9 +371,9 @@ def uia_first_enabled():
 
 # Floating orb (core/floating_orb.py): window sides in logical px (scaled by
 # the monitor DPI) per state, and the flat frosted-glass tint of its page.
-ORB_SIZE_BIG = 110       # idle, listening (at home)
-ORB_SIZE_MEDIUM = 94     # thinking, moving, speaking
-ORB_SIZE_SMALL = 36      # docked beside the window the task works in
+ORB_SIZE_BIG = 82        # idle, listening (at home)
+ORB_SIZE_MEDIUM = 70     # thinking, moving, speaking
+ORB_SIZE_SMALL = 28      # docked beside the window or element the task works in
 ORB_TINT = {
     "center": "rgba(238,252,255,.84)",
     "mid": "rgba(168,222,238,.445)",     # at 58%
@@ -381,6 +381,39 @@ ORB_TINT = {
     "border": "rgba(235,252,255,.65)",
     "glow": "rgba(130,220,240,.35)",
 }
+
+
+def orb_sizes():
+    """(big, medium, small) logical px: MISTAI_ORB_SIZES="big,med,small", read
+    at call time; three whole numbers 12..400 with big >= med >= small, else
+    the defaults above."""
+    raw = os.environ.get("MISTAI_ORB_SIZES", "").strip()
+    default = (ORB_SIZE_BIG, ORB_SIZE_MEDIUM, ORB_SIZE_SMALL)
+    if not raw:
+        return default
+    try:
+        sizes = tuple(int(v) for v in raw.split(","))
+    except ValueError:
+        return default
+    if len(sizes) != 3 or not all(12 <= v <= 400 for v in sizes) or not (
+            sizes[0] >= sizes[1] >= sizes[2]):
+        return default
+    return sizes
+
+
+def orb_background():
+    """The orb window's solid colour: ORB_TINT's edge colour over near-black,
+    so any pixel the page has not painted yet looks like the disc's rim."""
+    import re as _re
+
+    r, g, b, a = (float(v) for v in _re.findall(r"[\d.]+", ORB_TINT["edge"]))
+    return "#%02x%02x%02x" % tuple(round(a * c + (1 - a) * d) for c, d in ((r, 5), (g, 8), (b, 15)))
+
+
+def orb_debug_capture():
+    """MISTAI_ORB_DEBUG_CAPTURE=1: leave the orb and panels capturable for
+    screenshots. Ignored in a built app."""
+    return not getattr(sys, "frozen", False) and env_flag("MISTAI_ORB_DEBUG_CAPTURE", False)
 
 
 def _env_or_saved(name, saved):
@@ -948,12 +981,31 @@ def credential_failure_reason(command, output=""):
     return None
 
 
-# browser_search tries these in order; a block page moves on to the next one
-# (once). The second route's URL has not been checked against a live block.
-SEARCH_ROUTES = (
-    ("Google", "https://www.google.com/search?q="),
-    ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
-)
+# browser_search routes per engine, tried in order; a block or empty page moves
+# on to the next one (once). DuckDuckGo (default) never leaves DuckDuckGo: its
+# normal page, then its HTML endpoint. "google" is the old order.
+SEARCH_ENGINES = {
+    "duckduckgo": (("DuckDuckGo", "https://duckduckgo.com/?q="),
+                   ("DuckDuckGo HTML", "https://html.duckduckgo.com/html/?q=")),
+    "google": (("Google", "https://www.google.com/search?q="),
+               ("DuckDuckGo HTML", "https://html.duckduckgo.com/html/?q=")),
+}
+
+
+def search_engine():
+    """MISTAI_SEARCH_ENGINE = duckduckgo (default) | google, read at call time;
+    anything else is the default."""
+    v = os.environ.get("MISTAI_SEARCH_ENGINE", "").strip().lower()
+    return v if v in SEARCH_ENGINES else "duckduckgo"
+
+
+def search_routes():
+    return SEARCH_ENGINES[search_engine()]
+
+
+def search_url(base, query):
+    """The search URL for ``query``: every reserved character percent-encoded."""
+    return base + urllib.parse.quote(str(query), safe="")
 
 # Generic block/CAPTCHA wording -> a fixed reason. Checked in the title and
 # text of SHORT pages only: a block page is a few lines, while an article
@@ -965,6 +1017,8 @@ _BLOCK_PAGE_RX = (
     (re.compile(r"\bverify (?:that )?you(?: are|'re) (?:a )?human\b", re.I),
      "the page asks to verify you are human"),
     (re.compile(r"\baccess denied\b", re.I), "the page says access denied"),
+    (re.compile(r"\bbots use DuckDuckGo too\b", re.I),
+     "the page reports an anomaly (DuckDuckGo's bot check)"),
 )
 BLOCK_PAGE_MAX_CHARS = 1500
 
@@ -975,7 +1029,9 @@ def blocked_page_reason(url, title, text):
     path = urllib.parse.urlsplit(str(url or "")).path.lower()
     if "/sorry/" in path or path.rstrip("/").endswith("/sorry"):
         return "the site redirected to a /sorry/ block page"
-    text = " ".join(str(text or "").split())
+    if "anomaly" in path:
+        return "the page reports an anomaly (DuckDuckGo's bot check)"
+    text =" ".join(str(text or "").split())
     if len(text) > BLOCK_PAGE_MAX_CHARS:
         return None
     page = f"{title or ''} {text}"

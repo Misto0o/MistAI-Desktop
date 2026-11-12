@@ -31,19 +31,32 @@ Logs carry numbers and Win32 error codes only.
 
 import ctypes
 import threading
+import time
 
-from .config import ORB_SIZE_BIG, ORB_SIZE_MEDIUM, ORB_SIZE_SMALL
-from .orb_layout import dock_position, dock_side, frames, resize_about_center
+from . import events
+from .config import orb_background, orb_debug_capture, orb_sizes
+from .orb_layout import (coverage, dock_inside, dock_position, dock_side, flight_plan,
+                         resize_about_center, square_at)
 
-ORB_SIZE = ORB_SIZE_BIG   # window width and height at home, logical px (96 DPI)
 ORB_MARGIN = 16           # logical px from the work area's right and bottom edges
-ORB_BACKGROUND = "#05080f"
+MIN_SIZE = (1, 1)         # pywebview's default min_size (200, 100) clamps every resize
+MAXIMIZED = 0.9           # a target covering this much of its work area is "maximized"
+ELEMENT_PAD = 24          # logical px around a click point used as its element rect
+# Windows the orb never follows: the taskbar/desktop shell and Task Manager
+# (MistAI's own windows, the orb and its panels are excluded by handle/PID).
+SHELL_CLASSES = frozenset({"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW",
+                           "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
+                           "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow"})
+IGNORED_PROCESSES = ("taskmgr",)
+# MistAI's dedicated browser is Playwright's Firefox, run from its own folder.
+PLAYWRIGHT_PATH_HINTS = ("ms-playwright", ".local-browsers")
 
 WDA_MONITOR = 0x1
 WDA_EXCLUDEFROMCAPTURE = 0x11
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
+WS_EX_APPWINDOW = 0x00040000
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020     # with LAYERED: clicks pass through
 LWA_ALPHA = 0x2
@@ -51,6 +64,8 @@ MONITOR_DEFAULTTONEAREST = 2
 MONITOR_DEFAULTTOPRIMARY = 1
 HWND_TOPMOST = -1
 SWP_NOACTIVATE = 0x0010
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
 
 
 def orb_state(api):
@@ -107,12 +122,13 @@ class OrbBridge:
 
 # -- geometry (pure) ------------------------------------------------------------
 
-def place(work, scale, size=ORB_SIZE, margin=ORB_MARGIN):
+def place(work, scale, size=None, margin=ORB_MARGIN):
     """(x, y, side) in physical px: a square of ``size * scale`` with
     ``margin * scale`` to the right and bottom edges of ``work`` (l, t, r, b),
     shrunk and clamped so it always lies fully inside the work area."""
     l, t, r, b = (int(v) for v in work)
     scale = scale if scale and scale > 0 else 1.0
+    size = orb_sizes()[0] if size is None else size
     avail_w, avail_h = max(1, r - l), max(1, b - t)
     side = max(1, min(int(round(size * scale)), avail_w, avail_h))
     gap = max(0, min(int(round(margin * scale)), avail_w - side, avail_h - side))
@@ -128,9 +144,10 @@ def ellipse_box(width, height):
 def size_for(state, docked=False):
     """Logical side for a state: small while docked beside the task's window,
     medium while thinking or speaking, big when idle or listening."""
+    big, medium, small = orb_sizes()
     if docked:
-        return ORB_SIZE_SMALL
-    return ORB_SIZE_MEDIUM if state in ("thinking", "speaking") else ORB_SIZE_BIG
+        return small
+    return medium if state in ("thinking", "speaking") else big
 
 
 # -- Win32 (ctypes; tests pass a fake with the same methods) --------------------
@@ -193,8 +210,57 @@ class Win32:
     def exstyle(self, hwnd):
         return self.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
 
+    def set_exstyle(self, hwnd, add=0, remove=0):
+        style = self.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        self.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (style | add) & ~remove)
+
+    def move_only(self, hwnd, x, y):
+        """Position only: no resize, no z-order change, no activation."""
+        return bool(self.user32.SetWindowPos(hwnd, None, x, y, 0, 0,
+                                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+
     def foreground(self):
         return self.user32.GetForegroundWindow()
+
+    def is_minimized(self, hwnd):
+        return bool(self.user32.IsIconic(hwnd))
+
+    def window_info(self, hwnd):
+        """(pid, process name, window class) of a window; never raises."""
+        try:
+            import psutil
+            import win32gui
+            import win32process
+
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            return pid, psutil.Process(pid).name(), win32gui.GetClassName(hwnd)
+        except Exception:
+            return 0, "", ""
+
+    def browser_window(self):
+        """The visible top-level window of MistAI's Playwright Firefox, or None."""
+        try:
+            import psutil
+            import win32gui
+            import win32process
+
+            found = []
+
+            def visit(hwnd, _):
+                if found or not win32gui.IsWindowVisible(hwnd) or not win32gui.GetWindowText(hwnd):
+                    return True
+                try:
+                    exe = psutil.Process(win32process.GetWindowThreadProcessId(hwnd)[1]).exe()
+                except Exception:
+                    return True
+                if any(h in exe.lower() for h in PLAYWRIGHT_PATH_HINTS):
+                    found.append(hwnd)
+                return True
+
+            win32gui.EnumWindows(visit, None)
+            return found[0] if found else None
+        except Exception:
+            return None
 
     def monitor_for_rect(self, rect):
         """(work area, scale) of the monitor nearest ``rect`` (l, t, r, b)."""
@@ -248,10 +314,13 @@ class Win32:
         self.gdi32.DeleteObject(handle)
 
 
-def apply_square(win, hwnd, x, y, side):
-    """Move/resize the window to the square and cut a new circle for it.
-    True when both applied; never raises, never logs (callers log once)."""
+def apply_square(win, hwnd, x, y, side, last_side=None):
+    """Put the window on the square. Same side as ``last_side``: a plain
+    move (SetWindowPos SWP_NOSIZE), no region work. A new side: resize, then
+    cut a circle for that size. True when applied; never raises or logs."""
     try:
+        if last_side is not None and side == last_side:
+            return bool(win.move_only(hwnd, x, y))
         ok = win.move(hwnd, x, y, side, side)
         region = win.create_ellipse(ellipse_box(side, side))
         if not region:
@@ -265,32 +334,46 @@ def apply_square(win, hwnd, x, y, side):
 
 
 class Tween:
-    """Plays a list of squares on a worker thread, one per frame. A new
-    play() (or cancel()) stops the one before at its next frame."""
+    """Plays flight segments [(from, to, seconds, bow), ...] on a worker
+    thread at about 60 fps, positions from elapsed time (so a slow frame
+    never slows the flight). A frame with an unchanged side only moves the
+    window; the region is recut only when the side changes. A new play()
+    (or cancel()) stops the one before at its next frame."""
 
-    FRAME_S = 0.016
+    FRAME_S = 1 / 60
 
-    def __init__(self, win, hwnd):
-        self._win, self._hwnd = win, hwnd
+    def __init__(self, win, hwnd, clock=time.monotonic):
+        self._win, self._hwnd, self._clock = win, hwnd, clock
         self._stop = None
         self._thread = None
+        self.side = None          # the side last applied (physical px)
 
-    def play(self, squares, on_frame=None, done=None):
+    def play(self, segments, on_frame=None, done=None):
         self.cancel()
         stop = self._stop = threading.Event()
 
         def run():
-            failed = 0
-            for sq in squares:
+            failed = frames_n = 0
+            last = None
+            for start, end, seconds, bow in segments:
+                t0 = self._clock()
+                while not stop.is_set():
+                    t = 1.0 if seconds <= 0 else (self._clock() - t0) / seconds
+                    sq = square_at(start, end, t, bow)
+                    if sq != last:
+                        frames_n += 1
+                        if not apply_square(self._win, self._hwnd, *sq, last_side=self.side):
+                            failed += 1
+                        self.side, last = sq[2], sq
+                        if on_frame:
+                            on_frame(sq)
+                    if t >= 1.0:
+                        break
+                    stop.wait(self.FRAME_S)
                 if stop.is_set():
                     return
-                if not apply_square(self._win, self._hwnd, *sq):
-                    failed += 1
-                if on_frame:
-                    on_frame(sq)
-                stop.wait(self.FRAME_S)
             if failed:
-                print(f"[FloatingOrb] tween: {failed} of {len(squares)} frames failed")
+                print(f"[FloatingOrb] tween: {failed} of {frames_n} frames failed")
             if done and not stop.is_set():
                 done()
 
@@ -353,6 +436,26 @@ def guard_mouse_activate(hwnd, run_on_ui=None):
         return False
 
 
+def hide_from_taskbar(hwnd, win, tag):
+    """WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE on, WS_EX_APPWINDOW off, then hide
+    and re-show without activating: the taskbar and Alt-Tab only re-read a
+    window's styles when it is shown, so bits set on a visible WinForms form
+    (ShowInTaskbar is True by default) leave its button in place. Returns
+    True when the read-back has both bits and no APPWINDOW."""
+    try:
+        win.set_exstyle(hwnd, add=WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, remove=WS_EX_APPWINDOW)
+        win.show(hwnd, False)
+        win.show(hwnd, True)
+        style = win.exstyle(hwnd)
+        ok = bool(style & WS_EX_TOOLWINDOW and style & WS_EX_NOACTIVATE
+                  and not style & WS_EX_APPWINDOW)
+        print(f"[{tag}] taskbar: {'hidden' if ok else 'still listed'}")
+        return ok
+    except Exception as e:
+        print(f"[{tag}] SetWindowLongW error ({type(e).__name__})")
+        return False
+
+
 def _fail(call, win):
     """Log a failed Win32 call by name and GetLastError() code only."""
     try:
@@ -374,7 +477,10 @@ def harden(hwnd, win=None):
         print(f"[FloatingOrb] Win32 unavailable ({type(e).__name__})")
         return out
     try:
-        if win.set_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
+        if orb_debug_capture():
+            out["capture"] = "debug-visible"
+            print("[FloatingOrb] capture exclusion off (MISTAI_ORB_DEBUG_CAPTURE)")
+        elif win.set_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
             out["capture"] = "excluded"
         elif win.set_affinity(hwnd, WDA_MONITOR):
             out["capture"] = "black"
@@ -382,12 +488,9 @@ def harden(hwnd, win=None):
             _fail("SetWindowDisplayAffinity", win)
     except Exception as e:
         print(f"[FloatingOrb] SetWindowDisplayAffinity error ({type(e).__name__})")
-    try:
-        win.add_exstyle(hwnd, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-        out["noactivate"] = True
-    except Exception as e:
-        print(f"[FloatingOrb] SetWindowLongW error ({type(e).__name__})")
+    out["noactivate"] = hide_from_taskbar(hwnd, win, "FloatingOrb")
     scale = 1.0
+    side = None
     try:
         monitor, work = win.primary_work_area()
         scale = win.monitor_scale(monitor, hwnd) or 1.0
@@ -397,13 +500,17 @@ def harden(hwnd, win=None):
     except Exception as e:
         print(f"[FloatingOrb] placement error ({type(e).__name__})")
     try:
-        rect = win.window_rect(hwnd)       # the real size after the move
+        rect = win.window_rect(hwnd)       # the ACTUAL size after the move
         if rect is None:
             _fail("GetWindowRect", win)
             return out
         l, t, r, b = rect
         out["position"] = (l, t, r - l, b - t, round(scale, 2))
-        print(f"[FloatingOrb] at {l},{t} size {r - l},{b - t} monitor-scale {scale:.2f}")
+        req = f"{side},{side}" if side else "none"
+        print(f"[FloatingOrb] at {l},{t} requested {req} actual {r - l},{b - t} "
+              f"monitor-scale {scale:.2f}")
+        if side and (r - l, b - t) != (side, side):
+            print("[FloatingOrb] actual size differs from the requested size")
         region = win.create_ellipse(ellipse_box(r - l, b - t))
         if not region:
             _fail("CreateEllipticRgn", win)
@@ -417,7 +524,7 @@ def harden(hwnd, win=None):
     return out
 
 
-def _corner_position(size=ORB_SIZE, win=None):
+def _corner_position(size=None, win=None):
     """Create-time (x, y) in LOGICAL px near the work area's bottom-right
     corner. pywebview multiplies create-time x/y by the display scale, so the
     physical spot from place() is divided by it; in a DPI-unaware context the
@@ -453,12 +560,21 @@ class FloatingOrb:
         self.dock = None          # side docked on ("right", ...) or None
         self._logged_dock = None
         self.click_through = False
-        self._cur_target = None   # this tick's (rect, work, scale) or None
+        self._cur_target = None   # this tick's target dict or None
+        self._logged_target = None
         self.panels = None        # core.orb_panels.OrbPanels once used
+        self.aborted = False      # the task failed, paused or was stopped
+        self._was_busy = False
+        self._busy_since = 0.0
+        self._kick = threading.Event()     # tick now (a step just ran)
+        self._fast_until = 0.0             # poll faster after a step
+        self._acted = False                # the task has run an action
+        self._last_action = ""             # its most recent action id
+        self._pre_task_fg = None           # the window in front when it started
 
     TICK_S = 0.25
-    TWEEN_FRAMES = 8
-    FLIGHT_FRAMES = 22
+    FAST_TICK_S = 0.1
+    LAUNCH_POLL_S = 2.0
 
     def _flight_on(self):
         try:
@@ -472,21 +588,102 @@ class FloatingOrb:
         except Exception:
             return False
 
+    def _element_rect(self, window_rect, scale):
+        """The rect the current task's last click touched (a UIA control's
+        rect, else a box around the click point), if it was made during this
+        task and lies in ``window_rect``; else None."""
+        best = None
+        for owner in (getattr(self._api, "click_handler", None),
+                      getattr(self._api, "uia_nav", None)):
+            got = getattr(owner, "last_element_rect", None)
+            if got and (best is None or got[1] > best[1]):
+                best = got
+        if not best or best[1] < self._busy_since:
+            return None
+        rect = tuple(int(v) for v in best[0])
+        if len(rect) == 2:                           # a click point
+            pad = round(ELEMENT_PAD * scale)
+            rect = (rect[0] - pad, rect[1] - pad, rect[0] + pad, rect[1] + pad)
+        wl, wt, wr, wb = window_rect
+        cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+        return rect if wl <= cx <= wr and wt <= cy <= wb else None
+
+    def _ignored(self, hwnd):
+        """MistAI's own windows (main window, orb, panels, its PID), the
+        taskbar/desktop shell and Task Manager are never a target."""
+        if not hwnd or hwnd in self.handles():
+            return True
+        try:
+            if hwnd == self._api._own_window_handle():
+                return True
+        except Exception:
+            pass
+        pid, name, cls = self._win.window_info(hwnd)
+        if cls in SHELL_CLASSES:
+            return True
+        from .config import is_self_process, process_matches
+
+        try:
+            if is_self_process(name, pid):
+                return True
+        except Exception:
+            pass
+        return any(process_matches(p, name) for p in IGNORED_PROCESSES)
+
     def _target(self):
-        """(rect, work area, scale) of the window this phase opened or
-        switched to, while it is in front; else None. Like
-        Api._click_target_rect, but quiet (it runs four times a second)."""
-        app = getattr(self._api, "_last_opened_app", None)
-        if not app:
-            return None
-        hwnd = self._win.foreground()
-        if not hwnd or hwnd in self.handles() or not self._api._window_belongs_to(hwnd, app):
-            return None
+        """(target dict or None, reason label). Only after the task's first
+        action. browser_* steps: MistAI's own browser window ("browser").
+        Otherwise the window in front ("foreground"), unless it is one of
+        ours, the shell or Task Manager ("no-window"), or it is the same
+        window that was in front before the task and not the app the step
+        opened or switched to ("unrelated-window": the user's own window).
+        {"rect", "work", "scale", "inside", "element"}; a window covering
+        MAXIMIZED of its work area is docked inside, beside the element the
+        step touched. Quiet: it runs up to ten times a second."""
+        if not self._acted:
+            return None, "no-action-yet"
+        why = "foreground"
+        hwnd = None
+        if self._last_action.startswith("browser_"):
+            hwnd = self._win.browser_window()
+            why = "browser"
+        if not hwnd:
+            why = "foreground"
+            hwnd = self._win.foreground()
+            if self._ignored(hwnd):
+                return None, "no-window"
+            app = getattr(self._api, "_last_opened_app", None)
+            touched = False
+            if app:
+                try:
+                    touched = bool(self._api._window_belongs_to(hwnd, app))
+                except Exception:
+                    touched = False
+            if hwnd == self._pre_task_fg and not touched:
+                return None, "unrelated-window"
         rect = self._win.window_rect(hwnd)
         if not rect:
-            return None
+            return None, "no-rect"
         work, scale = self._win.monitor_for_rect(rect)
-        return rect, work, scale or 1.0
+        scale = scale or 1.0
+        target = {"rect": tuple(rect), "work": tuple(work), "scale": scale,
+                  "inside": coverage(rect, work) >= MAXIMIZED, "element": None}
+        if not target["inside"]:
+            return target, why
+        target["element"] = self._element_rect(rect, scale)
+        return target, ("maximized-element" if target["element"] else "maximized-edge")
+
+    def _log_target(self, target, why):
+        key = (why, target and target["rect"], target and target["element"])
+        if key != self._logged_target:
+            self._logged_target = key
+            if target:
+                l, t, r, b = target["rect"]
+                el = target["element"]
+                el_txt = f" element {el[0]},{el[1]},{el[2]},{el[3]}" if el else ""
+                print(f"[FloatingOrb] target {why} rect {l},{t},{r},{b}{el_txt}")
+            else:
+                print(f"[FloatingOrb] target none ({why})")
 
     def _here_scale(self):
         try:
@@ -505,16 +702,51 @@ class FloatingOrb:
         self.dock = None
         if not self._flight_on():
             return resize_about_center(x, y, side, round(size_for(state) * self.scale))
+        if self.aborted or self._stop_requested():
+            return self.home                         # failed, paused or stopped: home now
         busy = self._busy()
         target = self._cur_target
+        _big, medium, small_l = orb_sizes()
         if target:
-            rect, work, scale = target
-            small = max(1, round(ORB_SIZE_SMALL * scale))
-            self.dock = dock_side(rect, work, small, 8)
-            return dock_position(rect, work, small) + (small,)
+            rect, work, scale = target["rect"], target["work"], target["scale"]
+            small = max(1, round(small_l * scale))
+            if target["inside"]:
+                self.dock = "element" if target["element"] else "inner-edge"
+                pos = dock_inside(rect, work, small, target["element"],
+                                  near=(x + side / 2, y + side / 2))
+            else:
+                self.dock = dock_side(rect, work, small, 8)
+                pos = dock_position(rect, work, small)
+            return pos + (small,)
         if busy or state == "speaking":
-            return resize_about_center(x, y, side, round(ORB_SIZE_MEDIUM * self._here_scale()))
+            # No target yet (or it left the front): stay where it is.
+            return resize_about_center(x, y, side, round(medium * self._here_scale()))
         return self.home
+
+    def _stop_requested(self):
+        try:
+            return self._api._stop_requested.is_set()
+        except Exception:
+            return False
+
+    def _on_bus(self, ev):
+        """Bus subscriber (fast): a step ran -> tick now (and poll faster
+        after a launch); a task failed or paused, or the network sentence ->
+        go home."""
+        try:
+            name, data = ev.name, ev.data or {}
+            if name in (events.ACTION_EXECUTED, events.ACTION_FAILED):
+                # After every step: re-check now, then every 0.1 s for a while
+                # (the foreground can change a moment later, e.g. a launch).
+                self._acted = True
+                self._last_action = str(data.get("action", ""))
+                self._fast_until = time.monotonic() + self.LAUNCH_POLL_S
+            if name in (events.TASK_FAILED, events.TASK_PAUSED) or (
+                    name == events.AGENT_STEP and data.get("action") == "failed"):
+                self.aborted = True
+            self._kick.set()
+        except Exception:
+            pass
 
     def _sync_panels(self, busy):
         """Task panels (Settings "Task panels"): created on first use, placed
@@ -531,13 +763,22 @@ class FloatingOrb:
             from .orb_panels import OrbPanels
 
             self.panels = OrbPanels(self._api, self._win)
-        if self._cur_target:
-            rect, work, scale = self._cur_target
-        else:
-            x, y, s = self.square
-            rect = None
-            work, scale = self._win.monitor_for_rect((x, y, x + s, y + s))
-        self.panels.update(self.square, rect, work, scale or self.scale, busy)
+        x, y, s = self.square
+        rect = self._cur_target["rect"] if self._cur_target else None
+        work, scale = self._win.monitor_for_rect((x, y, x + s, y + s))
+        avoid = [r for r in (rect, self._own_rect()) if r]
+        self.panels.update(self.square, rect, work, scale or self.scale, busy,
+                           avoid=avoid, ended=self.aborted or self._stop_requested())
+
+    def _own_rect(self):
+        """MistAI's own main window rect while it is not minimized, else None."""
+        try:
+            hwnd = self._api._own_window_handle()
+            if hwnd and not self._win.is_minimized(hwnd):
+                return self._win.window_rect(hwnd)
+        except Exception:
+            pass
+        return None
 
     def _sync_click_through(self):
         """Click-through while flight is on and the agent acts, so the orb can
@@ -574,12 +815,23 @@ class FloatingOrb:
         try:
             if not (self.visible and self.square and self._tween):
                 return
-            self._sync_click_through()
             busy = self._busy()
+            if busy and not self._was_busy:          # a new task
+                self.aborted = False
+                self._busy_since = time.monotonic()
+                self._acted, self._last_action = False, ""
+                try:
+                    self._pre_task_fg = self._win.foreground()
+                except Exception:
+                    self._pre_task_fg = None
+            self._was_busy = busy
+            self._sync_click_through()
             try:
-                self._cur_target = self._target() if busy else None
+                self._cur_target, why = self._target() if busy else (None, "idle")
             except Exception:
-                self._cur_target = None
+                self._cur_target, why = None, "error"
+            if busy and self._flight_on():
+                self._log_target(self._cur_target, why)
             self._sync_panels(busy)
             if self._tween.running:
                 return
@@ -590,11 +842,7 @@ class FloatingOrb:
                 print(f"[FloatingOrb] dock {self.dock or 'none'} size {goal[2]}")
             if max(abs(a - b) for a, b in zip(goal, self.square)) <= 2:
                 return
-            (x0, y0, s0), (x1, y1, s1) = self.square, goal
-            far = abs((x1 + s1 / 2) - (x0 + s0 / 2)) + abs((y1 + s1 / 2) - (y0 + s0 / 2)) > s0
-            path = frames(self.square, goal, self.FLIGHT_FRAMES if far else self.TWEEN_FRAMES,
-                          bow=0.3 if far else 0.0)
-            self._tween.play(path, on_frame=self._set_square)
+            self._tween.play(flight_plan(self.square, goal), on_frame=self._set_square)
         except Exception as e:
             print(f"[FloatingOrb] tick error ({type(e).__name__})")
 
@@ -602,7 +850,10 @@ class FloatingOrb:
         self.square = sq
 
     def _run(self):
-        while not self._loop_stop.wait(self.TICK_S):
+        while not self._loop_stop.is_set():
+            fast = time.monotonic() < self._fast_until
+            self._kick.wait(self.FAST_TICK_S if fast else self.TICK_S)
+            self._kick.clear()
             self.tick()
 
     def _module(self):
@@ -622,9 +873,10 @@ class FloatingOrb:
                 x, y = _corner_position()
                 self.window = self._module().create_window(
                     "", html=html, js_api=OrbBridge(self._api),
-                    width=ORB_SIZE, height=ORB_SIZE, x=x, y=y,
+                    width=orb_sizes()[0], height=orb_sizes()[0], x=x, y=y,
+                    min_size=MIN_SIZE,
                     resizable=False, frameless=True, easy_drag=True, shadow=False,
-                    focus=False, on_top=True, background_color=ORB_BACKGROUND,
+                    focus=False, on_top=True, background_color=orb_background(),
                 )
                 self.window.events.shown += self._on_shown
             else:
@@ -666,6 +918,14 @@ class FloatingOrb:
                 except Exception:
                     return
                 self._tween = Tween(self._win, self.hwnd)
+                self._tween.side = w
+                try:
+                    for name in (events.ACTION_EXECUTED, events.ACTION_FAILED,
+                                 events.TASK_FAILED,
+                                 events.TASK_PAUSED, events.AGENT_STEP):
+                        self._api.bus.subscribe(name, self._on_bus)
+                except Exception:
+                    pass
                 threading.Thread(target=self._run, daemon=True, name="OrbControl").start()
 
     def _guard_clicks(self):

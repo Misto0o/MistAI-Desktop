@@ -886,6 +886,8 @@ class ImprovedClickHandler:
                 return False
 
             self._show_debug_marker(x, y)
+            # The floating orb docks beside what the task touches (a point here).
+            self.last_element_rect = ((x, y), time.monotonic())
 
             pyautogui.moveTo(x, y, duration=0.2)
             time.sleep(0.1)

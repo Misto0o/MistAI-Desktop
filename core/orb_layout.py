@@ -119,3 +119,144 @@ def panel_stack(orb, sizes, work, target_rect=None, gap=8):
         out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
         y += h + gap
     return out
+
+
+# -- time-based flights (fix: smooth movement) ------------------------------------------
+
+def square_at(start, end, t, bow=0.0):
+    """The square at progress ``t`` (0..1, eased with smoothstep) on the
+    path from ``start`` to ``end``: a quadratic arc bowed upward by ``bow``
+    x the distance (0 = straight); the side is interpolated."""
+    t = min(1.0, max(0.0, float(t)))
+    e = t * t * (3 - 2 * t)
+    (x0, y0, s0), (x1, y1, s1) = start, end
+    dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0 - bow * dist
+    u = 1 - e
+    x = u * u * x0 + 2 * u * e * cx + e * e * x1
+    y = u * u * y0 + 2 * u * e * cy + e * e * y1
+    return int(round(x)), int(round(y)), max(1, int(round(s0 + (s1 - s0) * e)))
+
+
+RESIZE_S = 0.12
+FLIGHT_S = 0.5
+NUDGE_S = 0.2
+
+
+def flight_plan(start, goal):
+    """Segments [(from, to, seconds, bow), ...] from ``start`` to ``goal``.
+    A short move or a pure resize is one straight segment. A flight keeps
+    the size fixed while it moves (so the window is only moved, never
+    resized, mid-flight): shrinking happens before take-off, growing after
+    landing, each as a short resize about the center."""
+    (x0, y0, s0), (x1, y1, s1) = start, goal
+    far = abs((x1 + s1 / 2) - (x0 + s0 / 2)) + abs((y1 + s1 / 2) - (y0 + s0 / 2)) > s0
+    if not far:
+        return [(start, goal, NUDGE_S, 0.0)]
+    if s1 < s0:                                   # shrink first, then fly small
+        shrunk = resize_about_center(x0, y0, s0, s1)
+        segs = [(start, shrunk, RESIZE_S, 0.0)] if shrunk != start else []
+        return segs + [(shrunk, goal, FLIGHT_S, 0.3)]
+    # fly at the current size to where the goal's center is, then grow
+    landing = resize_about_center(x1, y1, s1, s0)
+    segs = [(start, landing, FLIGHT_S, 0.3)]
+    return segs + ([(landing, goal, RESIZE_S, 0.0)] if landing != goal else [])
+
+
+# -- maximized targets (fix: follow the element, not the screen corner) -------------------
+
+def coverage(rect, work):
+    """Fraction of ``work`` covered by ``rect`` (0..1)."""
+    l, t, r, b = _clip([int(v) for v in rect], [int(v) for v in work])
+    area = max(1, (work[2] - work[0]) * (work[3] - work[1]))
+    return max(0, r - l) * max(0, b - t) / area
+
+
+def dock_inside(window_rect, work, side, element=None, near=None, gap=8):
+    """(x, y) for a small orb INSIDE a (maximized) window. With ``element``
+    (the rect the current step touches): beside it on the emptier side
+    (right/left by the room inside the window, then below/above), not over
+    it when a side fits. Without one: against the window's inner edge
+    nearest ``near`` (the orb's current center), at that point along it.
+    Always inside both the window and the work area."""
+    area = _clip([int(v) for v in window_rect], [int(v) for v in work])
+    al, at, ar, ab = area
+    if ar - al < 1 or ab - at < 1:
+        al, at, ar, ab = (int(v) for v in work)
+    side = max(1, min(int(side), ar - al, ab - at))
+    if element is not None:
+        el, et, er, eb = _clip([int(v) for v in element], (al, at, ar, ab))
+        need = side + 2 * gap
+        room = {"right": ar - er, "left": el - al, "below": ab - eb, "above": et - at}
+        y_mid = _clamp((et + eb) // 2 - side // 2, at, ab - side)
+        x_mid = _clamp((el + er) // 2 - side // 2, al, ar - side)
+        horiz = max(("right", "left"), key=lambda k: room[k])
+        vert = max(("below", "above"), key=lambda k: room[k])
+        for where in (horiz, vert):
+            if room[where] >= need:
+                x, y = {"right": (er + gap, y_mid), "left": (el - gap - side, y_mid),
+                        "below": (x_mid, eb + gap), "above": (x_mid, et - gap - side)}[where]
+                return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+        x, y = er + gap, y_mid                     # no room anywhere: as close as fits
+        return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+    cx, cy = near if near is not None else ((al + ar) / 2.0, (at + ab) / 2.0)
+    dists = {"left": cx - al, "right": ar - cx, "top": cy - at, "bottom": ab - cy}
+    edge = min(dists, key=dists.get)
+    x = _clamp(int(cx - side / 2), al + gap, ar - side - gap)
+    y = _clamp(int(cy - side / 2), at + gap, ab - side - gap)
+    if edge == "left":
+        x = al + gap
+    elif edge == "right":
+        x = ar - side - gap
+    elif edge == "top":
+        y = at + gap
+    else:
+        y = ab - side - gap
+    return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+
+
+def panel_spots(orb, sizes, work, target_rect=None, avoid=(), gap=8):
+    """Like panel_stack, but searches for a spot where no panel overlaps any
+    rect in ``avoid`` (the target, MistAI's own window) or the orb itself:
+    the side away from the target, then the other side, each level with the
+    orb's top, its bottom, the work area's bottom and top; then below and
+    above the orb. When none is clear: panel_stack's away side. Always
+    inside ``work``."""
+    first = panel_stack(orb, sizes, work, target_rect, gap)
+    if not avoid or not sizes:
+        return first
+    wl, wt, wr, wb = (int(v) for v in work)
+    ox, oy, s = orb
+    total = sum(h for _w, h in sizes) + gap * (len(sizes) - 1)
+    away_right = first[0][0] >= ox + s
+
+    def column(right, y0):
+        out, y = [], _clamp(y0, wt, wb - total)
+        for w, h in sizes:
+            x = ox + s + gap if right else ox - gap - w
+            out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
+            y += h + gap
+        return out
+
+    def row(y0):
+        out, y = [], y0
+        for w, h in sizes:
+            x = ox if away_right else ox + s - w
+            out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
+            y += h + gap
+        return out
+
+    cands = [first]
+    for right in (away_right, not away_right):
+        for y0 in (oy, oy + s - total, wb - total, wt):
+            cands.append(column(right, y0))
+    cands += [row(oy + s + gap), row(oy - gap - total)]
+    blockers = [a for a in avoid if a] + [(ox, oy, ox + s, oy + s)]
+
+    def clear(spots):
+        rects = [(x, y, x + w, y + h) for (x, y), (w, h) in zip(spots, sizes)]
+        if any(overlaps(a, b) for i, a in enumerate(rects) for b in rects[i + 1:]):
+            return False
+        return not any(overlaps(r, a) for r in rects for a in blockers)
+
+    return next((c for c in cands if clear(c)), first)
