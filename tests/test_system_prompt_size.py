@@ -35,14 +35,15 @@ STATES = {
         convo="\nRECENT CONVERSATION:\n  user: what's the weather\n  you: Sunny, 21 C.\n"),
 }
 
-# Recorded from the indented template (before the strip) for each state.
+# Recorded from the indented template (before the strip) for each state;
+# updated on purpose for the batched-steps LOOP rule (default on).
 PROMPT_HASHES = {
-    "plain": "b70e4626c79a0ad1bdd95b837f6e13752d681da70175b5141508cf4e44d2a9a8",
-    "project": "14bf4ebadea8204c28d82568639a52a63f4a42b08c8a583602fc2944af93d2c8",
-    "long-screen": "4091e80dca8b0f861bca8c3e84bdecf0478e076eddfb72ae9728745c3fbab97a",
-    "hints-and-conversation": "74c4f120c52ef09247cdfb41df5a68962c63c1eed40869b28381791501b9f09d",
+    "plain": "7fdac63552afdd3cd7923e7a136463fb2ee4b2690aa7c912ac227cd37a3a363a",
+    "project": "8189cbf282aac2b5e0352441eea70b706395ee1b5dbbe81f1b95f4f239dc3be5",
+    "long-screen": "3e1c4d84c25ee91546b4f1038e4071b6a69167b7a64e80dcc889ec32f5400f07",
+    "hints-and-conversation": "95447f8efd581d1af97b6b1ed83b55f535e4d82e69c717ffeabc2c300898c469",
 }
-PLAIN_LENGTH = 20749            # 24,189 with the indented template
+PLAIN_LENGTH = 20945            # 20,749 before the batched-steps rule (MISTAI_BATCH_STEPS)
 
 
 def build(state):

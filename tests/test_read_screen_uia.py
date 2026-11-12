@@ -13,6 +13,9 @@ from core.api import Api
 @pytest.fixture(autouse=True)
 def _no_trace(monkeypatch):
     monkeypatch.delenv("MISTAI_TRACE_READS", raising=False)
+    # These pin vision beside the text (what UIA-first leaves for visual or
+    # thin reads); tests/test_uia_first.py covers the default.
+    monkeypatch.setenv("MISTAI_UIA_FIRST", "0")
 
 
 def _api(vision_reply, exact=("", "", False), ready=True):

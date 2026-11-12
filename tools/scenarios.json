@@ -369,7 +369,7 @@
       "stub": [
         [
           {
-            "action": "switch_app",
+            "action": "open_app",
             "parameter": "calculator",
             "speech": ""
           },
@@ -390,8 +390,20 @@
       },
       "expect": {
         "success": true,
-        "actions_include": [
-          "switch_app"
+        "process_started": [
+          "calculator"
+        ],
+        "any_of": [
+          {
+            "actions_include": [
+              "open_app"
+            ]
+          },
+          {
+            "actions_include": [
+              "switch_app"
+            ]
+          }
         ],
         "actions_exclude": [
           "ask_user"

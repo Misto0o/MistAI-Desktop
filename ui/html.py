@@ -66,6 +66,7 @@ header{
 
 .center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px;position:relative;min-width:0}
 
+/* orb:start (ORB_HTML reuses this block) */
 .orb-wrap{width:150px;height:150px;position:relative}
 .orb{
   width:100%;height:100%;border-radius:50%;position:relative;
@@ -93,6 +94,28 @@ header{
 }
 .orb.busy{animation:breathe 1.1s ease-in-out infinite, pulse-hot 1.1s ease-in-out infinite}
 @keyframes pulse-hot{0%,100%{box-shadow:0 0 30px rgba(0,217,255,0.6),0 0 70px rgba(0,217,255,0.25)}50%{box-shadow:0 0 45px rgba(0,217,255,1),0 0 100px rgba(0,217,255,0.5)}}
+/* Orb states (data-state on .orb-wrap, set by setOrb): idle breathes (above),
+   listening pulses, thinking swirls, speaking ripples. */
+.orb-swirl{position:absolute;inset:0;border-radius:50%;opacity:0;transition:opacity .4s;pointer-events:none;
+  background:conic-gradient(from 0deg,rgba(255,255,255,0) 0deg,rgba(186,140,255,0.75) 90deg,rgba(255,255,255,0) 180deg,rgba(127,245,255,0.7) 270deg,rgba(255,255,255,0) 360deg);
+  mix-blend-mode:screen}
+.orb-ripple{position:absolute;inset:0;border-radius:50%;border:2px solid rgba(127,245,255,0.7);opacity:0;pointer-events:none}
+.orb-wrap[data-state="listening"] .orb{animation:orb-listen .9s ease-in-out infinite;
+  box-shadow:0 0 40px rgba(127,245,255,0.9),0 0 90px rgba(0,217,255,0.45),inset 0 0 20px rgba(255,255,255,0.5)}
+.orb-wrap[data-state="thinking"] .orb{animation:breathe 1.6s ease-in-out infinite}
+.orb-wrap[data-state="thinking"] .orb-swirl{opacity:1;animation:ring-spin 1.4s linear infinite}
+.orb-wrap[data-state="speaking"] .orb{animation:breathe 1.2s ease-in-out infinite}
+.orb-wrap[data-state="speaking"] .orb-ripple{animation:orb-ripple 1.8s ease-out infinite}
+.orb-wrap[data-state="speaking"] .orb-ripple.r2{animation-delay:.9s}
+@keyframes orb-listen{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+@keyframes orb-ripple{0%{transform:scale(1);opacity:.7}100%{transform:scale(1.6);opacity:0}}
+@media (prefers-reduced-motion: reduce){
+  .orb,.orb-swirl,.orb-ripple,.orb-wrap::before,.orb-wrap::after,.wave span{animation:none !important}
+  .orb-wrap[data-state="thinking"] .orb-swirl{opacity:.6}
+  .orb-wrap[data-state="speaking"] .orb-ripple{opacity:.5;transform:scale(1.15)}
+  .orb-wrap[data-state="speaking"] .orb-ripple.r2{opacity:0}
+}
+/* orb:end */
 
 .wave{display:flex;align-items:center;gap:3px;height:20px;opacity:0;transition:opacity .3s}
 .wave span{width:3px;background:rgba(255,255,255,0.85);border-radius:2px;animation:wave-bar 0.9s ease-in-out infinite}
@@ -212,6 +235,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
       <div class="card-title">System</div>
       <div class="toggle-row"><span>Wake word (beta)</span><div class="sw" id="sw-wake"></div></div>
       <div class="toggle-row"><span>Captions</span><div class="sw" id="sw-cap"></div></div>
+      <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works"></div></div>
     </div>
 
     <div class="card">
@@ -234,8 +258,10 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
   </div>
 
   <div class="center">
-    <div class="orb-wrap">
+    <div class="orb-wrap" id="orb-wrap" data-state="idle">
+      <span class="orb-ripple"></span><span class="orb-ripple r2"></span>
       <div class="orb" id="orb">
+        <div class="orb-swirl"></div>
         <div class="wave" id="wave"><span></span><span></span><span></span><span></span><span></span></div>
       </div>
     </div>
@@ -313,6 +339,7 @@ let busy=false,wakeOn=false,capOn=false,ready=false;
 let sendInFlight=false,stopping=false;
 const chat=document.getElementById('chat'),inp=document.getElementById('inp');
 const btnSend=document.getElementById('btn-send'),orb=document.getElementById('orb');
+const orbWrap=document.getElementById('orb-wrap');
 const swWake=document.getElementById('sw-wake');
 const swCap=document.getElementById('sw-cap'),wave=document.getElementById('wave');
 const selGender=document.getElementById('sel-gender'),selModel=document.getElementById('sel-model');
@@ -351,6 +378,7 @@ window.addEventListener('pywebviewready',()=>{
   runStep('models',loadModels);
   runStep('stats',updateStats);
   runStep('status',checkStatus);
+  runStep('orb',loadOrbSetting);
 });
 
 // Developer-only controls stay hidden (and unused) unless Python says this is
@@ -447,6 +475,21 @@ swWake.onclick=toggleWake;
 // "Didn't catch that") replaces the status line for a few seconds.
 const PTT_NOTE_MS=3000,PTT_SAFETY_MS=45000;
 let pttState='idle',pttNoteTimer=null,pttSafetyTimer=null;
+// The orb shows one state from what the page knows: the push-to-talk mic
+// (handleListenState), Mist's voice (is_agent_busy().speaking, polled) and a
+// running task (busy). The mic wins, then the voice, then the task.
+let speaking=false;
+function orbState(s){
+  if(s.ptt==='waiting'||s.ptt==='listening')return 'listening';
+  if(s.speaking)return 'speaking';
+  if(s.busy)return 'thinking';
+  return 'idle';
+}
+function setOrb(){
+  const state=orbState({ptt:pttState,speaking:speaking,busy:busy});
+  orbWrap.dataset.state=state;
+  return state;
+}
 function showPttNote(text){
   clearTimeout(pttNoteTimer);
   setMistStatus('notice',String(text));
@@ -465,6 +508,7 @@ function handleListenState(state,message){
   if(pttState!=='idle')pttSafetyTimer=setTimeout(()=>handleListenState('idle',''),PTT_SAFETY_MS);
   if(pttState==='idle'&&message)showPttNote(message);
   else{clearTimeout(pttNoteTimer);pttNoteTimer=null;restoreStatus();}
+  setOrb();
 }
 btnPtt.onclick=async()=>{
   if(!ready)return;
@@ -487,6 +531,25 @@ async function toggleCaptions(){
 }
 swCap.onclick=toggleCaptions;
 ctrlCaption.onclick=toggleCaptions;
+
+// Floating orb (off by default): Python saves the setting and shows or hides
+// a small always-on-top window with only the orb (core/floating_orb.py).
+const swOrb=document.getElementById('sw-orb');
+let orbOn=false;
+async function loadOrbSetting(){
+  if(typeof pywebview.api.get_floating_orb!=='function')return;
+  orbOn=!!(await pywebview.api.get_floating_orb());
+  swOrb.classList.toggle('on',orbOn);
+}
+swOrb.onclick=async()=>{
+  if(!ready)return;
+  try{
+    const r=await pywebview.api.set_floating_orb(!orbOn);
+    orbOn=!!(r&&r.enabled);
+    swOrb.classList.toggle('on',orbOn);
+    if(r&&r.error)addMsg('Floating orb: '+r.error,'error');
+  }catch(e){console.error('Floating orb toggle error:',e);}
+};
 
 function showAskUserPrompt(question){
   addMsg(question, 'assistant');
@@ -770,6 +833,7 @@ function setBusy(b){
   btnSend.disabled=inp.disabled=b;
   orb.classList.toggle('busy',b);
   restoreStatus();
+  setOrb();
 }
 
 // Reconcile the UI with the runtime's actual agent state. Voice-initiated
@@ -779,6 +843,8 @@ async function syncBusy(){
   if(!ready)return;
   try{
     const s=await pywebview.api.is_agent_busy();
+    speaking=!!s.speaking;
+    setOrb();
     if(s.busy){
       if(!busy && inp.dataset.answering!=="true") setBusy(true);
     }else{
@@ -900,3 +966,51 @@ btnStop.onclick = async () => {
 </script>
 </body>
 </html>"""
+
+
+def _orb_css():
+    """The main page's orb CSS block (between the orb:start / orb:end markers)."""
+    return HTML[HTML.index("/* orb:start"):HTML.index("/* orb:end */")]
+
+
+# The floating orb window (core/floating_orb.py): only the orb, no fonts, no
+# external resources; its js_api is OrbBridge, whose one method is orb_state().
+ORB_HTML = (
+    """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title></title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05080f}
+body{display:flex;align-items:center;justify-content:center;user-select:none;-webkit-user-select:none;cursor:default}
+"""
+    + _orb_css()
+    + """.orb-wrap{width:64px;height:64px}
+.orb-wrap::before{inset:-9px}
+.orb-wrap::after{inset:-18px}
+</style>
+</head>
+<body>
+<div class="orb-wrap" id="orb-wrap" data-state="idle">
+  <span class="orb-ripple"></span><span class="orb-ripple r2"></span>
+  <div class="orb" id="orb"><div class="orb-swirl"></div></div>
+</div>
+<script>
+window.addEventListener('pywebviewready',()=>{
+  const wrap=document.getElementById('orb-wrap');
+  const STATES=['idle','listening','thinking','speaking'];
+  async function poll(){
+    try{
+      const s=await pywebview.api.orb_state();
+      const st=String(s&&s.state||'idle');
+      wrap.dataset.state=STATES.includes(st)?st:'idle';
+    }catch(e){}
+  }
+  poll();
+  setInterval(poll,500);
+});
+</script>
+</body>
+</html>"""
+)

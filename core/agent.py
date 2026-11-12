@@ -20,14 +20,16 @@ from . import planner
 from .api_manager import describe_api_error
 from .executor import Executor
 from .config import (BACKEND_LIMIT_WARN_RATIO, BACKEND_MESSAGES_LIMIT, BACKEND_SYSTEM_LIMIT,
+                     BATCH_MAX_STEPS, BATCHABLE_ACTIONS, batch_steps_enabled,
                      confirm_listen_profile, confirmation_answer, credential_failure_reason,
                      injection_flags, scrub_outbound, scrub_outbound_enabled,
                      send_is_grounded,
-                     lazy_vision_mode,
+                     lazy_vision_mode, uia_first_enabled,
                      log_text, skip_verified_read_enabled, step_param_for_log, verbose_logs,
                      vision_gating_enabled)
 from .live_state import describe_open_apps
 from .tools import CLICK_FAMILY, READ_RESULT_CHARS
+from .uia_text import text_is_sufficient
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
 # on screen (core/api.py read_screen_text).
@@ -515,6 +517,19 @@ class AgentLoop:
         except Exception:
             return set()
 
+    def _batch_target_in_front(self):
+        """Before a queued batch step: the app this phase opened or switched
+        to is still in front (True when no target is known yet). A failed
+        check stops the batch."""
+        target = getattr(self.api, "_last_opened_app", None)
+        check = getattr(self.api, "_foreground_process_matches", None)
+        if not target or not callable(check):
+            return True
+        try:
+            return bool(check(target))
+        except Exception:
+            return False
+
     def _current_foreground_key(self):
         """(hwnd, title) of the window in front right now (the live snapshot
         can lag), for the identical-input cap."""
@@ -844,6 +859,8 @@ class AgentLoop:
         unsubmitted = False  # type_text ran and no key/click submitted it yet
         read_after_unsubmitted = False  # the last read happened in that state
         done_reminded = False
+        batch_queue = []  # the rest of a batched reply (MISTAI_BATCH_STEPS)
+        batch_ok = False  # the previous queued step executed cleanly
 
         print(f"\n[AgentLoop] Task: {log_text(task)}")
         if self.api.caption_window and self.api.captions_enabled:
@@ -858,180 +875,206 @@ class AgentLoop:
                 # starts, so a stop reaches every remaining phase of a plan.
                 return {"success": False, "error": "Stopped by user"}
 
+            # --- BATCHED STEPS: run the next queued step of the model's last
+            # reply only if the previous one executed cleanly and the phase's
+            # input target is still in front; otherwise drop the rest.
+            queued = None
+            if batch_queue:
+                if batch_ok and self._batch_target_in_front():
+                    queued = batch_queue.pop(0)
+                else:
+                    left = ", ".join(f"{s['action']}({str(s['parameter'])[:40]})"
+                                     for s in batch_queue)
+                    print(f"  [Batch] stopped: {len(batch_queue)} step(s) not run")
+                    history.append({"role": "user", "content": (
+                        f"[OBSERVATION] Batch stopped; these steps were NOT run: {left}. "
+                        "Decide the next step from the current state.")})
+                    batch_queue = []
+            batch_ok = False
             steps_taken += 1
             snap = self.api.live.snapshot
             step_times = {}
 
-            if gating:
-                fg_key = self._foreground_key(snap)
-                if screen_stale:
-                    read_reason = "first read" if screen_cache_key is None else "after a UI action"
-                elif fg_key != screen_cache_key:
-                    read_reason = "foreground changed" + (  # the title is content
-                        f" to {fg_key[1]!r}" if verbose_logs() else "")
-                elif time.monotonic() - screen_cache_time > self.GATED_CACHE_SECONDS:
-                    read_reason = "cache expired"
-                else:
-                    read_reason = ""
-                need_read = bool(read_reason)
-                if need_read:
-                    print(f"  [Screen] re-read: {read_reason}")
-            else:
-                need_read = screen_cache_age == 0 or screen_cache_age > cache_ttl
-            skip_now, verified_read_skip = verified_read_skip, False
-            if need_read:
-                t0 = time.monotonic()
-                if lazy_first and first_read:
-                    print(
-                        "  [Screen] lazy first read: title + Open apps"
-                        + (" + UIA" if lazy_first == 1 else "") + ", no vision"
-                    )
-                    screen_context = self._get_screen_context(lazy=lazy_first)
-                elif skip_now:
-                    print("  [Screen] after a verified launch: title + Open apps, no vision")
-                    screen_context = self._get_screen_context(lazy=2)
-                else:
-                    screen_context = self._get_screen_context()
-                first_read = False
-                self.record_time("screen", time.monotonic() - t0, step_times)
-                screen_cache = screen_context
-                # The context is fresh now. Zero means "no cache" and would
-                # immediately trigger a second vision/UIA read next step.
-                screen_cache_age = 1
+            if queued is None:
                 if gating:
-                    screen_stale = False
-                    # Key on the window the read actually saw.
-                    screen_cache_key = self._foreground_key(self.api.live.snapshot)
-                    screen_cache_time = time.monotonic()
-            else:
-                screen_context = screen_cache
-                screen_cache_age += 1
-
-            # Outbound scrub: the screen context and observations (screen text,
-            # read results, command output, page text) leave the device with
-            # secrets redacted; the task and the user's answers are untouched.
-            # history itself keeps the raw text (old reads are shrunk in it).
-            system = self._build_system(
-                gender, snap, self._scrubbed(screen_context, scrub_cache), last_action,
-                task_hints, convo_block
-            )
-
-            messages = (
-                [{"role": "user", "content": task}]
-                + [self._scrubbed_message(m, scrub_cache) for m in history]
-                + [
-                    {
-                        "role": "user",
-                        "content": "What is your next action? Reply with JSON only.",
-                    }
-                ]
-            )
-
-            llm_t0 = time.monotonic()
-            try:
-                headers = self.api.api_manager.get_headers()
-                url = self.api.api_manager.get_api_url()
-
-                request_data = {
-                    # Compatibility field required by older API validation.
-                    # It deliberately contains only the task; system/history
-                    # remain in their real structured fields below.
-                    "message": task,
-                    "model": model,
-                    "mode": "agent",
-                    # Structured form: real system prompt + real roles.
-                    "system": system,
-                    "messages": messages,
-                }
-
-                self._check_request_size(system, messages)
-                r = _post(url, json=request_data, headers=headers, timeout=30)
-
-                if not r.ok:
-                    primary_status = r.status_code
-                    primary_response = r
-                    print(
-                        f"[AgentLoop] Primary API {r.status_code}, trying fallback..."
-                    )
-                    fallback_url = self.api.api_manager.get_fallback_url()
-                    if fallback_url and fallback_url != url:
-                        r = _post(
-                            fallback_url,
-                            json=request_data,
-                            headers=headers,
-                            timeout=30,
+                    fg_key = self._foreground_key(snap)
+                    if screen_stale:
+                        read_reason = "first read" if screen_cache_key is None else "after a UI action"
+                    elif fg_key != screen_cache_key:
+                        read_reason = "foreground changed" + (  # the title is content
+                            f" to {fg_key[1]!r}" if verbose_logs() else "")
+                    elif time.monotonic() - screen_cache_time > self.GATED_CACHE_SECONDS:
+                        read_reason = "cache expired"
+                    else:
+                        read_reason = ""
+                    need_read = bool(read_reason)
+                    if need_read:
+                        print(f"  [Screen] re-read: {read_reason}")
+                else:
+                    need_read = screen_cache_age == 0 or screen_cache_age > cache_ttl
+                skip_now, verified_read_skip = verified_read_skip, False
+                if need_read:
+                    t0 = time.monotonic()
+                    if lazy_first and first_read:
+                        print(
+                            "  [Screen] lazy first read: title + Open apps"
+                            + (" + UIA" if lazy_first == 1 else "") + ", no vision"
                         )
+                        screen_context = self._get_screen_context(lazy=lazy_first)
+                    elif skip_now:
+                        print("  [Screen] after a verified launch: title + Open apps, no vision")
+                        screen_context = self._get_screen_context(lazy=2)
+                    else:
+                        screen_context = self._get_screen_context()
+                    first_read = False
+                    self.record_time("screen", time.monotonic() - t0, step_times)
+                    screen_cache = screen_context
+                    # The context is fresh now. Zero means "no cache" and would
+                    # immediately trigger a second vision/UIA read next step.
+                    screen_cache_age = 1
+                    if gating:
+                        screen_stale = False
+                        # Key on the window the read actually saw.
+                        screen_cache_key = self._foreground_key(self.api.live.snapshot)
+                        screen_cache_time = time.monotonic()
+                else:
+                    screen_context = screen_cache
+                    screen_cache_age += 1
 
-                    if not fallback_url or fallback_url == url or not r.ok:
-                        fallback_status = (
-                            r.status_code
-                            if fallback_url and fallback_url != url
-                            else None
-                        )
-                        status_detail = (
-                            f"primary {primary_status}; fallback {fallback_status}"
-                            if fallback_status is not None
-                            else f"primary {primary_status} (no compatible fallback)"
-                        )
-                        print(f"[AgentLoop] API failed: {status_detail}")
-                        # Same model on the fallback URL only; never another
-                        # model. Say what the backend said, plainly.
-                        message = describe_api_error(primary_response, model)
-                        print(f"[AgentLoop] {message}")
-                        if self.api.caption_window and self.api.captions_enabled:
-                            self.api.caption_window.show_error(message, 5)
-                        if input_mode == "voice":
-                            self.api.speak(message)
-                        return {"success": False, "error": message, "speech": message}
-
-                raw = r.json().get("response", "")
-            except Exception as e:
-                # Type and time only: the message can carry the URL.
-                elapsed = time.monotonic() - llm_t0
-                if not _is_network_error(e):
-                    print(f"[AgentLoop] Agent call failed: {type(e).__name__} after {elapsed:.1f}s")
-                    return {"success": False, "error": f"Agent call failed ({type(e).__name__})"}
-                print(f"[AgentLoop] Network error: {type(e).__name__} after {elapsed:.1f}s")
-                if self.api.caption_window and self.api.captions_enabled:
-                    self.api.caption_window.show_error(NETWORK_FAILURE_SPEECH, 5)
-                if input_mode == "voice":
-                    self.api.speak(NETWORK_FAILURE_SPEECH)
-                return {"success": False, "error": NETWORK_FAILURE_SPEECH,
-                        "speech": NETWORK_FAILURE_SPEECH}
-            self.record_time("llm", time.monotonic() - llm_t0, step_times)
-
-            # A model request cannot be forcibly pre-empted, but a Stop that
-            # lands while it is in flight must prevent the returned action
-            # from touching the computer.
-            if self.api._stop_requested.is_set():
-                return {"success": False, "error": "Stopped by user"}
-
-            cmd = self._parse_cmd(raw)
-            if not cmd:
-                if self.api.caption_window and self.api.captions_enabled:
-                    self.api.caption_window.show_error("Could not parse response", 5)
-                return {"success": False, "error": "Could not parse LLM response"}
-
-            if cmd.get("action") == "parse_retry":
-                consecutive_parse_failures += 1
-                if consecutive_parse_failures >= 3:
-                    return {
-                        "success": False,
-                        "error": "Model responses kept failing to parse (3x in a row)",
-                    }
-            else:
-                consecutive_parse_failures = 0
-
-            if cmd.get("action") == "parse_retry":
-                history.append(
-                    {
-                        "role": "user",
-                        "content": "[OBSERVATION] Your last reply was not a single "
-                        "JSON object and was ignored. Reply with EXACTLY: "
-                        '{"thinking":"...","action":"...","parameter":"...","speech":""}',
-                    }
+                # Outbound scrub: the screen context and observations (screen text,
+                # read results, command output, page text) leave the device with
+                # secrets redacted; the task and the user's answers are untouched.
+                # history itself keeps the raw text (old reads are shrunk in it).
+                system = self._build_system(
+                    gender, snap, self._scrubbed(screen_context, scrub_cache), last_action,
+                    task_hints, convo_block
                 )
-                continue
+
+                messages = (
+                    [{"role": "user", "content": task}]
+                    + [self._scrubbed_message(m, scrub_cache) for m in history]
+                    + [
+                        {
+                            "role": "user",
+                            "content": "What is your next action? Reply with JSON only.",
+                        }
+                    ]
+                )
+
+                llm_t0 = time.monotonic()
+                try:
+                    headers = self.api.api_manager.get_headers()
+                    url = self.api.api_manager.get_api_url()
+
+                    request_data = {
+                        # Compatibility field required by older API validation.
+                        # It deliberately contains only the task; system/history
+                        # remain in their real structured fields below.
+                        "message": task,
+                        "model": model,
+                        "mode": "agent",
+                        # Structured form: real system prompt + real roles.
+                        "system": system,
+                        "messages": messages,
+                    }
+
+                    self._check_request_size(system, messages)
+                    r = _post(url, json=request_data, headers=headers, timeout=30)
+
+                    if not r.ok:
+                        primary_status = r.status_code
+                        primary_response = r
+                        print(
+                            f"[AgentLoop] Primary API {r.status_code}, trying fallback..."
+                        )
+                        fallback_url = self.api.api_manager.get_fallback_url()
+                        if fallback_url and fallback_url != url:
+                            r = _post(
+                                fallback_url,
+                                json=request_data,
+                                headers=headers,
+                                timeout=30,
+                            )
+
+                        if not fallback_url or fallback_url == url or not r.ok:
+                            fallback_status = (
+                                r.status_code
+                                if fallback_url and fallback_url != url
+                                else None
+                            )
+                            status_detail = (
+                                f"primary {primary_status}; fallback {fallback_status}"
+                                if fallback_status is not None
+                                else f"primary {primary_status} (no compatible fallback)"
+                            )
+                            print(f"[AgentLoop] API failed: {status_detail}")
+                            # Same model on the fallback URL only; never another
+                            # model. Say what the backend said, plainly.
+                            message = describe_api_error(primary_response, model)
+                            print(f"[AgentLoop] {message}")
+                            if self.api.caption_window and self.api.captions_enabled:
+                                self.api.caption_window.show_error(message, 5)
+                            if input_mode == "voice":
+                                self.api.speak(message)
+                            return {"success": False, "error": message, "speech": message}
+
+                    raw = r.json().get("response", "")
+                except Exception as e:
+                    # Type and time only: the message can carry the URL.
+                    elapsed = time.monotonic() - llm_t0
+                    if not _is_network_error(e):
+                        print(f"[AgentLoop] Agent call failed: {type(e).__name__} after {elapsed:.1f}s")
+                        return {"success": False, "error": f"Agent call failed ({type(e).__name__})"}
+                    print(f"[AgentLoop] Network error: {type(e).__name__} after {elapsed:.1f}s")
+                    if self.api.caption_window and self.api.captions_enabled:
+                        self.api.caption_window.show_error(NETWORK_FAILURE_SPEECH, 5)
+                    if input_mode == "voice":
+                        self.api.speak(NETWORK_FAILURE_SPEECH)
+                    return {"success": False, "error": NETWORK_FAILURE_SPEECH,
+                            "speech": NETWORK_FAILURE_SPEECH}
+                self.record_time("llm", time.monotonic() - llm_t0, step_times)
+
+                # A model request cannot be forcibly pre-empted, but a Stop that
+                # lands while it is in flight must prevent the returned action
+                # from touching the computer.
+                if self.api._stop_requested.is_set():
+                    return {"success": False, "error": "Stopped by user"}
+
+                cmd = self._parse_cmd(raw)
+                if not cmd:
+                    if self.api.caption_window and self.api.captions_enabled:
+                        self.api.caption_window.show_error("Could not parse response", 5)
+                    return {"success": False, "error": "Could not parse LLM response"}
+
+                if cmd.get("action") == "parse_retry":
+                    consecutive_parse_failures += 1
+                    if consecutive_parse_failures >= 3:
+                        return {
+                            "success": False,
+                            "error": "Model responses kept failing to parse (3x in a row)",
+                        }
+                else:
+                    consecutive_parse_failures = 0
+
+                if cmd.get("action") == "parse_retry":
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": cmd.get("retry_note") or (
+                                "[OBSERVATION] Your last reply was not a single "
+                                "JSON object and was ignored. Reply with EXACTLY: "
+                                '{"thinking":"...","action":"...","parameter":"...","speech":""}'),
+                        }
+                    )
+                    continue
+                batch_queue = cmd.pop("_batch", None) or []
+                if batch_queue:
+                    print(f"  [Batch] {len(batch_queue) + 1} steps in one reply")
+            else:
+                cmd = queued
+                # The read after a verified launch was skipped by the batch.
+                verified_read_skip = False
+                print("  [Batch] next step, no model call")
 
             action = cmd.get("action", "none")
             param = cmd.get("parameter", "")
@@ -1645,6 +1688,9 @@ class AgentLoop:
                 print("  [Loop] repeating steps; note added")
                 obs += f" {LOOP_NOTE}"
 
+            batch_ok = bool(
+                success and res.verified is not False and loop_verdict != "warn"
+                and not result_str.startswith(("WARNING", "NOT SENT")))
             history.append({"role": "assistant", "content": json.dumps(cmd)})
             history.append({"role": "user", "content": f"[OBSERVATION] {obs}"})
             if shown_result and result_limit >= READ_RESULT_CHARS:
@@ -1685,6 +1731,9 @@ class AgentLoop:
                 "was taken for this read -- call analyze_screen or read_screen_text "
                 "if you need to see the screen.)"
             )
+        exact = self._exact_text_context()
+        if exact:
+            return exact
         if self.api.vision.ready:
             try:
                 frame = self._vision_frame("screen context")
@@ -1707,6 +1756,28 @@ class AgentLoop:
         fw = snap.get("foreground_window", "Unknown")
         apps = ", ".join(snap.get("open_apps", [])[:3])
         return f"Window: {fw} | Apps: {apps}"
+
+    def _exact_text_context(self):
+        """The per-step context from the foreground native window's own
+        accessibility text when it is sufficient (MISTAI_UIA_FIRST), so no
+        vision call is made; "" otherwise (browsers, MistAI's window, thin or
+        cut text, the phase's app not in front). Never raises."""
+        get = getattr(self.api, "_exact_ui_text", None)
+        if not callable(get) or not uia_first_enabled():
+            return ""
+        try:
+            exact, title, native, kind, _asked = get("", include_browser=False)
+        except Exception:
+            return ""
+        if not (native and kind == "exact" and text_is_sufficient(exact, title)):
+            return ""
+        snap = self.api.live.snapshot
+        fw = snap.get("foreground_window", "Unknown")
+        apps = describe_open_apps(snap, limit=10) or "none"
+        print("  [Screen] native window: accessibility text, no vision")
+        return (f"Window: {fw} | Open apps: {apps} | EXACT UI TEXT: {exact} | (No screenshot "
+                "was taken for this read -- call analyze_screen or read_screen_text if you "
+                "need to see the screen.)")
 
     def _uia_summary_within(self, budget):
         """_uia_summary(), or None if it takes longer than ``budget`` seconds."""
@@ -1838,6 +1909,16 @@ class AgentLoop:
         except Exception:
             known_folders = "unavailable"
 
+        loop_rule = (
+            "- You work in a LOOP: one action per reply, then observe its result. Only a "
+            "predictable input sequence (open_app/switch_app, type_text, press_key, hotkey) "
+            'may share one reply as {"thinking":"...","steps":[{"action":"...","parameter":'
+            f'"..."}}, ...]}} (2-{BATCH_MAX_STEPS} steps, no reads, no done); it stops at the '
+            "first failure or question."
+            if batch_steps_enabled() else
+            "- You work in a LOOP. Each iteration, analyze the screen and decide exactly ONE "
+            "action. Observe the result before proceeding.")
+
         return f"""You are MistAI, a JARVIS-like desktop AI assistant with FULL system-level control.
 
 CURRENT DATE/TIME: {now_str}
@@ -1858,7 +1939,7 @@ keys and UIA cannot do it, or the rare canvas-only page with no real DOM element
 6. click_coords -- LAST RESORT ONLY, using exact coordinates verified via read_screen_text.
 
 OPERATING RULES:
-- You work in a LOOP. Each iteration, analyze the screen and decide exactly ONE action. Observe the result before proceeding.
+{loop_rule}
 - Never guess or hallucinate elements — use what you see on the screen right now.
 - NEVER assume an unknown app/project name refers to something specific
 (a VS Code project, a particular folder, etc) without real evidence.
@@ -2107,6 +2188,38 @@ VS Code evidence; it never creates or edits files.
 RESPONSE FORMAT (JSON ONLY):
 {{"thinking":"brief reasoning","action":"...","parameter":"...","speech":""}}"""
 
+    BATCH_RETRY_NOTE = (
+        "[OBSERVATION] Your \"steps\" list was malformed and NOTHING was run. A batch is "
+        f"2-{BATCH_MAX_STEPS} steps, each {{\"action\",\"parameter\"}}, only "
+        + "/".join(sorted(BATCHABLE_ACTIONS)) + " (no reads, no done, no top-level action). "
+        "Otherwise reply with ONE action: "
+        '{"thinking":"...","action":"...","parameter":"...","speech":""}')
+
+    @classmethod
+    def _batch_cmd(cls, obj):
+        """A {"steps": [...]} reply as its first step plus "_batch" (the rest),
+        or parse_retry with BATCH_RETRY_NOTE when the list is not a valid batch."""
+        steps = obj.get("steps")
+        ok = (isinstance(steps, list) and 2 <= len(steps) <= BATCH_MAX_STEPS
+              and not str(obj.get("action") or "").strip())
+        clean = []
+        for st in steps if ok else []:
+            action = st.get("action") if isinstance(st, dict) else None
+            param = st.get("parameter", "") if isinstance(st, dict) else None
+            if (not isinstance(action, str) or action.strip() not in BATCHABLE_ACTIONS
+                    or isinstance(param, (dict, list))):
+                ok = False
+                break
+            clean.append({"action": action.strip(), "parameter": "" if param is None else param})
+        if not ok:
+            print("  [Batch] malformed steps list -- parse retry")
+            return {"action": "parse_retry", "parameter": "", "speech": "",
+                    "thinking": "Malformed steps list, retrying",
+                    "retry_note": cls.BATCH_RETRY_NOTE}
+        first = dict(clean[0], thinking=obj.get("thinking", ""), speech="")
+        first["_batch"] = clean[1:]
+        return first
+
     def _parse_cmd(self, raw):
         def _action_object(value):
             if not isinstance(value, dict):
@@ -2125,6 +2238,8 @@ RESPONSE FORMAT (JSON ONLY):
         cleaned = cleaned.strip()
         try:
             parsed = json.loads(cleaned)
+            if isinstance(parsed, dict) and "steps" in parsed and batch_steps_enabled():
+                return self._batch_cmd(parsed)
             if isinstance(parsed, list):
                 # Some models wrap a single-object reply in an array.
                 parsed = next((x for x in parsed if isinstance(x, dict)), None)
@@ -2133,6 +2248,15 @@ RESPONSE FORMAT (JSON ONLY):
                 return parsed
             raise ValueError("parsed JSON was not an object")
         except Exception:
+            if '"steps"' in cleaned and batch_steps_enabled():
+                # A batch with text around it: the outermost object, so the
+                # regex below cannot pick out just its first step.
+                try:
+                    outer = json.loads(cleaned[cleaned.find("{"):cleaned.rfind("}") + 1])
+                except Exception:
+                    outer = None
+                if isinstance(outer, dict) and "steps" in outer:
+                    return self._batch_cmd(outer)
             m = re.search(r"\{[^{}]+\}", cleaned, re.DOTALL)
 
             if m:

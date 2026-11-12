@@ -66,6 +66,7 @@ def main():
         resizable=True,
     )
     api._window = window
+    api.start_floating_orb_if_enabled()   # Settings > Floating orb (off by default)
     def _cleanup():
         # Signal all background loops to stop before interpreter teardown
         try:

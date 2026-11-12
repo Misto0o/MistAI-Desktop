@@ -340,12 +340,33 @@ def vision_gating_enabled():
 
 
 def lazy_vision_mode():
-    """MISTAI_LAZY_VISION: how a phase's first screen read is done. 0 (default)
-    = normal (vision); 1 = window title + Open apps + a time-boxed UIA summary;
-    2 = "no first read": title + Open apps only (no UIA walk, no vision)."""
-    if os.environ.get("MISTAI_LAZY_VISION", "").strip() == "2":
+    """MISTAI_LAZY_VISION: how a phase's first screen read is done. 2 (default)
+    = "no first read": title + Open apps only (no UIA walk, no vision); 1 =
+    title + Open apps + a time-boxed UIA summary; 0/off = normal (vision)."""
+    v = os.environ.get("MISTAI_LAZY_VISION", "").strip()
+    if v == "2":
         return 2
-    return 1 if env_flag("MISTAI_LAZY_VISION", False) else 0
+    flag = env_flag("MISTAI_LAZY_VISION", None)
+    return 2 if flag is None else (1 if flag else 0)
+
+
+# Batched steps: one model reply may carry a short "steps" list of these
+# predictable input actions; each still runs through the full per-step path.
+BATCHABLE_ACTIONS = frozenset({"open_app", "switch_app", "type_text", "press_key", "hotkey"})
+BATCH_MAX_STEPS = 4
+
+
+def batch_steps_enabled():
+    """MISTAI_BATCH_STEPS (default on): accept a reply's "steps" list
+    (BATCHABLE_ACTIONS, at most BATCH_MAX_STEPS). 0 = one action per reply."""
+    return env_flag("MISTAI_BATCH_STEPS", True)
+
+
+def uia_first_enabled():
+    """MISTAI_UIA_FIRST (default on): in a native window whose accessibility
+    text is sufficient, read_screen_text and the per-step screen context use
+    that text alone, with no vision call. 0 = vision beside the text, as before."""
+    return env_flag("MISTAI_UIA_FIRST", True)
 
 
 def task_ack_enabled():

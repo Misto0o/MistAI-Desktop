@@ -157,6 +157,8 @@ class ImprovedClickHandler:
         # () -> MistAI's own top-level window handle, or None. Set by Api
         # (Api._own_window_handle); without it, this process's windows are used.
         self.own_window_fn = None
+        # More of MistAI's own windows to mask (the floating orb): () -> [hwnd].
+        self.extra_own_windows_fn = None
         self.last_refusal = ""          # why the last click was not made, if refused
         self._refused = False
 
@@ -279,6 +281,28 @@ class ImprovedClickHandler:
         except Exception as e:
             print(f"[OCR] MistAI-window rect lookup failed: {type(e).__name__}")
         return None
+
+    def _mask_extra_own_windows(self, img):
+        """Black out MistAI's other own windows (extra_own_windows_fn, by
+        handle) in ``img``; the same plausibility check as the main mask."""
+        fn = self.extra_own_windows_fn
+        if fn is None:
+            return img
+        try:
+            import win32gui
+
+            handles = list(fn() or [])
+            rects = [win32gui.GetWindowRect(h) for h in handles
+                     if h and win32gui.IsWindowVisible(h) and not win32gui.IsIconic(h)]
+        except Exception:
+            return img
+        for rect in rects:
+            safe = self._sane_mask_rect(rect, img.shape)
+            if safe:
+                l, t, r, b = safe
+                hh, ww = img.shape[:2]
+                img[max(t, 0):min(b, hh), max(l, 0):min(r, ww)] = 0
+        return img
 
     @staticmethod
     def _own_process_window(win32gui):
@@ -577,6 +601,7 @@ class ImprovedClickHandler:
                 hh, ww = img.shape[:2]
                 l, t, r, b = max(l, 0), max(t, 0), min(r, ww), min(b, hh)
                 img[t:b, l:r] = 0
+            self._mask_extra_own_windows(img)
             img[:80, :] = 0  # browser tab bar / window chrome -- never a target
             return img
 
@@ -803,6 +828,7 @@ class ImprovedClickHandler:
                 h, w = gray.shape
                 l, t, r, b = max(l, 0), max(t, 0), min(r, w), min(b, h)
                 gray[t:b, l:r] = 0
+            self._mask_extra_own_windows(gray)
             data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT,
                                              config="--oem 3 --psm 11")
 

@@ -71,6 +71,7 @@ from .config import (
     strip_wake_prefix,
     task_ack_enabled,
     trace_reads_enabled,
+    uia_first_enabled,
     verbose_logs,
     voice_diag_enabled,
 )
@@ -255,6 +256,8 @@ class Api:
         self.click_handler.target_rect_fn = self._click_target_rect
         # The OCR mask finds MistAI's own window by handle, never by title.
         self.click_handler.own_window_fn = self._own_window_handle
+        # ...and the floating orb (when shown) by its handle too.
+        self.click_handler.extra_own_windows_fn = self._orb_window_handles
         self.uia_nav = EnhancedUIANavigator()
         self.agent = AgentLoop(self, self.uia_nav)
 
@@ -308,13 +311,16 @@ class Api:
     def is_agent_busy(self):
         """Ground truth for 'is Mist doing something': true iff an AgentLoop
         thread currently holds the run gate. The UI polls this instead of
-        inferring idleness from its own request timeouts."""
+        inferring idleness from its own request timeouts; it also reports
+        whether Mist is speaking (the orb)."""
         return {
             "busy": self._agent_lock.locked(),
             "task": (self._agent_task or "")[:80],
             "elapsed": round(time.time() - self._agent_started_at, 1)
             if self._agent_lock.locked() else 0,
             "stop_requested": self._stop_requested.is_set(),
+            # Mist's voice is playing (the page's orb shows "speaking").
+            "speaking": bool(getattr(getattr(self, "tts", None), "speaking", False)),
         }
 
     def stop_current_task(self):
@@ -1381,6 +1387,63 @@ class Api:
             "choices": [{"id": m, "label": MODEL_LABELS.get(m, m)} for m in MODEL_CHOICES],
             "current": self.current_model(),
         }
+
+    # -- Floating orb (Settings, default off; core/floating_orb.py) -----------
+
+    def _floating_orb(self):
+        orb = getattr(self, "_orb", None)
+        if orb is None:
+            from .floating_orb import FloatingOrb
+
+            orb = self._orb = FloatingOrb(self)
+        return orb
+
+    def get_floating_orb(self):
+        """The saved Floating orb setting (off unless turned on)."""
+        try:
+            return str(self.memory.get_profile("floating_orb", "off")) == "on"
+        except Exception:
+            return False
+
+    def set_floating_orb(self, enabled):
+        """Save the setting and show or hide the orb window. A window that
+        cannot be opened turns the setting back off."""
+        enabled = bool(enabled)
+        try:
+            self.memory.set_profile("floating_orb", "on" if enabled else "off")
+        except Exception:
+            return {"success": False, "enabled": self.get_floating_orb(),
+                    "error": "Could not save the setting"}
+        orb = self._floating_orb()
+        if not enabled:
+            orb.hide()
+            return {"success": True, "enabled": False}
+        if orb.show():
+            return {"success": True, "enabled": True}
+        try:
+            self.memory.set_profile("floating_orb", "off")
+        except Exception:
+            pass
+        return {"success": False, "enabled": False, "error": "The orb window could not be opened"}
+
+    def start_floating_orb_if_enabled(self):
+        if self.get_floating_orb():
+            self._floating_orb().show()
+
+    def _orb_window_handles(self):
+        orb = getattr(self, "_orb", None)
+        return orb.handles() if orb is not None else []
+
+    def _orb_in_front(self):
+        handles = self._orb_window_handles()
+        if not handles:
+            return False
+        try:
+            import win32gui
+
+            return win32gui.GetForegroundWindow() in handles
+        except Exception:
+            return False
 
     # -- Ask before sending (quick_message) ------------------------------------
 
@@ -3323,6 +3386,13 @@ class Api:
         input goes to whatever is in front -- except a terminal/shell."""
         target = getattr(self, "_last_opened_app", None)
         if not target:
+            if self._orb_in_front():
+                return (
+                    f"NOT SENT: the {what} was not sent because the window in front is "
+                    "MistAI's own floating orb and no app was opened or switched to. "
+                    "Use open_app / switch_app to the intended app first.",
+                    False,
+                )
             shell = self._foreground_terminal()
             if shell:
                 return (
@@ -3891,12 +3961,29 @@ class Api:
             return f"Error reading screen: {e}", False
 
     def read_screen_text(self, query=""):
-        """Vision's reading of the screen; in a native window also the exact
-        accessibility-tree text, and a NOTE when vision reports numbers the
-        window does not contain. MISTAI_TRACE_READS=1 logs both side by side."""
+        """In a native window whose accessibility text is sufficient and a
+        question that is not about looks (MISTAI_UIA_FIRST, default on): that
+        exact text alone, no vision call. Otherwise vision's reading, in a native
+        window with the exact text beside it and a NOTE when vision reports
+        numbers the window does not contain. MISTAI_TRACE_READS=1 logs both."""
+        from .uia_text import is_visual_question, text_is_sufficient
+
         trace = trace_reads_enabled()
         # UIA first: it is closer in time to the screenshot than the slow vision call.
         exact, title, native, kind, asked = self._exact_ui_text(query, include_browser=trace)
+        if (native and kind in ("exact", "background") and uia_first_enabled()
+                and text_is_sufficient(exact, title) and not is_visual_question(query)):
+            # The window's own text answers it: no screenshot, no vision call.
+            where = ("accessibility tree, exact" if kind == "exact" else
+                     "accessibility tree, exact; this window is NOT in front")
+            print("  [Read] answered from the accessibility text; no vision call")
+            result = (f"EXACT UI TEXT of '{title[:60]}' ({where}): {exact}\n(No screenshot "
+                      "was read. If the answer is not in this text, the window does not show "
+                      "it; for how something looks, ask read_screen_text about its appearance.)")
+            if trace:
+                print(f"[ReadTrace] query={query[:80]!r} | vision=(skipped) | uia={exact[:300]!r}")
+            self.last_result_text = result[:_RESULT_MEMORY_CHARS]
+            return self.last_result_text
         answer, ok = self._vision_read(query)
         result = answer
         if native and exact and kind == "other":

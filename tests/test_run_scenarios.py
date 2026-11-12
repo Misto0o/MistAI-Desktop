@@ -26,12 +26,15 @@ def test_bundled_scenarios_load_and_cover_the_requested_cases():
     assert scenarios["plan-notifications"]["expect"]["nodes_count"] == 1
     assert scenarios["plan-research-write"]["expect"]["node_desc_any"] == ["notepad"]
     assert scenarios["delete-needs-confirmation"]["expect"]["confirmation_asked"] is True
-    # A goal that is only an app's name: switch_app, then done, never ask_user.
+    # A goal that is only an app's name: open_app (it is closed) or switch_app,
+    # Calculator ends up started, then done, never ask_user.
     bare = scenarios["bare-app-name"]
     assert bare["prompt"] == "Calculator"
     assert "ui_input" in bare["tags"]          # it opens a window: never in plain stub runs
-    assert [s["action"] for s in bare["stub"][0]][:2] == ["switch_app", "done"]
-    assert "switch_app" in bare["expect"]["actions_include"]
+    assert [s["action"] for s in bare["stub"][0]][:2] == ["open_app", "done"]
+    assert [alt["actions_include"] for alt in bare["expect"]["any_of"]] == [
+        ["open_app"], ["switch_app"]]
+    assert bare["expect"]["process_started"] == ["calculator"]
     assert "ask_user" in bare["expect"]["actions_exclude"]
     assert {"require_process_absent": "calculator"} in bare["setup"]
     assert bare["cleanup"]["close_new_processes"] == ["calculator"]
@@ -528,3 +531,17 @@ def test_a_scripted_confirmation_goes_through_the_real_yes_no_prompt(tmp_path, c
     assert runner.questions == ["Delete it?"]
     assert shown == ['showConfirmPrompt("Delete it?")', "closeConfirmPrompt()"]
     assert api._notify_js == shown.append                  # restored afterwards
+
+
+def test_bare_app_name_accepts_open_app_or_switch_app_when_calculator_starts():
+    sc = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)}["bare-app-name"]
+    expect = sc["expect"]
+    started = {"process_started": {"calculator": True}}
+    for action in ("open_app", "switch_app"):
+        log = f"  Step 1: {action}('calculator')\n  Step 2: done()\n"
+        assert rs.check_desktop(expect, _outcome(log, end_state=started)) == [], action
+    # Neither action ran, or Calculator never started -> fail.
+    assert rs.check_desktop(expect, _outcome("  Step 1: done()\n", end_state=started))
+    log = "  Step 1: open_app('calculator')\n  Step 2: done()\n"
+    assert rs.check_desktop(expect, _outcome(log, end_state={
+        "process_started": {"calculator": False}}))

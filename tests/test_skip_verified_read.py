@@ -15,7 +15,7 @@ from core.tools import SPECS
 def _run(monkeypatch, script, results=None, in_front=True, gating=True):
     """Scripted phase; returns the list of reads: "vision" or the lazy level."""
     monkeypatch.setenv("MISTAI_VISION_GATING", "1" if gating else "0")
-    monkeypatch.delenv("MISTAI_LAZY_VISION", raising=False)
+    monkeypatch.setenv("MISTAI_LAZY_VISION", "0")   # these tests pin a vision first read
     results = results or {}
     replies = iter([json.dumps({"action": a, "parameter": p}) for a, p in script]
                    + [json.dumps({"action": "done", "speech": "ok"})])

@@ -10,12 +10,14 @@ Password fields are skipped, and a snapshot that looks like it holds a secret
 whose walk ran past the budget once is skipped for the rest of the session.
 """
 
+import re
 import threading
 import time
 
 from .config import secret_text_reason, verbose_logs
 
 TEXT_CONTROL_TYPES = ("Text", "Edit", "Document")
+TEXT_CAP = 300  # chars foreground_uia_text returns by default
 UIA_VALUE_PROPERTY_ID = 30045  # UIA_ValueValuePropertyId
 UIA_IS_PASSWORD_PROPERTY_ID = 30019  # UIA_IsPasswordPropertyId
 MAX_ELEMENTS = 2000
@@ -90,7 +92,34 @@ def _mark_slow(proc):
     print(f"[UIA] skipping {proc}: too slow")
 
 
-def foreground_uia_text(hwnd=None, budget=1.5, cap=300):
+# Questions about how things look, not what text they hold: a screenshot is
+# needed. General words only, never app names.
+_VISUAL_RX = re.compile(
+    r"\b(colou?rs?|red|green|blue|yellow|orange|purple|pink|gr[ae]y|images?|pictures?|"
+    r"photos?|icons?|logos?|thumbnails?|layout|positions?|arranged|aligned|highlighted|"
+    r"bold|italic|underlined|fonts?|shapes?|charts?|graphs?|diagrams?|maps?|"
+    r"looks? like|appearance|screenshot|where on)\b", re.I)
+
+
+def is_visual_question(query):
+    """True when the question is empty (a general description) or about
+    something visual (colours, images, layout...)."""
+    q = str(query or "").strip()
+    return not q or bool(_VISUAL_RX.search(q))
+
+
+def text_is_sufficient(text, title="", cap=TEXT_CAP):
+    """UIA text that can answer a read on its own: it holds at least one
+    element besides the window's own title, and the walk was not cut at
+    ``cap`` (a cut walk may have dropped what the question is about)."""
+    text = str(text or "")
+    if not text.strip() or len(text) >= cap - 3:
+        return False
+    own = " ".join(str(title or "").split()).lower()
+    return any(p.strip() and p.strip().lower() != own for p in text.split(" | "))
+
+
+def foreground_uia_text(hwnd=None, budget=1.5, cap=TEXT_CAP):
     """(text, title) for the foreground window (or ``hwnd``); text is "" when
     UIA found nothing, ran past ``budget`` seconds, the process is on the
     too-slow list, or the text looks like it holds a secret. Never raises."""

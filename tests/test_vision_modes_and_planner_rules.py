@@ -29,9 +29,9 @@ def test_vision_gating_is_on_by_default(monkeypatch, value, gating):
     assert vision_gating_enabled() is gating
 
 
-@pytest.mark.parametrize("value, mode", [(None, 0), ("0", 0), ("junk", 0), ("1", 1),
-                                         ("on", 1), ("2", 2), (" 2 ", 2)])
-def test_lazy_vision_is_off_by_default(monkeypatch, value, mode):
+@pytest.mark.parametrize("value, mode", [(None, 2), ("0", 0), ("off", 0), ("junk", 2),
+                                         ("1", 1), ("on", 1), ("2", 2), (" 2 ", 2)])
+def test_lazy_vision_is_mode_2_by_default(monkeypatch, value, mode):
     if value is None:
         monkeypatch.delenv("MISTAI_LAZY_VISION", raising=False)
     else:
