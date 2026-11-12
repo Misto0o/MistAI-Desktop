@@ -144,6 +144,24 @@ class Memory:
             ).fetchone()
         return row[0] if row else default
 
+    def count_profile_prefix(self, prefix):
+        """How many user_profile keys start with prefix (exact, no LIKE)."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM user_profile WHERE substr(key,1,?)=?",
+                (len(prefix), prefix),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_profile_prefix(self, prefix):
+        """Delete only the user_profile rows whose key starts with prefix."""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM user_profile WHERE substr(key,1,?)=?", (len(prefix), prefix)
+            )
+            self.conn.commit()
+        return cur.rowcount
+
     def remember_fact(self, content, category="general", importance=1):
         kw = _keywords(content)
         with self._lock:

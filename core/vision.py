@@ -19,6 +19,9 @@ except ImportError:
 
 class CohereVision:
     MODEL = "command-a-vision-07-2025"
+    # Frames wider than this are scaled down before they are sent; coordinate
+    # answers are in the pixels of the image sent and are scaled back.
+    MAX_SEND_WIDTH = 1920
 
     def __init__(self):
         self._client = None
@@ -49,11 +52,44 @@ class CohereVision:
     def _b64(self, frame):
         import base64
         buf = io.BytesIO()
-        w, h = frame.size
-        if w > 1920:
-            frame = frame.resize((1920, int(h * 1920 / w)), Image.LANCZOS)
+        size = self._sent_size(frame)
+        if size != frame.size:
+            frame = frame.resize(size, Image.LANCZOS)
         frame.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode()
+
+    def _sent_size(self, frame):
+        """(w, h) of the image _b64 sends for this frame; None if the frame
+        has no size."""
+        try:
+            w, h = frame.size
+        except Exception:
+            return None
+        if w > self.MAX_SEND_WIDTH:
+            return self.MAX_SEND_WIDTH, int(h * self.MAX_SEND_WIDTH / w)
+        return w, h
+
+    def _coord_space(self, frame):
+        """(image_w, image_h, screen_w, screen_h, prompt line) for a
+        coordinate question. The model is told the size of the image it gets
+        (unchanged wording when that is the screen size)."""
+        sw, sh = pyautogui.size()
+        iw, ih = self._sent_size(frame) or (sw, sh)
+        if (iw, ih) == (sw, sh):
+            line = f"Screen resolution: {sw}x{sh}."
+        else:
+            line = f"Image size: {iw}x{ih} pixels (give coordinates in this image's pixels)."
+        return iw, ih, sw, sh, line
+
+    @staticmethod
+    def _to_screen(x, y, iw, ih, sw, sh):
+        """An answer in image pixels -> screen pixels (x * screen / image);
+        None when it lies outside the image."""
+        if not (0 <= x <= iw and 0 <= y <= ih):
+            return None
+        if (iw, ih) == (sw, sh):
+            return (x, y)
+        return (round(x * sw / iw), round(y * sh / ih))
 
     def _call(self, prompt, frame=None):
         if not self.ready:
@@ -121,10 +157,10 @@ class CohereVision:
         if not self.ready:
             return None
         shot = frame or ImageGrab.grab()
-        sw, sh = pyautogui.size()
+        iw, ih, sw, sh, size_line = self._coord_space(shot)
         result = self._call(
             f"Find '{description}' on this screen.\n"
-            f"Screen resolution: {sw}x{sh}.\n"
+            f"{size_line}\n"
             "Reply with ONLY: x,y (pixel coordinates of the center of that element).\n"
             "If not found, reply: NOT_FOUND\n"
             "No explanation. Just coordinates or NOT_FOUND.",
@@ -135,8 +171,7 @@ class CohereVision:
         try:
             parts = result.strip().replace(" ", "").split(",")
             x, y = int(parts[0]), int(parts[1])
-            if 0 <= x <= sw and 0 <= y <= sh:
-                return (x, y)
+            return self._to_screen(x, y, iw, ih, sw, sh)
         except Exception:
             pass
         return None
@@ -145,7 +180,7 @@ class CohereVision:
         if not self.ready:
             return None, None
         shot = frame or ImageGrab.grab()
-        sw, sh = pyautogui.size()
+        iw, ih, sw, sh, size_line = self._coord_space(shot)
         ordinals = [
             "first", "second", "third", "fourth", "fifth",
             "sixth", "seventh", "eighth", "ninth", "tenth",
@@ -153,7 +188,7 @@ class CohereVision:
         ordinal = ordinals[n - 1] if 1 <= n <= len(ordinals) else f"#{n}"
         result = self._call(
             f"Find the {ordinal} {item_type} on this screen.\n"
-            f"Screen resolution: {sw}x{sh}.\n"
+            f"{size_line}\n"
             "Reply with TWO lines:\n"
             "TITLE: <exact full title of the item>\n"
             "COORDS: x,y\n"
@@ -171,8 +206,7 @@ class CohereVision:
                 try:
                     parts = line.split(":", 1)[1].strip().replace(" ", "").split(",")
                     x, y = int(parts[0]), int(parts[1])
-                    if 0 <= x <= sw and 0 <= y <= sh:
-                        coords = (x, y)
+                    coords = self._to_screen(x, y, iw, ih, sw, sh)
                 except Exception:
                     pass
         return title, coords

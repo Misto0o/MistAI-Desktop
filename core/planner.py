@@ -448,7 +448,8 @@ def make_plan(api, goal, model):
     print(f"[Planner] Plan: {len(nodes)} node(s)" + (f" for {log_text(name)}" if name else ""))
     for n in nodes:
         deps = f" <- {n.depends_on}" if n.depends_on else ""
-        print(f"    {n.id}: {n.desc[:60]}{deps}")
+        # The description is made from the user's goal: content (verbose only).
+        print(f"    {n.id}: {log_text(n.desc[:60])}{deps}")
     return Plan(nodes), name
 
 

@@ -327,7 +327,8 @@ def install_stub_fences(stub, plan_reply):
     import core.planner
 
     saved = (core.agent.requests, core.planner._llm, requests.sessions.Session.request)
-    core.agent.requests = SimpleNamespace(post=stub.post)
+    # exceptions: AgentLoop's network-error check reads requests.exceptions.
+    core.agent.requests = SimpleNamespace(post=stub.post, exceptions=requests.exceptions)
     core.planner._llm = lambda *_a, **_k: plan_reply[0]
     original = saved[2]
 
@@ -452,17 +453,18 @@ def running_elevated():
         return False
 
 
-def make_scenario_dir():
-    return tempfile.mkdtemp(prefix=TMP_PREFIX)
+def make_scenario_dir(prefix=TMP_PREFIX):
+    return tempfile.mkdtemp(prefix=prefix)
 
 
-def remove_scenario_dir(path):
-    """Delete only a folder this harness created under %TEMP%."""
+def remove_scenario_dir(path, prefix=TMP_PREFIX):
+    """Delete only a folder this harness created under %TEMP% (its name
+    starts with ``prefix``; tools/live_checks.py uses its own)."""
     root = os.path.realpath(tempfile.gettempdir())
     real = os.path.realpath(path)
     if (
         os.path.dirname(real) != root
-        or not os.path.basename(real).startswith(TMP_PREFIX)
+        or not os.path.basename(real).startswith(prefix)
     ):
         raise RuntimeError(f"refusing to delete {path}: not a harness temp folder")
     shutil.rmtree(real, ignore_errors=True)
@@ -726,20 +728,26 @@ class Runner:
 
     def _confirm_through(self, real_confirm):
         """Confirmations go through the REAL Api.ask_confirmation (its Yes/No
-        prompt); the scripted answer is submitted as the page's text box would."""
+        prompt); the scripted answer is submitted as the page's text box would,
+        or as a click on a button when it reads "button:<answer>" (yes, no,
+        remember). Keyword arguments (offer_remember) are passed through."""
         api = self._api
 
-        def confirm(question, input_mode):
+        def confirm(question, input_mode, **kw):
             notify = api._notify_js
 
             def page(js):
                 notify(js)
                 if js.startswith("showConfirmPrompt("):
-                    api.submit_answer(self._answer(question))
+                    answer = self._answer(question)
+                    if isinstance(answer, str) and answer.startswith("button:"):
+                        api.submit_answer(answer[len("button:"):], "button")
+                    else:
+                        api.submit_answer(answer)
 
             api._notify_js = page
             try:
-                return real_confirm(question, input_mode)
+                return real_confirm(question, input_mode, **kw)
             finally:
                 api._notify_js = notify
 

@@ -6,6 +6,7 @@ import sys
 import os
 import re
 import difflib
+import unicodedata
 import urllib.parse
 
 VERSION = "2.0"
@@ -402,6 +403,82 @@ def confirm_reminimize_enabled():
     return env_flag("MISTAI_CONFIRM_REMINIMIZE", True)
 
 
+# quick_message recipient checks (Api._act_quick_message): vision is asked
+# what the chat header / selected result shows, never told the expected
+# name, and its answer is compared here.
+RECIPIENT_FUZZY_MIN_LEN = 5        # compact length both names need for a fuzzy accept
+RECIPIENT_FUZZY_RATIO = 0.85
+
+
+def normalize_person_name(name):
+    """Casefolded, punctuation and symbols removed, whitespace collapsed."""
+    s = unicodedata.normalize("NFKC", str(name or "")).casefold()
+    s = "".join(" " if ch.isspace() else ch for ch in s
+                if ch.isspace() or unicodedata.category(ch)[0] not in "PS")
+    return " ".join(s.split())
+
+
+def recipient_match(seen, expected):
+    """(matched, exact) for a name vision read against the intended
+    recipient. exact: equal after normalize_person_name. Also accepted (not
+    exact): equal with spaces removed, or, when both compact names have at
+    least RECIPIENT_FUZZY_MIN_LEN characters, a difflib ratio of at least
+    RECIPIENT_FUZZY_RATIO. Empty on either side never matches."""
+    a, b = normalize_person_name(seen), normalize_person_name(expected)
+    if not a or not b:
+        return False, False
+    if a == b:
+        return True, True
+    ca, cb = a.replace(" ", ""), b.replace(" ", "")
+    if ca == cb:
+        return True, False
+    if (min(len(ca), len(cb)) >= RECIPIENT_FUZZY_MIN_LEN
+            and difflib.SequenceMatcher(None, ca, cb).ratio() >= RECIPIENT_FUZZY_RATIO):
+        return True, False
+    return False, False
+
+
+# Ask before sending (quick_message only), profile key "ask_before_sending":
+# set by the Settings page only (Api.set_ask_before_sending), never by the
+# model; read at call time. The page shows these labels and explanations.
+ASK_BEFORE_SENDING_CHOICES = ("always", "when_unsure", "never")
+ASK_BEFORE_SENDING_DEFAULT = "when_unsure"
+ASK_BEFORE_SENDING_LABELS = {
+    "always": "Always ask",
+    "when_unsure": "Ask when unsure",
+    "never": "Never ask",
+}
+ASK_BEFORE_SENDING_HELP = {
+    "always": "Every message waits for your Yes before it is sent.",
+    "when_unsure": ("Asks unless the name and the message are your own words and the "
+                    "chat shows exactly that name."),
+    "never": "Messages are sent without asking (the chat name is still checked).",
+}
+
+
+def ask_before_sending_choice(saved):
+    """A stored ask_before_sending value, or the default when it isn't one
+    of ASK_BEFORE_SENDING_CHOICES."""
+    v = str(saved or "").strip().lower()
+    return v if v in ASK_BEFORE_SENDING_CHOICES else ASK_BEFORE_SENDING_DEFAULT
+
+
+def send_is_grounded(parameter, user_text):
+    """quick_message: are the recipient AND the message both the user's own
+    words? Each, normalized (normalize_person_name), must occur as whole
+    words in the normalized original request. user_text is what the user
+    said or typed, never model text or a phase brief."""
+    parts = [p.strip() for p in str(parameter or "").split("|", 2)]
+    if len(parts) < 3:
+        return False
+    said = f" {normalize_person_name(user_text)} "
+    for piece in parts[1:]:
+        n = normalize_person_name(piece)
+        if not n or f" {n} " not in said:
+            return False
+    return True
+
+
 def voice_diag_enabled():
     """MISTAI_VOICE_DIAG=1: one "[VoiceDiag]" line per _listen_once with
     numbers only (clip length, levels, sample rate, threshold, seconds since
@@ -658,6 +735,98 @@ def secret_file_in(text):
         if token and is_secret_file(token):
             return token
     return None
+
+
+# -- Outbound scrub -------------------------------------------------------------
+# Secrets redacted from what the agent sends to the backend (screen context and
+# observations; never the user's task or answers). Only these shapes, to keep
+# false positives low. Screenshots sent to the vision provider can't be scrubbed.
+_SCRUB_PATTERNS = (
+    ("private_key", re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+        r"(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[\s\S]*$)")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("bearer_token", re.compile(r"(?<=\bBearer )[A-Za-z0-9\-._~+/]{20,}=*")),
+    ("aws_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("google_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}(?![0-9A-Za-z_\-])")),
+    ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b")),
+    ("slack_token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
+)
+# 13-19 digits, optionally in groups split by single spaces or dashes.
+_CARD_RX = re.compile(r"(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])")
+# Card brand prefixes (Visa, Mastercard, Amex, Discover, JCB, Diners): plain
+# 13-19 digit numbers such as timestamps and IDs mostly don't start like this.
+_CARD_PREFIX_RX = re.compile(r"^(?:4|5[1-5]|2[2-7]|3[47]|6(?:011|5)|35|30[0-5]|36|38)")
+
+
+def luhn_ok(digits):
+    """The Luhn checksum of a digit string."""
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d = d * 2 - 9 if d > 4 else d * 2
+        total += d
+    return total % 10 == 0
+
+
+def scrub_outbound(text):
+    """(clean_text, {kind: count}): private key blocks, JWTs, long Bearer
+    tokens, AWS access key ids, Google API keys, GitHub and Slack tokens,
+    and card numbers (13-19 digits, a card prefix and a passing Luhn check)
+    replaced by "[REDACTED:<kind>]"."""
+    text = str(text or "")
+    counts = {}
+
+    def sub(kind, rx, s):
+        def repl(m):
+            counts[kind] = counts.get(kind, 0) + 1
+            return f"[REDACTED:{kind}]"
+        return rx.sub(repl, s)
+
+    for kind, rx in _SCRUB_PATTERNS:
+        text = sub(kind, rx, text)
+
+    def card(m):
+        digits = re.sub(r"[ -]", "", m.group(0))
+        if 13 <= len(digits) <= 19 and _CARD_PREFIX_RX.match(digits) and luhn_ok(digits):
+            counts["card"] = counts.get("card", 0) + 1
+            return "[REDACTED:card]"
+        return m.group(0)
+
+    return _CARD_RX.sub(card, text), counts
+
+
+# -- Instruction-like text in untrusted observations -------------------------
+# Flag only (AgentLoop appends a note); nothing is blocked or rewritten. Each
+# pattern stays inside one sentence (no "." or newline in its gaps), so a long
+# article about prompt injection flags each kind at most once, like a single
+# matching sentence would.
+_INJECTION_PATTERNS = (
+    ("ignore_instructions", re.compile(
+        r"\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+|my\s+)?"
+        r"(?:previous|prior|above|earlier|preceding)\s+(?:instructions|prompts|directions|rules)\b",
+        re.I)),
+    ("role_override", re.compile(r"\byou\s+are\s+now\s+(?:a|an|my|the|dan|in\s+\w+\s+mode)\b", re.I)),
+    ("system_prompt", re.compile(r"\bsystem\s+prompt\b", re.I)),
+    ("send_to_url", re.compile(
+        r"\b(?:send|post|upload|forward|transmit|submit)\b[^.\n]{0,80}?\bto\s+https?://", re.I)),
+    ("run_shell", re.compile(
+        r"\b(?:run|execute|exec)\b[^.\n]{0,60}?"
+        r"\b(?:curl|wget|powershell|pwsh|cmd(?:\.exe)?|iex|invoke-expression)\b", re.I)),
+)
+
+
+def injection_flags(text):
+    """The kinds of instruction-like wording in a text from outside (page
+    text, screen text, file contents, command output), in pattern order."""
+    text = str(text or "")
+    return [kind for kind, rx in _INJECTION_PATTERNS if rx.search(text)]
+
+
+def scrub_outbound_enabled():
+    """MISTAI_SCRUB_OUTBOUND (default on), read at call time."""
+    return env_flag("MISTAI_SCRUB_OUTBOUND", True)
 
 
 def secret_output_reason(command, output=""):

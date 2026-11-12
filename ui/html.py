@@ -289,6 +289,14 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
       <button class="btn-cancel" id="btn-import-facts" title="Add facts from your my_facts.json file">Import my facts</button>
       <div class="card-note" id="facts-note"></div>
     </div>
+    <div style="margin-bottom:12px">
+      <div class="card-title">Ask before sending</div>
+      <!-- Choices and explanations come from Api.get_ask_before_sending_options() (config). -->
+      <select id="sel-send"></select>
+      <div class="card-note" id="send-note"></div>
+      <div class="card-note" id="approvals-note"></div>
+      <button class="btn-cancel" id="btn-forget-approvals" title="Forget every remembered approval">Forget all</button>
+    </div>
     <div class="modal-buttons">
       <button class="btn-save" onclick="saveAPIKey()">Save</button>
       <button class="btn-cancel" onclick="closeAPIModal()">Cancel</button>
@@ -501,6 +509,7 @@ function unlockForAnswer(placeholder){
 // The text box keeps working as for any question.
 let confirmPrompt=null;
 function showConfirmPrompt(question){
+  const offerRemember=arguments[1]===true;   // messages only, from Python
   closeConfirmPrompt();
   const box=addMsg('', 'assistant confirm');
   const q=document.createElement('div');
@@ -508,7 +517,10 @@ function showConfirmPrompt(question){
   box.appendChild(q);
   const row=document.createElement('div');
   row.className='confirm-buttons';
-  for(const [answer,label,cls] of [['yes','Yes','btn-save'],['no','No','btn-cancel']]){
+  // offerRemember: a third button, a yes that Python also remembers for this person.
+  const buttons=[['yes','Yes','btn-save'],['no','No','btn-cancel']];
+  if(offerRemember)buttons.push(['remember','Always for this person','btn-cancel']);
+  for(const [answer,label,cls] of buttons){
     const b=document.createElement('button');
     b.className=cls;b.textContent=label;
     b.onclick=()=>answerConfirm(answer,label);
@@ -536,8 +548,90 @@ async function answerConfirm(answer,label){
   catch(e){addMsg('Error: '+e,'error');}
 }
 
-function openAPIModal(){apiModal.classList.add('open');}
+function openAPIModal(){
+  apiModal.classList.add('open');
+  if(ready){runStep('sending',loadSendSetting);runStep('approvals',loadApprovals);}
+}
 function closeAPIModal(){apiModal.classList.remove('open');}
+
+// Ask before sending (messages only): the choices, labels and explanations
+// come from Python, which also validates and saves the choice; the page only
+// shows labels and sends ids. Loaded when Settings opens.
+const selSend=document.getElementById('sel-send'),sendNote=document.getElementById('send-note');
+let sendHelp=new Map();
+function showSendNote(text,isError){
+  sendNote.textContent=text;
+  sendNote.className='card-note'+(isError?' error':'');
+}
+async function loadSendSetting(){
+  try{
+    const o=await pywebview.api.get_ask_before_sending_options();
+    const choices=(o&&Array.isArray(o.choices))?o.choices:[];
+    if(!choices.length)throw new Error('no choices were returned');
+    selSend.innerHTML='';sendHelp=new Map();
+    for(const c of choices){
+      const opt=document.createElement('option');
+      opt.value=String(c.id);opt.textContent=String(c.label||c.id);
+      sendHelp.set(String(c.id),String(c.help||''));
+      selSend.appendChild(opt);
+    }
+    selSend.value=o.current;
+    showSendNote(sendHelp.get(String(o.current))||'',false);
+  }catch(e){
+    console.error('[send] could not load the setting:',e);
+    showSendNote('Could not load this setting: '+((e&&e.message)||e),true);
+  }
+}
+// Remembered "Always for this person" approvals: only a count is shown.
+const approvalsNote=document.getElementById('approvals-note');
+async function loadApprovals(){
+  try{
+    const n=Number(await pywebview.api.get_remembered_approvals_count())||0;
+    approvalsNote.textContent='Remembered approvals: '+n;
+    approvalsNote.className='card-note';
+  }catch(e){
+    console.error('[approvals] could not load the count:',e);
+    approvalsNote.textContent='Could not load the remembered approvals';
+    approvalsNote.className='card-note error';
+  }
+}
+// Forget all asks first, in the page: the first click arms it, a second
+// click within 5 s forgets; otherwise it disarms.
+const btnForget=document.getElementById('btn-forget-approvals');
+let forgetArmed=null;
+function disarmForget(){
+  if(forgetArmed)clearTimeout(forgetArmed);
+  forgetArmed=null;btnForget.textContent='Forget all';
+}
+btnForget.onclick=async()=>{
+  if(!ready)return;
+  if(!forgetArmed){
+    btnForget.textContent='Click again to forget all';
+    forgetArmed=setTimeout(disarmForget,5000);
+    return;
+  }
+  disarmForget();
+  try{
+    const r=await pywebview.api.forget_remembered_approvals();
+    if(!(r&&r.success))addMsg((r&&r.error)||'Could not forget the approvals','error');
+  }catch(err){console.error('[approvals] forget failed:',err);}
+  await loadApprovals();
+};
+selSend.onchange=async e=>{
+  if(!ready)return;
+  try{
+    const r=await pywebview.api.set_ask_before_sending(e.target.value);
+    if(r&&r.success){
+      showSendNote(String(r.help||''),false);
+    }else{
+      await loadSendSetting();   // show the choice that is really saved
+      showSendNote((r&&r.error)||'Could not save this setting',true);
+    }
+  }catch(err){
+    console.error('[send] save failed:',err);
+    await loadSendSetting();
+  }
+};
 async function saveAPIKey(){
   if(!ready)return;
   const key=document.getElementById('apiKeyInput').value.trim();

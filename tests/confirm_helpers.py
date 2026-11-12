@@ -19,7 +19,7 @@ def bind_confirmation(api):
             setattr(api, name, value)
     api.notified = getattr(api, "notified", [])
 
-    def ask(question, mode):
+    def ask(question, mode, **kw):
         listen = getattr(api, "_listen_once", None)
 
         def notify(js):
@@ -33,7 +33,7 @@ def bind_confirmation(api):
         if listen is not None:
             api._listen_once = lambda timeout=10, stop_event=None, **_k: listen(timeout=timeout)
         try:
-            return Api.ask_confirmation(api, question, mode)
+            return Api.ask_confirmation(api, question, mode, **kw)
         finally:
             if listen is not None:
                 api._listen_once = listen

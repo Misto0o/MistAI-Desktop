@@ -43,3 +43,6 @@ CLAUDE.local.md
 # Moved out of the repo
 handtracking/
 node_modules/
+
+# tools/live_checks.py personal settings (contact names)
+tools/live_checks.local.json

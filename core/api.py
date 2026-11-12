@@ -4,9 +4,12 @@ all subsystems (TTS, vision, memory, agent loop, enhanced utils, etc.) are
 wired together.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -26,6 +29,9 @@ from .api_manager import APIKeyManager, describe_api_error
 from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler
 from .config import (
+    ASK_BEFORE_SENDING_CHOICES,
+    ASK_BEFORE_SENDING_HELP,
+    ASK_BEFORE_SENDING_LABELS,
     DEFAULT_GENDER,
     DEFAULT_HOTKEYS,
     DEFAULT_MODEL,
@@ -42,6 +48,7 @@ from .config import (
     TRACKED_APPS,
     WAKE_WORDS,
     announce_verbose_logs,
+    ask_before_sending_choice,
     blocked_page_reason,
     confirm_listen_profile,
     confirm_reminimize_enabled,
@@ -54,8 +61,10 @@ from .config import (
     log_text,
     my_facts_path,
     narration_mode,
+    normalize_person_name,
     normalize_process_name,
     process_matches,
+    recipient_match,
     restore_after_task_enabled,
     secret_output_reason,
     step_param_for_log,
@@ -92,6 +101,23 @@ except ImportError:
 # Memory bound for handler result text. What the model actually sees per step
 # is the much smaller ToolSpec.result_chars (AgentLoop truncates).
 _RESULT_MEMORY_CHARS = 20_000
+# quick_message recipient checks: vision is asked what is shown, never told
+# the expected name or the message (an "Expected: <name>" invites the model
+# to agree); the answer is compared locally (config.recipient_match).
+QM_SWITCHER_QUESTION = (
+    "The quick-switcher/search box is open. Reply with ONLY the exact name of "
+    "the top highlighted conversation result, as displayed."
+)
+QM_HEADER_QUESTION = (
+    "Reply with ONLY the exact name shown in the header of the currently open "
+    "chat, as displayed."
+)
+# Remembered "Always for this person" approvals (quick_message): profile keys
+# APPROVED_PREFIX + HMAC-SHA256(approval_key, app|recipient), value "1". No
+# name is stored; "approval_key" is a random per-install key.
+APPROVED_PREFIX = "approved:"
+# The final check before Enter failed: names no person.
+QM_UNCONFIRMED_REASON = "I couldn't confirm who this chat is with, so I didn't send it."
 # Appended wherever secret content is withheld from the model.
 _WITHHELD_NOTE = (
     "You cannot see or show this content. Tell the user it was withheld "
@@ -1356,6 +1382,98 @@ class Api:
             "current": self.current_model(),
         }
 
+    # -- Ask before sending (quick_message) ------------------------------------
+
+    def ask_before_sending_mode(self):
+        """The saved ask_before_sending choice, read at call time; anything
+        unreadable or unknown gives the default (config)."""
+        try:
+            saved = self.memory.get_profile("ask_before_sending", None)
+        except Exception as e:
+            print(f"[Settings] Could not read ask_before_sending ({type(e).__name__})")
+            saved = None
+        return ask_before_sending_choice(saved)
+
+    def set_ask_before_sending(self, choice):
+        """From the Settings page only (nothing the model outputs reaches
+        it). Validated here against ASK_BEFORE_SENDING_CHOICES."""
+        v = str(choice or "").strip().lower()
+        if v not in ASK_BEFORE_SENDING_CHOICES:
+            return {"success": False,
+                    "error": f"Unknown choice. Choose one of: {', '.join(ASK_BEFORE_SENDING_CHOICES)}."}
+        self.memory.set_profile("ask_before_sending", v)
+        print(f"[Settings] Ask before sending: {v}")
+        return {"success": True, "current": v, "label": ASK_BEFORE_SENDING_LABELS[v],
+                "help": ASK_BEFORE_SENDING_HELP[v]}
+
+    def get_ask_before_sending_options(self):
+        """Every choice as {id, label, help} (the page shows label and help,
+        sends ids), plus the current id."""
+        return {
+            "choices": [{"id": c, "label": ASK_BEFORE_SENDING_LABELS[c],
+                         "help": ASK_BEFORE_SENDING_HELP[c]}
+                        for c in ASK_BEFORE_SENDING_CHOICES],
+            "current": self.ask_before_sending_mode(),
+        }
+
+    # -- Remembered send approvals ("Always for this person") ------------------
+
+    def _approval_id(self, app, recipient, create=False):
+        """HMAC-SHA256 of app|recipient (both normalized) under this install's
+        random approval_key, hex; None without a key (unless create) or a
+        name. The name itself is never stored."""
+        who = normalize_person_name(recipient)
+        if not who:
+            return None
+        try:
+            key = self.memory.get_profile("approval_key", None)
+            raw = bytes.fromhex(key) if key else None
+        except (ValueError, TypeError):
+            raw = None
+        except Exception as e:
+            print(f"[Confirm] approvals unreadable ({type(e).__name__})")
+            return None
+        if raw is None:
+            if not create:
+                return None
+            key = secrets.token_hex(32)
+            self.memory.set_profile("approval_key", key)
+            raw = bytes.fromhex(key)
+        msg = f"{normalize_person_name(app)}|{who}".encode("utf-8")
+        return hmac.new(raw, msg, hashlib.sha256).hexdigest()
+
+    def remember_send_approval(self, app, recipient):
+        h = self._approval_id(app, recipient, create=True)
+        if h:
+            self.memory.set_profile(APPROVED_PREFIX + h, "1")
+            print("[Confirm] approval remembered")
+        return bool(h)
+
+    def is_send_approved(self, app, recipient):
+        h = self._approval_id(app, recipient)
+        try:
+            return bool(h) and self.memory.get_profile(APPROVED_PREFIX + h, None) is not None
+        except Exception:
+            return False
+
+    def get_remembered_approvals_count(self):
+        """For Settings: only a number."""
+        try:
+            return self.memory.count_profile_prefix(APPROVED_PREFIX)
+        except Exception as e:
+            print(f"[Confirm] approvals unreadable ({type(e).__name__})")
+            return 0
+
+    def forget_remembered_approvals(self):
+        """Deletes the remembered approvals and nothing else (the
+        approval_key and every other profile key stay)."""
+        try:
+            removed = self.memory.delete_profile_prefix(APPROVED_PREFIX)
+        except Exception as e:
+            return {"success": False, "error": f"Could not forget them ({type(e).__name__})."}
+        print(f"[Confirm] remembered approvals forgotten: {removed}")
+        return {"success": True, "removed": removed}
+
     def set_vision_api_key(self, key):
         self.vision.set_api_key(key)
         return {"success": True}
@@ -1386,13 +1504,15 @@ class Api:
     CONFIRM_LISTEN_TIMEOUT = 10
     CONFIRM_TEXT_TIMEOUT = 60
 
-    def ask_confirmation(self, question, input_mode):
+    def ask_confirmation(self, question, input_mode, offer_remember=False):
         """Ask a yes/no question with Yes/No buttons on the page; MistAI's
         window is shown while it is pending. Voice: the question is spoken and
         answered by speech or a button -- a click ends the listen and wins.
         Typed: a button or the text box. Returns (answer, source), source
         "button", "typed" or "voice"; answer None when nothing came. A stop
-        request wakes it (stop_current_task). Never logs the question."""
+        request wakes it (stop_current_task). Never logs the question.
+        offer_remember: also show "Always for this person" (its click answers
+        "remember" from the button)."""
         with self._answer_lock:
             self._pending_answer = self._pending_source = None
             self._answer_event.clear()
@@ -1406,7 +1526,8 @@ class Api:
                     shown = True
                 except Exception as e:
                     print(f"[Confirm] window not shown ({type(e).__name__})")
-            self._notify_js(f'showConfirmPrompt("{esc(question)}")')
+            self._notify_js(f'showConfirmPrompt("{esc(question)}"'
+                            f'{",true" if offer_remember else ""})')
             heard = None
             if input_mode == "voice":
                 self.speak(question)
@@ -2917,9 +3038,11 @@ class Api:
             )
             return False
 
+        self._last_send_exact = False
         # Sending to the wrong person is worse than failing to send. OCR/UIA
         # is unreliable in Electron chat clients, so this fast path requires
-        # configured vision and exact recipient confirmation at both stages.
+        # configured vision and a recipient check at all three stages
+        # (switcher result, header before typing, header before Enter).
         if not self.vision.ready:
             self.last_result_text = (
                 "quick_message refused: recipient verification requires vision, "
@@ -2956,15 +3079,14 @@ class Api:
         time.sleep(0.3)
 
         # Confirm the quick-switcher actually resolved to this person BEFORE
-        # committing. Require ONLY the exact visible name: accepting prose,
-        # prefixes (Ann/Anna), or an uncertain answer would make this a guess.
-        # Vision only: these answers are compared to the name exactly, so the
-        # appended accessibility-tree text of read_screen_text must not be in them.
-        seen, _ = self._vision_read(
-            "The quick-switcher/search box is open. Reply with ONLY the exact "
-            f"name of the top highlighted conversation result. Expected: {recipient}"
-        )
-        if self._normalize_app_name(seen) != self._normalize_app_name(recipient):
+        # committing. Vision is asked only what is shown (never the expected
+        # name) and its answer is compared here (config.recipient_match):
+        # prose, prefixes (Ann/Anna) or an uncertain answer don't match.
+        # Vision only: the appended accessibility-tree text of
+        # read_screen_text must not be in these answers.
+        found, exact_switcher, seen = self._qm_read_name(
+            QM_SWITCHER_QUESTION, recipient, "switcher")
+        if found != "match":
             pyautogui.press("escape")
             self.last_result_text = (
                 f"The quick-switcher's top result could not be verified as "
@@ -2977,19 +3099,36 @@ class Api:
         time.sleep(0.8)
 
         # -- Verify the open conversation before typing the message ---------
-        header, _ = self._vision_read(
-            "Reply with ONLY the exact name shown in the header of the currently "
-            f"open chat. Expected: {recipient}"
-        )
-        rn = self._normalize_app_name(recipient)
-        hn = self._normalize_app_name(header)
-        if not rn or rn != hn:
+        found, exact_header, header = self._qm_read_name(
+            QM_HEADER_QUESTION, recipient, "header")
+        if found != "match":
             self.last_result_text = (
                 f"Opened a conversation, but its header could not be verified as "
                 f"'{recipient}' (saw: {header[:60]}). NOTHING was typed or sent. "
                 "Verify the exact contact name with ask_user before retrying."
             )
             return False
+        # Both checks named exactly this person (a close match is not exact).
+        self._last_send_exact = bool(exact_switcher and exact_header)
+
+        # Ask before sending, "when_unsure": AgentLoop deferred the question
+        # to here, where the exactness of the match is known. It returns
+        # (proceed, asked); nothing is typed unless proceed.
+        hook = getattr(self, "_send_confirm", None)
+        if callable(hook):
+            proceed, asked = hook(self._last_send_exact)
+            if not proceed:
+                self.last_result_text = "Not confirmed. Nothing was typed or sent."
+                return False
+            if asked:
+                # The Yes/No prompt raised MistAI: give the chat the keyboard back.
+                if not (self.switch_to_app(app) and self._foreground_process_matches(app)):
+                    self.last_result_text = (
+                        "After the confirmation the app could not be brought back "
+                        "to the front. Nothing was typed or sent."
+                    )
+                    return False
+                time.sleep(0.3)
 
         if not self.set_clipboard(message):
             self.last_result_text = (
@@ -3002,10 +3141,48 @@ class Api:
         pyautogui.press("delete")
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.2)
+
+        # -- Final check, immediately before the one keystroke that sends ----
+        # One retry when the header can't be read; unreadable twice or a
+        # different name -> Enter is never pressed.
+        found, _, _ = self._qm_read_name(QM_HEADER_QUESTION, recipient, "final",
+                                         retry_unreadable=True)
+        if found != "match":
+            print("[QuickMessage] final check failed; Enter not pressed")
+            self.last_result_text = (
+                f"{QM_UNCONFIRMED_REASON} The message may still be in the chat's "
+                "text box, unsent."
+            )
+            return False
         pyautogui.press("enter")
 
         self.last_result_text = f"Sent to '{recipient}' in {app}"
         return True
+
+    def _qm_read_name(self, question, recipient, label, retry_unreadable=False):
+        """(found, exact, seen) for one quick_message recipient check: found is
+        "match", "mismatch" or "unreadable" (vision failed, nothing readable,
+        or NOT VISIBLE ON SCREEN). With retry_unreadable, an unreadable answer
+        is read once more. Logs the label and verdict only, never a name."""
+        attempts = 2 if retry_unreadable else 1
+        seen, found, exact = "", "unreadable", False
+        for attempt in range(attempts):
+            mark = getattr(getattr(self, "screen", None), "mark_action", None)
+            if callable(mark):
+                mark()      # our own keystrokes changed the screen: no older frame
+            seen, ok = self._vision_read(question)
+            seen = str(seen or "")
+            if not ok or not seen.strip() or NOT_VISIBLE_ON_SCREEN.lower() in seen.lower():
+                found, exact = "unreadable", False
+                print(f"[QuickMessage] {label} check: unreadable"
+                      f"{' (retry)' if attempt else ''}")
+                continue
+            matched, exact = recipient_match(seen, recipient)
+            found = "match" if matched else "mismatch"
+            print(f"[QuickMessage] {label} check: "
+                  f"{'exact' if exact else 'close' if matched else 'no match'}")
+            break
+        return found, exact, seen
 
     def _act_type_search(self, param):
         time.sleep(0.3)
