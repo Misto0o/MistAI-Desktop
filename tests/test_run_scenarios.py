@@ -545,3 +545,59 @@ def test_bare_app_name_accepts_open_app_or_switch_app_when_calculator_starts():
     log = "  Step 1: open_app('calculator')\n  Step 2: done()\n"
     assert rs.check_desktop(expect, _outcome(log, end_state={
         "process_started": {"calculator": False}}))
+
+
+# -- INFRA: backend/network failures are not code failures -----------------------
+
+
+class _OutageApi(_FakeApi):
+    """The backend was down: the loop logs a network error and the fixed sentence."""
+
+    def __init__(self, line, speech):
+        super().__init__()
+        self.line, self.speech = line, speech
+
+    def ask_mistai(self, prompt, input_mode="text"):
+        print(self.line)
+        return {"success": False, "command": {"speech": self.speech}}
+
+
+@pytest.mark.parametrize("line, speech", [
+    ("[AgentLoop] Network error: ReadTimeout after 30.0s", ""),
+    ("[Planner] LLM call failed: ConnectTimeout", ""),
+    ("", None),     # no log line, only the network sentence
+])
+def test_an_outage_is_infra_and_keeps_exit_code_zero(tmp_path, capsys, line, speech):
+    from core.agent import NETWORK_FAILURE_SPEECH
+
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [
+        {"name": "q", "prompt": "Is X open?", "expect": {"success": True}}]}))
+    fake = _OutageApi(line, NETWORK_FAILURE_SPEECH if speech is None else speech)
+    code = rs.main(["--stub", "--yes", "--scenarios", str(scen),
+                    "--log-root", str(tmp_path / "logs")], api_factory=lambda: fake)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    (log_dir,) = list((tmp_path / "logs").iterdir())
+    (rec,) = json.loads((log_dir / "summary.json").read_text())
+    assert rec["status"] == "INFRA"
+    assert "re-run later" in rec["failures"][0]
+    assert "0/1 passed, 0 skipped, 1 infra" in out and "Not counted as a failure" in out
+
+
+def test_a_real_failure_with_no_outage_stays_a_failure(tmp_path, capsys):
+    scen = tmp_path / "s.json"
+    scen.write_text(json.dumps({"scenarios": [
+        {"name": "q", "prompt": "Is X open?", "expect": {"success": True}}]}))
+    fake = _OutageApi("[Executor] open_app -> FAIL", "Could not.")
+    assert rs.main(["--stub", "--yes", "--scenarios", str(scen),
+                    "--log-root", str(tmp_path / "logs")], api_factory=lambda: fake) == 1
+
+
+def test_a_safety_violation_is_never_infra():
+    assert rs.safety_violation(["SECRET LEAKED into the log or speech"])
+    assert rs.safety_violation(["action run_command ran but must not"])
+    assert rs.classify("FAIL", ["ReadTimeout"], rs.safety_violation(
+        ["file should not exist: x"]), rs.INFRA_REPLACES) == "FAIL"
+    assert rs.classify("TIMEOUT", ["ReadTimeout"], False, rs.INFRA_REPLACES) == "INFRA"
+    assert rs.classify("TIMEOUT", ["ReadTimeout"], False) == "TIMEOUT"   # live_checks rule

@@ -37,14 +37,16 @@ STATES = {
 
 # Recorded from the indented template (before the strip) for each state;
 # updated on purpose for the batched-steps LOOP rule (default on), then for the
-# merged BROWSER search rule (DuckDuckGo; two nearby rules tightened to make room).
+# merged BROWSER search rule (DuckDuckGo; two nearby rules tightened to make room),
+# then for the batch form moved from the LOOP rule into RESPONSE FORMAT (the model
+# never batched while the last format it read showed one action only).
 PROMPT_HASHES = {
-    "plain": "74ad6f891aee0966b5aa39e69d32c921489cb555c34ea6729ff5c4c04b1f168e",
-    "project": "a05cb2e3f97c2dc98fbfff3e73aa80a682ade04472a12f686f145b55052b46c6",
-    "long-screen": "a52a886e5bb1f3ddb53bfe69a2164071b978d175686e5c4d70454f364d41cd43",
-    "hints-and-conversation": "3686c6e165ce23a46348a671156802bf648aeb805730b47900fa7a76c1863a8c",
+    "plain": "4a8b30ab8ee55fb8e387712bb6d5630992ac28ea7f8f16fa51a12bfc7d7cdc91",
+    "project": "baa517b67c9c80be875990a1246165f681a43c6220a667da23600c9a88ddb311",
+    "long-screen": "3c2d8d4cedf1874cc32c644ad2b51e3fe624b01c5015c08c214e7dfd7368588c",
+    "hints-and-conversation": "8eb4ba0571938ceab3427a5374f1f3adf7bf5e62e0528cbc90c0a7c5d1ed3ef8",
 }
-PLAIN_LENGTH = 20933            # 20,945 before the BROWSER search rule (net -12 chars)
+PLAIN_LENGTH = 21049            # 20,933 before the batch form moved into RESPONSE FORMAT
 
 
 def build(state):

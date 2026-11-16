@@ -414,9 +414,10 @@ def make_plan(api, goal, model):
                 key = re.sub(r"[^a-z0-9_]", "", dependency.lower())
                 dep_id = aliases.get(key)
                 if not dep_id or dep_id not in ids:
-                    print(
-                        f"[Planner] Unknown dependency '{dependency}' on "
-                        f"'{n.id}' -- discarding malformed plan"
+                    print(  # dependency names come from the model: content
+                        f"[Planner] Unknown dependency "
+                        f"{repr(dependency) + ' on ' + repr(n.id) + ' ' if verbose_logs() else ''}"
+                        f"-- discarding malformed plan"
                     )
                     invalid_dependency = True
                     break
@@ -431,7 +432,8 @@ def make_plan(api, goal, model):
             for i, n in enumerate(nodes):
                 n.depends_on = [nodes[i - 1].id] if i else []
     except Exception as e:
-        print(f"[Planner] Plan parse failed ({e}) -- single-phase fallback")
+        print(f"[Planner] Plan parse failed ({e if verbose_logs() else type(e).__name__}) "
+              "-- single-phase fallback")
         nodes = []
 
     if not nodes:

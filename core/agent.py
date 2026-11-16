@@ -109,6 +109,16 @@ CREDENTIAL_NOTE = (
 LOOP_NOTE = "NOTE: You are repeating the same steps; try a different approach or finish."
 LOOP_SPEECH = "I got stuck going in circles, so I stopped."
 
+# The last message of every agent request while batched steps are on.
+NEXT_STEP_PROMPT = "What next? Reply with JSON only: one action, or a steps list."
+
+# Added to a read_screen_text / analyze_screen observation that follows
+# type_text with no Enter, key or click after it.
+UNSUBMITTED_READ_NOTE = (
+    "NOTE: the text you typed last was never submitted (no Enter or submit key after "
+    "it), so this read shows the state before submitting. If the task needs it "
+    "submitted, press the app's submit key, then read again.")
+
 
 # Observations of these actions carry text from outside (pages, the screen,
 # files, command output); instruction-like wording in them gets a note.
@@ -968,7 +978,8 @@ class AgentLoop:
                     + [
                         {
                             "role": "user",
-                            "content": "What is your next action? Reply with JSON only.",
+                            "content": NEXT_STEP_PROMPT if batch_steps_enabled()
+                            else "What is your next action? Reply with JSON only.",
                         }
                     ]
                 )
@@ -1115,7 +1126,8 @@ class AgentLoop:
                 action, param
             )
             if not valid_action:
-                print(f"  [Invalid] {format_note}")
+                # The note quotes the model's action and parameter: content.
+                print(f"  [Invalid] {format_note if verbose_logs() else 'not a valid action name; note added'}")
                 if on_step:
                     on_step(steps_taken, "invalid_action", str(action), "")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
@@ -1633,6 +1645,9 @@ class AgentLoop:
                 route_notes.append(
                     f"{executed_action} ran as an automatic fallback for {escalated_from}"
                 )
+            if executed_action in ("read_screen_text", "analyze_screen") and unsubmitted:
+                # Said where it helps: in the read itself, not only at done.
+                obs += f" {UNSUBMITTED_READ_NOTE}"
             if executed_action == "read_screen_text":
                 last_read = result_str
                 read_after_unsubmitted = unsubmitted
@@ -1763,7 +1778,7 @@ class AgentLoop:
                         print(f"[Vision] Screen understood: {log_text(description, 100)}")
                         return f"Window: {fw} | Vision: {description}"
             except Exception as e:
-                print(f"[Vision] Error: {e}")
+                print(f"[Vision] Error: {e if verbose_logs() else type(e).__name__}")
 
         controls = self._uia_summary()
         if controls:
@@ -1851,7 +1866,7 @@ class AgentLoop:
                     except Exception:
                         pass
         except Exception as e:
-            print(f"[UIA] Error: {e}")
+            print(f"[UIA] Error: {e if verbose_logs() else type(e).__name__}")
         return ""
 
     def _recent_conversation_block(self, task, limit=6, max_chars=200, max_age_min=30):
@@ -1925,15 +1940,21 @@ class AgentLoop:
         except Exception:
             known_folders = "unavailable"
 
+        batching = batch_steps_enabled()
         loop_rule = (
-            "- You work in a LOOP: one action per reply, then observe its result. Only a "
-            "predictable input sequence (open_app/switch_app, type_text, press_key, hotkey) "
-            'may share one reply as {"thinking":"...","steps":[{"action":"...","parameter":'
-            f'"..."}}, ...]}} (2-{BATCH_MAX_STEPS} steps, no reads, no done); it stops at the '
-            "first failure or question."
-            if batch_steps_enabled() else
+            "- You work in a LOOP: reply, then observe the result. A predictable input "
+            "sequence (open_app/switch_app, type_text, press_key, hotkey -- e.g. type, then "
+            f"Enter) goes in ONE reply as the steps form below (2-{BATCH_MAX_STEPS} steps, no "
+            "reads, no done); it stops at the first failure or question. Anything else is "
+            "one action per reply."
+            if batching else
             "- You work in a LOOP. Each iteration, analyze the screen and decide exactly ONE "
             "action. Observe the result before proceeding.")
+        submit_hint = " (both in one steps reply)" if batching else ""
+        response_format = (
+            '{"thinking":"brief reasoning","action":"...","parameter":"...","speech":""}'
+            + ('\nor, for an input sequence: {"thinking":"...","steps":[{"action":"...",'
+               '"parameter":"..."}, ...]}' if batching else ""))
 
         return f"""You are MistAI, a JARVIS-like desktop AI assistant with FULL system-level control.
 
@@ -2084,7 +2105,7 @@ WHAT'S ON SCREEN NOW:
 AVAILABLE ACTIONS:
 - open_app          : Open app (parameter = app name). Automatically switches to it if already running.
 - open_url          : Open website (parameter = url).
-- type_text         : Enter text (parameter = text) into the app you opened/switched to, replacing the field's content (with no such app it only appends). It does NOT submit: for a command, expression, or form, follow it with press_key('enter') or end the text with the app's submit key.
+- type_text         : Enter text (parameter = text) into the app you opened/switched to, replacing the field's content (with no such app it only appends). It does NOT submit: for a command, expression, or form, follow it with press_key('enter'){submit_hint} or end the text with the app's submit key.
 - type_search       : Type text and press Enter (parameter = text).
 - click_coords      : Click raw pixels (parameter = "x,y"). LAST RESORT ONLY.
 - click_on_text     : Find and click text via OCR/Vision (parameter = text).
@@ -2202,7 +2223,7 @@ VS Code evidence; it never creates or edits files.
 - done              : Task is complete.
 
 RESPONSE FORMAT (JSON ONLY):
-{{"thinking":"brief reasoning","action":"...","parameter":"...","speech":""}}"""
+{response_format}"""
 
     BATCH_RETRY_NOTE = (
         "[OBSERVATION] Your \"steps\" list was malformed and NOTHING was run. A batch is "
@@ -2254,8 +2275,29 @@ RESPONSE FORMAT (JSON ONLY):
         cleaned = cleaned.strip()
         try:
             parsed = json.loads(cleaned)
+        except Exception:
+            parsed = None
+        # The reply's shape, never its content: shows on real runs whether the
+        # model ever sends a batch (and in which form).
+        shape = ("steps" if isinstance(parsed, dict) and "steps" in parsed
+                 else "object" if isinstance(parsed, dict)
+                 else f"array of {len(parsed)}" if isinstance(parsed, list)
+                 else "text with a steps list" if '"steps"' in cleaned
+                 else "text")
+        print(f"  [Reply] shape={shape}")
+        try:
+            if parsed is None:
+                raise ValueError("not JSON")
             if isinstance(parsed, dict) and "steps" in parsed and batch_steps_enabled():
                 return self._batch_cmd(parsed)
+            if (isinstance(parsed, list) and batch_steps_enabled()
+                    and len(parsed) >= 2 and all(isinstance(x, dict) for x in parsed)
+                    and all(str(x.get("action") or "").strip() in BATCHABLE_ACTIONS
+                            for x in parsed)):
+                # A bare list of input steps is the steps form without its
+                # wrapper; _batch_cmd validates it like any other batch.
+                return self._batch_cmd({"thinking": parsed[0].get("thinking", ""),
+                                        "steps": parsed})
             if isinstance(parsed, list):
                 # Some models wrap a single-object reply in an array.
                 parsed = next((x for x in parsed if isinstance(x, dict)), None)

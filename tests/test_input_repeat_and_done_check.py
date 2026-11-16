@@ -206,6 +206,23 @@ def test_unsubmitted_typing_gets_23_then_submits_and_gets_851(monkeypatch):
     assert out["speech"] == "Calculator shows 851." and spoken == ["Calculator shows 851."]
 
 
+@pytest.mark.parametrize("read_action", ["read_screen_text", "analyze_screen"])
+def test_a_read_after_unsubmitted_typing_says_so_in_its_own_observation(monkeypatch,
+                                                                         read_action):
+    from core.agent import UNSUBMITTED_READ_NOTE
+
+    _, _, _, obs, _ = _run(monkeypatch, [
+        {"action": "type_text", "parameter": "37*23"},
+        {"action": read_action, "parameter": "what is shown?"},
+        {"action": "press_key", "parameter": "enter"},
+        {"action": read_action, "parameter": "what is shown?"},
+        {"action": "done", "speech": "Done."},
+    ], results={read_action: _result(read_action, "Display is 23")})
+    assert UNSUBMITTED_READ_NOTE in obs[1]
+    assert UNSUBMITTED_READ_NOTE not in obs[3]       # Enter submitted it
+    assert UNSUBMITTED_READ_NOTE not in obs[0]       # only reads carry it
+
+
 def test_typing_that_ends_in_a_newline_counts_as_submitted(monkeypatch):
     read = "EXACT UI TEXT of 'Terminal' (accessibility tree, exact): 42"
     out, _, _, obs, _ = _run(monkeypatch, [

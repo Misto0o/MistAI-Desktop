@@ -36,6 +36,16 @@ AGENT_MODEL = DEFAULT_MODEL  # alias: the default before the user picks one
 # agent.
 CHAT_TIMEOUT = 5
 
+
+def chat_timeout():
+    """MISTAI_CHAT_TIMEOUT seconds for the routing call (read at call time;
+    default CHAT_TIMEOUT, clamped to 1-30; bad input = the default)."""
+    try:
+        value = float(os.environ.get("MISTAI_CHAT_TIMEOUT", "") or CHAT_TIMEOUT)
+    except ValueError:
+        return CHAT_TIMEOUT
+    return min(30.0, max(1.0, value)) if value == value else CHAT_TIMEOUT
+
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]
 
 # Push-to-talk listening (Api._listen_once(ptt=True)), on its own recognizer;

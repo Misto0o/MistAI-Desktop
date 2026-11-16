@@ -586,3 +586,57 @@ def test_agent_reports_a_429_plainly_and_never_tries_another_model(
     assert spoken == ([msg] if spoken_expected else [])
     assert sent == ["mistral", "mistral"]            # same model on the fallback URL
     assert "secret" not in json.dumps(out) and "invalid" not in json.dumps(out)
+
+
+# -- why a message went to the agent (a fixed label on the route line) -----------
+
+
+@pytest.mark.parametrize("raw, label", [
+    ("", "no reply"),
+    ("I think this is a task", "unparsable"),
+    ('{"route": "chat", "reply": ""}', "no chat reply"),
+    ('{"route": "task", "reply": ""}', ""),
+    ('{"route": "chat", "reply": "Hi."}', ""),
+])
+def test_route_reason_labels(raw, label):
+    assert conversation.route_reason(raw) == label
+
+
+def test_the_route_line_names_the_reason_and_never_the_message(monkeypatch, capsys):
+    monkeypatch.setattr("core.planner._llm", lambda *a, **k: "secret words here")
+    assert conversation.try_chat(_api(), "open my diary", "none") is None
+    line = [l for l in capsys.readouterr().out.splitlines() if "route=" in l][0]
+    assert line.startswith("[Conversation] route=task in ") and line.endswith("(unparsable)")
+    assert "diary" not in line and "secret" not in line
+
+
+def test_a_reply_that_never_came_within_the_timeout_is_labelled_timeout(monkeypatch, capsys):
+    clock = iter([0.0, 6.0])
+    monkeypatch.setattr(conversation.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr("core.planner._llm", lambda *a, **k: "")
+    conversation.try_chat(_api(), "hi there", "none")
+    assert "route=task in 6.00s (timeout)" in capsys.readouterr().out
+
+
+def test_a_task_decision_has_no_label(monkeypatch, capsys):
+    monkeypatch.setattr("core.planner._llm", lambda *a, **k: '{"route": "task", "reply": ""}')
+    conversation.try_chat(_api(), "open notepad", "none")
+    out = capsys.readouterr().out
+    assert "route=task in" in out and "(" not in out.split("route=task in", 1)[1].splitlines()[0]
+
+
+@pytest.mark.parametrize("env, want", [(None, 5), ("2.5", 2.5), ("0", 1.0), ("99", 30.0),
+                                       ("abc", 5), ("nan", 5)])
+def test_chat_timeout_reads_the_environment(monkeypatch, env, want):
+    from core.config import chat_timeout
+
+    if env is None:
+        monkeypatch.delenv("MISTAI_CHAT_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("MISTAI_CHAT_TIMEOUT", env)
+    assert chat_timeout() == want
+    calls = []
+    monkeypatch.setattr("core.planner._llm",
+                        lambda api, p, m, timeout, label, fallback: calls.append(timeout) or "")
+    conversation.try_chat(_api(), "hello there", "none")
+    assert calls == [want]

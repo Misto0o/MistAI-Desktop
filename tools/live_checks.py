@@ -96,7 +96,8 @@ ALLOWED_LOG_LINES = [re.compile(p) for p in (
     r"\[Window\] (Restored and raised after the task \(not activated\)"
     r"|Could not clear topmost: \w+|Restore after the task skipped: \w+)",
     r"\[Timing\] (Phase|Task): [\d.]+s total( \| \w+ [\d.]+s(/\d+)?)*",
-    r"\[Conversation\] route=(chat|task) in [\d.]+s",
+    r"\[Conversation\] route=(chat|task) in [\d.]+s( \((timeout|no reply|unparsable|no chat reply|error)\))?",
+    r"\[Reply\] shape=(object|steps|text|text with a steps list|array of \d+)",
     r"\[AgentLoop\] System prompt: \d+ chars",
     r"\[Model\] Set to [a-z]+ \(applies from the next request\)",
 )]
@@ -112,33 +113,9 @@ def allowlisted(text):
     return out
 
 
-# Infrastructure errors (the backend or the network, not MistAI): each gives a
-# content-free label, an exception type or an HTTP status.
-INFRA_LINES = (
-    (re.compile(r"\[AgentLoop\] Network error: (\w+) after [\d.]+s"), lambda m: m.group(1)),
-    (re.compile(r"\[\w+\] [\w ]{1,40}? (?:request failed|is rate-limited or unavailable right now)"
-                r" \(HTTP (5\d\d|429)\b"), lambda m: "HTTP " + m.group(1)),
-    (re.compile(r"\[\w+\] LLM call failed: (\w*(?:Timeout|ConnectionError))\b"),
-     lambda m: m.group(1)),
-)
-
-
-def infra_errors(text):
-    """The labels of the infrastructure errors logged in text, one per line."""
-    out = []
-    for line in str(text or "").splitlines():
-        s = line.strip()
-        for rx, label in INFRA_LINES:
-            m = rx.match(s)
-            if m:
-                out.append(label(m))
-                break
-    return out
-
-
-def classify(status, infra, hard):
-    """A FAIL with infrastructure errors and no safety violation is INFRA."""
-    return "INFRA" if status == "FAIL" and infra and not hard else status
+# Infrastructure errors (the backend or the network, not MistAI): shared with
+# the scenario harness, which classifies its runs the same way.
+INFRA_LINES, infra_errors, classify = rs.INFRA_LINES, rs.infra_errors, rs.classify
 
 
 _PHASE_PART = re.compile(r"\b(llm|screen) ([\d.]+)s/(\d+)")

@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 
 from . import planner
-from .config import CHAT_TIMEOUT, DEFAULT_MODEL, verbose_logs
+from .config import DEFAULT_MODEL, chat_timeout, verbose_logs
 
 _PROMPT = """You are Mist, a desktop assistant inspired by JARVIS: quick, confident, dry and a little playful, natural when spoken aloud, never robotic, and you don't narrate yourself.{address}
 
@@ -38,6 +38,27 @@ def build_prompt(message, now, history="", title=""):
         history=history,
         message=json.dumps(str(message)),
     )
+
+
+def route_reason(raw):
+    """Why a reply routes to the agent, as a fixed label ("" = the model said
+    task or chat): "no reply" (the call failed or timed out), "unparsable",
+    or "no chat reply" (route chat with an empty reply)."""
+    if not (raw or "").strip():
+        return "no reply"
+    try:
+        cleaned = raw.strip()
+        for fence in ("```json", "```"):
+            if fence in cleaned:
+                cleaned = cleaned.split(fence)[1].split("```")[0]
+        data = json.loads(cleaned.strip())
+    except Exception:
+        return "unparsable"
+    if not isinstance(data, dict):
+        return "unparsable"
+    if data.get("route") == "chat" and parse_route(raw) is None:
+        return "no chat reply"
+    return ""
 
 
 def parse_route(raw):
@@ -71,6 +92,8 @@ def try_chat(api, message, gender="none", model=None):
     """Answer ``message`` as conversation, or return None to hand it to the
     agent. Never raises. ``model`` is the request's model (ask_mistai)."""
     t0 = time.monotonic()
+    timeout = chat_timeout()
+    reason = ""
     try:
         try:
             history = api.agent._recent_conversation_block(message)
@@ -82,17 +105,23 @@ def try_chat(api, message, gender="none", model=None):
             api,
             build_prompt(message, now, history, title),
             _model_for(api, model),
-            timeout=CHAT_TIMEOUT,
+            timeout=timeout,
             label="Conversation",
             fallback=False,
         )
         reply = parse_route(raw)
+        reason = route_reason(raw)
     except Exception as e:
         print(f"[Conversation] Router failed ({e if verbose_logs() else type(e).__name__}) "
               "-- routing to agent")
-        reply = None
+        reply, reason = None, "error"
+    elapsed = time.monotonic() - t0
+    if reason == "no reply" and elapsed >= timeout * 0.95:
+        reason = "timeout"
+    # A fixed label says why a message went to the agent without a model
+    # decision (timeouts cost the whole wait before the agent starts).
     print(
         f"[Conversation] route={'chat' if reply else 'task'} "
-        f"in {time.monotonic() - t0:.2f}s"
+        f"in {elapsed:.2f}s" + (f" ({reason})" if reason and not reply else "")
     )
     return reply

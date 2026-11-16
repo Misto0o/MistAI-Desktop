@@ -736,3 +736,89 @@ def test_the_label_returns_to_talk_after_a_note_and_the_safety_restore(tmp_path)
     ])
     assert a[0]["label"] == "Done" and a[1]["label"] == "Talk"
     assert a[2]["label"] == "Done" and a[3]["label"] == "Talk"
+
+
+# -- Keyboard, focus and labels (UI polish) ----------------------------------------
+
+
+def _fn(name):
+    return re.search(r"function " + name + r"\(.*?\n}\n", _script(), re.S).group(0)
+
+
+def test_every_settings_switch_is_a_keyboard_switch_with_a_state():
+    js = _script()
+    for sw in ("sw-wake", "sw-cap", "sw-orb", "sw-orb_flight", "sw-orb_panels"):
+        assert f"['{sw}'," in js, sw
+    make = _fn("makeSwitch")
+    assert "setAttribute('role','switch')" in make and "sw.tabIndex=0;" in make
+    assert "e.key===' '||e.key==='Enter'" in make
+    # Every place that flips a switch goes through setSw, so aria-checked follows.
+    assert "classList.toggle('on'" not in js.replace(_fn("setSw"), "")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_switch_helpers_run(tmp_path):
+    script = tmp_path / "sw.js"
+    script.write_text(
+        "const attrs={},cls=new Set();let clicks=0;\n"
+        "const sw={tabIndex:-1,setAttribute:(k,v)=>{attrs[k]=v;},"
+        "classList:{toggle:(c,on)=>{on?cls.add(c):cls.delete(c);}},onclick:()=>{clicks++;}};\n"
+        + _fn("setSw") + _fn("makeSwitch")
+        + "makeSwitch(sw,'Captions');setSw(sw,true);let prevented=0;\n"
+        "sw.onkeydown({key:' ',preventDefault:()=>prevented++});"
+        "sw.onkeydown({key:'a',preventDefault:()=>prevented++});\n"
+        "console.log(JSON.stringify({attrs,on:cls.has('on'),tab:sw.tabIndex,clicks,prevented}));\n",
+        encoding="utf-8")
+    out = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    r = json.loads(out.stdout)
+    assert r == {"attrs": {"role": "switch", "aria-label": "Captions", "aria-checked": "true"},
+                 "on": True, "tab": 0, "clicks": 1, "prevented": 1}
+
+
+def test_settings_is_a_labelled_dialog_that_escape_closes_and_returns_focus():
+    assert '<div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">' in HTML
+    assert '<div class="modal-title" id="settings-title">SETTINGS</div>' in HTML
+    assert "API CONFIGURATION" not in HTML
+    close = _fn("closeAPIModal")
+    assert "document.getElementById('btn-settings').focus();" in close
+    assert "document.getElementById('apiKeyInput').focus();" in _fn("openAPIModal")
+    assert "if(e.key==='Escape')closeAPIModal();" in _script()
+
+
+def test_the_api_key_is_a_password_field_cleared_after_saving():
+    assert re.search(r'<input type="password" class="modal-input" id="apiKeyInput"', HTML)
+    save = _fn("saveAPIKey")
+    assert save.index("set_api_key(key)") < save.index(
+        "document.getElementById('apiKeyInput').value='';")
+
+
+def test_icon_only_controls_have_names_and_live_regions_exist():
+    for frag in ('id="btn-send" title="Send" aria-label="Send"',
+                 'id="btn-stop" title="Stop the current task" aria-label="Stop"',
+                 'id="btn-settings"', 'aria-label="Captions"',
+                 '<div id="chat" role="log" aria-live="polite"',
+                 'id="mist-status" role="status" aria-live="polite"'):
+        assert frag in HTML, frag
+    assert HTML.count('class="hint-chip" role="button" tabindex="0"') == 4
+    assert HTML.count('class="res-link" role="link" tabindex="0"') == 2
+
+
+def test_focus_ring_contrast_and_reduced_motion_for_the_rest_of_the_page():
+    css = HTML.split("<style>", 1)[1].split("</style>", 1)[0]
+    assert ":focus-visible{outline:none;box-shadow:var(--focus)}" in css
+    assert "--muted:#6b8796;" in css and "#4c6472" not in css.split("*/", 1)[1]
+    second = css.split("@media (prefers-reduced-motion: reduce){")[2]
+    for rule in (".msg,.modal-content{animation:none !important}",
+                 "#chat{scroll-behavior:auto}", "transition:none !important"):
+        assert rule in second, rule
+    assert ".btn-save,.btn-cancel{font-family:'DM Mono',monospace" in css
+
+
+def test_orb_options_say_they_need_the_orb_and_dim_without_it():
+    for name in ("orb_flight", "orb_panels"):
+        assert re.search(r'id="sw-' + name + r'" title="Needs the floating orb\.', HTML)
+        assert f'id="row-{name}"' in HTML
+    dep = _fn("showOrbDependents")
+    assert "row.classList.toggle('inactive',!orbOn)" in dep
+    assert "beside the floating orb: current step" not in HTML

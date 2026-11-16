@@ -14,7 +14,11 @@ HTML = """<!DOCTYPE html>
 :root{
   --bg:#050709;--surface:#0b1016;--surface2:#101923;--border:rgba(0,217,255,0.12);
   --accent:#00d9ff;--accent2:#5eead4;--green:#34d399;--amber:#fbbf24;--red:#f87171;
-  --text:#dff6ff;--muted:#4c6472;--muted2:#7ea3b3;
+  --text:#dff6ff;--muted:#6b8796;--muted2:#7ea3b3;
+  /* --muted was #4c6472 (2.9:1 on surface2); #6b8796 is 4.7:1 (WCAG AA). */
+  --radius-sm:6px;--radius:8px;--radius-lg:12px;--pill:20px;
+  --focus:0 0 0 2px var(--bg),0 0 0 4px var(--accent);
+  --ease:.2s;
 }
 body{
   font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);
@@ -204,6 +208,28 @@ header{
 .card-note.error{color:var(--red)}
 .card-note:empty{display:none}
 select{background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:6px 8px;border-radius:6px;font-size:.78em;cursor:pointer;font-family:'DM Mono',monospace;pointer-events:auto;width:100%;margin-top:6px}
+
+/* Shared states: one keyboard focus ring for everything focusable, the app
+   font and the same easing on every text button, a visible pressed state,
+   and switches that show their dependency. */
+:focus{outline:none}
+:focus-visible{outline:none;box-shadow:var(--focus)}
+#inp:focus-visible,.modal-input:focus-visible{border-color:var(--accent);box-shadow:var(--focus)}
+.btn-save,.btn-cancel{font-family:'DM Mono',monospace;transition:all var(--ease)}
+.btn-save:disabled,.btn-cancel:disabled{opacity:.4;cursor:not-allowed}
+button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{transform:translateY(1px)}
+.modal-input,select{transition:border-color var(--ease)}
+.modal-input:hover,select:hover{border-color:rgba(0,217,255,0.3)}
+.sw:hover{border-color:rgba(0,217,255,0.35)}
+.toggle-row.inactive{opacity:.5}
+.modal-hint{font-size:.66em;color:var(--muted2);font-family:'DM Mono',monospace;margin:-6px 0 12px}
+.sr-only{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+@media (prefers-reduced-motion: reduce){
+  .msg,.modal-content{animation:none !important}
+  #chat{scroll-behavior:auto}
+  *,*::before,*::after{transition:none !important}
+  button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{transform:none}
+}
 </style>
 </head>
 <body>
@@ -215,7 +241,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
   </div>
   <div class="clock"><b id="clock-time">--:--:--</b><span id="clock-date">-- -- ----</span></div>
   <div class="header-right">
-    <button class="gear-btn" onclick="openAPIModal()" title="Settings">&#9881;</button>
+    <button class="gear-btn" id="btn-settings" onclick="openAPIModal()" title="Settings" aria-label="Settings" aria-haspopup="dialog">&#9881;</button>
   </div>
 </header>
 
@@ -236,18 +262,18 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
       <div class="toggle-row"><span>Wake word (beta)</span><div class="sw" id="sw-wake"></div></div>
       <div class="toggle-row"><span>Captions</span><div class="sw" id="sw-cap"></div></div>
       <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works"></div></div>
-      <div class="toggle-row"><span>Orb follows the task</span><div class="sw" id="sw-orb_flight" title="The floating orb flies beside the window Mist is working in"></div></div>
-      <div class="toggle-row"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Small panels beside the floating orb: current step, steps, answer"></div></div>
+      <div class="toggle-row" id="row-orb_flight"><span>Orb follows the task</span><div class="sw" id="sw-orb_flight" title="Needs the floating orb. The orb flies beside the window Mist is working in"></div></div>
+      <div class="toggle-row" id="row-orb_panels"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Needs the floating orb. Two panels at the top of the screen: the steps Mist takes and its answer"></div></div>
     </div>
 
     <div class="card">
       <div class="card-title">Resources</div>
-      <div class="res-link" onclick="openLink('https://mistai.org/docs')"><span class="ic">&#128214;</span>Docs & Get API Key</div>
-      <div class="res-link" onclick="openLink('https://github.com/Misto0o/MistAI-Desktop')"><span class="ic">&#9733;</span>GitHub Repo</div>
+      <div class="res-link" role="link" tabindex="0" onclick="openLink('https://mistai.org/docs')"><span class="ic" aria-hidden="true">&#128214;</span>Docs &amp; Get API Key</div>
+      <div class="res-link" role="link" tabindex="0" onclick="openLink('https://github.com/Misto0o/MistAI-Desktop')"><span class="ic" aria-hidden="true">&#9733;</span>GitHub Repo</div>
     </div>
 
     <div class="card">
-      <div class="card-title">Gender Address</div>
+      <div class="card-title" title="How Mist addresses you in replies">How Mist addresses you</div>
       <select id="sel-gender"><option value="none">Neutral</option><option value="male">Sir</option><option value="female">Ma'am</option></select>
     </div>
 
@@ -268,7 +294,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
       </div>
     </div>
     <div class="mist-title">M.I.S.T.</div>
-    <div class="mist-status ready" id="mist-status"><div class="dot"></div><span id="mist-status-text">Ready</span></div>
+    <div class="mist-status ready" id="mist-status" role="status" aria-live="polite"><div class="dot" aria-hidden="true"></div><span id="mist-status-text">Ready</span></div>
 
     <div class="control-bar">
       <div class="control-item">
@@ -276,7 +302,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
         <div class="ctrl-label" id="ptt-label">Talk</div>
       </div>
       <div class="control-item">
-        <button class="ctrl-btn" id="ctrl-caption" title="Toggle on-screen captions">&#128190;</button>
+        <button class="ctrl-btn" id="ctrl-caption" title="Toggle on-screen captions" aria-label="Captions">&#128172;</button>
         <div class="ctrl-label">Captions</div>
       </div>
     </div>
@@ -285,31 +311,33 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
   <div class="convo">
     <div class="convo-head">
       <h3>CONVERSATION</h3>
-      <button class="btn-clear" onclick="clearChat()">Clear Chat</button>
+      <button class="btn-clear" onclick="clearChat()">Clear chat</button>
     </div>
-    <div id="chat">
+    <div id="chat" role="log" aria-live="polite" aria-label="Conversation">
       <div class="empty" id="empty">
-        <p>JARVIS-style desktop control — UIA navigation, browser automation, and system-level actions.</p>
+        <p>Type a request or press Talk. Mist works in your apps, files and its own browser, and asks before anything that can't be undone.</p>
         <div class="hints">
-          <div class="hint-chip" onclick="fillAndSend(this)">Open Firefox and go to YouTube</div>
-          <div class="hint-chip" onclick="fillAndSend(this)">List all my open windows</div>
-          <div class="hint-chip" onclick="fillAndSend(this)">Take a screenshot and save it</div>
-          <div class="hint-chip" onclick="fillAndSend(this)">What's in my clipboard?</div>
+          <div class="hint-chip" role="button" tabindex="0" onclick="fillAndSend(this)">Open Firefox and go to YouTube</div>
+          <div class="hint-chip" role="button" tabindex="0" onclick="fillAndSend(this)">List all my open windows</div>
+          <div class="hint-chip" role="button" tabindex="0" onclick="fillAndSend(this)">Take a screenshot and save it</div>
+          <div class="hint-chip" role="button" tabindex="0" onclick="fillAndSend(this)">What's in my clipboard?</div>
         </div>
       </div>
     </div>
     <div class="convo-input">
-      <input id="inp" type="text" placeholder="Tell MistAI what to do..." autocomplete="off"/>
-      <button class="btn-send" id="btn-send">&#9654;</button>
-      <button class="btn-send" id="btn-stop">■</button>
+      <input id="inp" type="text" placeholder="Tell MistAI what to do..." autocomplete="off" aria-label="Message to Mist"/>
+      <button class="btn-send" id="btn-send" title="Send" aria-label="Send">&#9654;</button>
+      <button class="btn-send" id="btn-stop" title="Stop the current task" aria-label="Stop">&#9632;</button>
     </div>
   </div>
 </div>
 
 <div class="modal" id="apiModal">
-  <div class="modal-content">
-    <div class="modal-title">API CONFIGURATION</div>
-    <input type="text" class="modal-input" id="apiKeyInput" placeholder="Enter your MistAI API key (mistai_...)"/>
+  <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-title" id="settings-title">SETTINGS</div>
+    <div class="card-title">API key</div>
+    <input type="password" class="modal-input" id="apiKeyInput" placeholder="Enter your MistAI API key (mistai_...)" autocomplete="off" aria-label="MistAI API key"/>
+    <div class="modal-hint">Saved when you press Save; leave empty to keep the current key.</div>
     <label id="backend-row" style="font-size:.75em;color:var(--muted);margin-bottom:12px;display:none">
       <input type="checkbox" id="useBackend" checked/> Use MistAI backend
     </label>
@@ -318,7 +346,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
       <div class="card-note" id="facts-note"></div>
     </div>
     <div style="margin-bottom:12px">
-      <div class="card-title">Ask before sending</div>
+      <div class="card-title">Ask before sending a message</div>
       <!-- Choices and explanations come from Api.get_ask_before_sending_options() (config). -->
       <select id="sel-send"></select>
       <div class="card-note" id="send-note"></div>
@@ -327,7 +355,7 @@ select{background:var(--surface2);color:var(--text);border:1px solid var(--borde
     </div>
     <div class="modal-buttons">
       <button class="btn-save" onclick="saveAPIKey()">Save</button>
-      <button class="btn-cancel" onclick="closeAPIModal()">Cancel</button>
+      <button class="btn-cancel" onclick="closeAPIModal()">Close</button>
     </div>
   </div>
 </div>
@@ -351,6 +379,30 @@ const btnPtt=document.getElementById('btn-ptt'),ctrlCaption=document.getElementB
 const pttLabel=document.getElementById('ptt-label');
 let stepEl=null;
 
+// Settings switches are divs styled as switches: give them the switch role,
+// keyboard focus and Space/Enter, and keep aria-checked in step with 'on'.
+function setSw(sw,on){
+  sw.classList.toggle('on',!!on);
+  sw.setAttribute('aria-checked',on?'true':'false');
+}
+function makeSwitch(sw,label){
+  sw.setAttribute('role','switch');
+  sw.setAttribute('aria-label',label);
+  sw.setAttribute('aria-checked','false');
+  sw.tabIndex=0;
+  sw.onkeydown=e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();if(sw.onclick)sw.onclick();}};
+}
+for(const [id,label] of [['sw-wake','Wake word'],['sw-cap','Captions'],['sw-orb','Floating orb'],
+  ['sw-orb_flight','Orb follows the task'],['sw-orb_panels','Task panels']]){
+  const sw=document.getElementById(id);if(sw)makeSwitch(sw,label);
+}
+// Hint chips and resource links are divs too: Enter or Space clicks them.
+function keyClick(e){
+  const t=e.target;
+  if(!(e.key==='Enter'||e.key===' ')||!t||!t.classList||!t.onclick)return;
+  if(t.classList.contains('hint-chip')||t.classList.contains('res-link')){e.preventDefault();t.onclick();}
+}
+
 function tickClock(){
   const d=new Date();
   document.getElementById('clock-time').textContent=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -364,7 +416,7 @@ function openLink(url){
 
 // Startup. All state lives in Python (memory.db): pywebview loads this page
 // with NavigateToString, an opaque origin where every browser storage API
-// throws (tests/test_ui_model_card.py checks none is used). The intervals start first, and each step runs on its own
+// throws (tests/test_ui_page.py checks none is used). The intervals start first, and each step runs on its own
 // (not awaited one after another), so a step that throws or never answers
 // cannot stop the others.
 async function runStep(name,step){
@@ -461,7 +513,7 @@ function restoreStatus(){
 // Wake word: one switch (sidebar), off at startup.
 async function toggleWake(){
   wakeOn=!wakeOn;
-  swWake.classList.toggle('on',wakeOn);
+  setSw(swWake,wakeOn);
   orb.classList.toggle('active',wakeOn);
   if(ready)try{
     if(wakeOn)await pywebview.api.start_wake_word_detection();
@@ -525,7 +577,7 @@ btnPtt.onclick=async()=>{
 
 async function toggleCaptions(){
   capOn=!capOn;
-  swCap.classList.toggle('on',capOn);ctrlCaption.classList.toggle('active',capOn);
+  setSw(swCap,capOn);ctrlCaption.classList.toggle('active',capOn);
   if(ready)try{
     await pywebview.api.toggle_captions(capOn);
     addMsg(capOn?'Captions on':'Captions off','system');
@@ -538,19 +590,27 @@ ctrlCaption.onclick=toggleCaptions;
 // a small always-on-top window with only the orb (core/floating_orb.py).
 const swOrb=document.getElementById('sw-orb');
 let orbOn=false;
+// The two orb options only act while the floating orb is on: dim them then.
+function showOrbDependents(){
+  for(const name of ['orb_flight','orb_panels']){
+    const row=document.getElementById('row-'+name);
+    if(row)row.classList.toggle('inactive',!orbOn);
+  }
+}
 async function loadOrbSetting(){
   if(typeof pywebview.api.get_floating_orb!=='function')return;
   orbOn=!!(await pywebview.api.get_floating_orb());
-  swOrb.classList.toggle('on',orbOn);
+  setSw(swOrb,orbOn);
+  showOrbDependents();
   if(typeof pywebview.api.get_orb_options!=='function')return;
   const opts=(await pywebview.api.get_orb_options())||{};
   for(const name of ['orb_flight','orb_panels']){
     const sw=document.getElementById('sw-'+name);
-    sw.classList.toggle('on',!!opts[name]);
+    setSw(sw,!!opts[name]);
     sw.onclick=async()=>{
       try{
         const r=await pywebview.api.set_orb_option(name,!sw.classList.contains('on'));
-        sw.classList.toggle('on',!!(r&&r.enabled));
+        setSw(sw,!!(r&&r.enabled));
         if(r&&r.error)addMsg('Orb: '+r.error,'error');
       }catch(e){console.error('Orb option toggle error:',e);}
     };
@@ -561,7 +621,8 @@ swOrb.onclick=async()=>{
   try{
     const r=await pywebview.api.set_floating_orb(!orbOn);
     orbOn=!!(r&&r.enabled);
-    swOrb.classList.toggle('on',orbOn);
+    setSw(swOrb,orbOn);
+    showOrbDependents();
     if(r&&r.error)addMsg('Floating orb: '+r.error,'error');
   }catch(e){console.error('Floating orb toggle error:',e);}
 };
@@ -628,9 +689,20 @@ async function answerConfirm(answer,label){
 
 function openAPIModal(){
   apiModal.classList.add('open');
+  document.getElementById('apiKeyInput').focus();
   if(ready){runStep('sending',loadSendSetting);runStep('approvals',loadApprovals);}
 }
-function closeAPIModal(){apiModal.classList.remove('open');}
+function closeAPIModal(){
+  if(!apiModal.classList.contains('open'))return;
+  apiModal.classList.remove('open');
+  document.getElementById('btn-settings').focus();
+}
+// Escape closes Settings; Enter in the key field saves it.
+window.addEventListener('keydown',e=>{
+  if(e.key==='Escape')closeAPIModal();
+  else if(e.key==='Enter'&&e.target&&e.target.id==='apiKeyInput')saveAPIKey();
+  else keyClick(e);
+});
 
 // Ask before sending (messages only): the choices, labels and explanations
 // come from Python, which also validates and saves the choice; the page only
@@ -717,6 +789,7 @@ async function saveAPIKey(){
   if(key){
     try{
       await pywebview.api.set_api_key(key);
+      document.getElementById('apiKeyInput').value='';
       addMsg('API key configured','system');
     }catch(e){addMsg('Error: '+e,'error');}
   }
@@ -1083,7 +1156,7 @@ ORB_HTML = _orb_page()
 
 
 # A task panel window (core/orb_panels.py): dark translucent glass, rounded,
-# a close button, a short scale-in from the orb's side. Its js_api is
+# a close button, a short drop in from above. Its js_api is
 # PanelBridge (panel_state, dismiss). Text goes in through textContent only.
 PANEL_HTML = """<!DOCTYPE html>
 <html lang="en">

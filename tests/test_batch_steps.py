@@ -235,6 +235,58 @@ def test_flag_off_keeps_one_action_per_reply(monkeypatch, tmp_path):
     assert "decide exactly ONE action" in rec.requests[0]["system"]
 
 
+def test_a_bare_list_of_input_steps_is_one_batch(monkeypatch, tmp_path, capsys):
+    steps = [{"action": a, "parameter": p} for a, p in STEPS3]
+    rec = _run(monkeypatch, tmp_path, [json.dumps(steps), DONE])
+    assert rec.calls == list(STEPS3)
+    assert len(rec.requests) == 2
+    log = capsys.readouterr().out
+    assert "[Reply] shape=array of 3" in log and "hello" not in log
+
+
+def test_a_list_with_a_non_input_step_keeps_its_first_object(monkeypatch, tmp_path):
+    steps = [{"action": "type_text", "parameter": "x"},
+             {"action": "read_screen_text", "parameter": "q"}]
+    rec = _run(monkeypatch, tmp_path, [json.dumps(steps), DONE])
+    assert rec.calls == [("type_text", "x")]
+
+
+def test_a_bare_list_is_not_a_batch_with_the_flag_off(monkeypatch, tmp_path):
+    monkeypatch.setenv("MISTAI_BATCH_STEPS", "0")
+    steps = [{"action": a, "parameter": p} for a, p in STEPS3]
+    rec = _run(monkeypatch, tmp_path, [json.dumps(steps), DONE])
+    assert rec.calls == [("open_app", "notepad")]
+
+
+def test_every_reply_logs_its_shape_only(monkeypatch, tmp_path, capsys):
+    _run(monkeypatch, tmp_path, [batch(*STEPS3), "not json at all", DONE])
+    log = capsys.readouterr().out
+    assert "[Reply] shape=steps" in log
+    assert "[Reply] shape=text" in log
+    assert "[Reply] shape=object" in log
+    assert "not json" not in log
+
+
+def test_the_format_block_shows_both_shapes_and_the_last_message_allows_steps(
+        monkeypatch, tmp_path):
+    rec = _run(monkeypatch, tmp_path, [DONE])
+    system = rec.requests[0]["system"]
+    fmt = system.split("RESPONSE FORMAT (JSON ONLY):", 1)[1]
+    assert '"action":"..."' in fmt and '"steps":[' in fmt
+    assert "(both in one steps reply)" in system
+    assert rec.requests[0]["messages"][-1]["content"] == (
+        "What next? Reply with JSON only: one action, or a steps list.")
+
+
+def test_flag_off_keeps_the_old_format_and_last_message(monkeypatch, tmp_path):
+    monkeypatch.setenv("MISTAI_BATCH_STEPS", "0")
+    rec = _run(monkeypatch, tmp_path, [DONE])
+    assert "steps" not in rec.requests[0]["system"].split("RESPONSE FORMAT", 1)[1]
+    assert "(both in one steps reply)" not in rec.requests[0]["system"]
+    assert rec.requests[0]["messages"][-1]["content"] == (
+        "What is your next action? Reply with JSON only.")
+
+
 def test_the_prompt_carries_one_merged_batch_rule(monkeypatch, tmp_path):
     rec = _run(monkeypatch, tmp_path, [DONE])
     system = rec.requests[0]["system"]

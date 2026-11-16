@@ -182,7 +182,13 @@ class _StoppableStream:
         return self._stream.close()
 
 
-class Api:
+# Api's action groups that live in their own modules (methods moved verbatim).
+from .api_browser import BrowserActionsMixin  # noqa: E402
+from .api_system import SystemActionsMixin  # noqa: E402
+from .api_windows import WindowActionsMixin  # noqa: E402
+
+
+class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
     _BROWSER_APP_NAMES = {"firefox", "chrome", "edge", "browser"}
 
     _DEFAULT_HOTKEY = "ctrl+k"  # fallback only if the LLM genuinely can't answer
@@ -2637,26 +2643,6 @@ class Api:
             parts.append("another matching window is MistAI's own browser")
         return f" [{'; '.join(parts)}]" if parts else ""
     
-    def _act_browser_import_cookies(self, param):
-        if not param:
-            self.last_result_text = "browser_import_cookies needs domain(s), e.g. 'youtube.com' or 'youtube.com|google.com'"
-            return False
-        try:
-            counts = self.browser.import_cookies(param)
-            self.last_result_text = f"Imported cookies: {counts}. Navigate/reload the page to see the logged-in state."
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_import_cookies failed: {e}"
-            return False
-        
-    def _act_browser_use_daily_profile(self, param):
-        try:
-            source, copied = self.browser.use_daily_profile_copy()
-            self.last_result_text = f"Cloned logins from {source} ({', '.join(copied)}). Next browser action will use them."
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_use_daily_profile failed: {e}"
-            return False   
 
     def _act_open_app(self, param):
         app_lower = str(param or "").lower().strip()
@@ -4049,22 +4035,6 @@ class Api:
         self.last_result_text = result[:_RESULT_MEMORY_CHARS]
         return self.last_result_text
 
-    def list_open_apps(self):
-        from .live_state import describe_open_apps
-
-        return describe_open_apps(self.live.snapshot) or "No tracked apps open"
-
-    def remember_fact(self, fact, category="general", importance=1):
-        self.memory.remember_fact(fact, category=category, importance=importance)
-        return {"success": True, "stored": fact}
-
-    def recall_facts(self, query=None, category=None):
-        """The user's saved facts; when none match a query, MistAI's facts
-        about itself (from code)."""
-        facts = self.memory.recall_facts(query=query, category=category, limit=5)
-        if not facts and query and category is None:
-            facts = recall_builtin(query, limit=5)
-        return facts
 
     def import_my_facts(self):
         """Import the user's own facts from config.my_facts_path(): a JSON list
@@ -4095,44 +4065,6 @@ class Api:
         return {"success": True, "added": added, "skipped": skipped,
                 "restored": restored, "message": summary}
 
-    def add_reminder(self, text, due_time=None):
-        self.memory.add_reminder(text, due_time=due_time)
-        return {"success": True, "reminder": text}
-
-    def get_reminders(self):
-        reminders = self.memory.get_pending_reminders()
-        return [{"id": r[0], "text": r[1], "due": r[2]} for r in reminders]
-
-    def complete_reminder(self, reminder_id):
-        self.memory.complete_reminder(reminder_id)
-        return {"success": True}
-
-    def get_battery_status(self):
-        try:
-            battery = psutil.sensors_battery()
-            if battery:
-                plugged = "plugged in" if battery.power_plugged else "unplugged"
-                return f"Battery at {battery.percent}% ({plugged})"
-            return "Battery info unavailable"
-        except Exception:
-            return "Could not get battery status"
-
-    def get_active_window(self):
-        return self.live.snapshot.get("foreground_window", "Unknown")
-
-    def lock_screen(self):
-        try:
-            pyautogui.hotkey("win", "l")
-            return True
-        except Exception:
-            return False
-
-    def minimize_all_windows(self):
-        try:
-            pyautogui.hotkey("win", "d")
-            return True
-        except Exception:
-            return False
 
     def find_file_roots(self):
         """Folders find_file searches, in order: the active workspace root,
@@ -4197,46 +4129,6 @@ class Api:
             print(f"[FindFile] Error: {e if verbose_logs() else type(e).__name__}")
             return False
 
-    def take_notes(self, note_text):
-        try:
-            subprocess.Popen("notepad.exe")
-            time.sleep(1.5)
-            pyautogui.write(note_text, interval=0.02)
-            return True
-        except Exception:
-            return False
-
-    def press_and_hold(self, key, duration=0.5):
-        try:
-            pyautogui.keyDown(key)
-            time.sleep(duration)
-            pyautogui.keyUp(key)
-            return True
-        except Exception:
-            return False
-
-    def type_slowly(self, text, delay=0.1):
-        try:
-            for char in text:
-                pyautogui.write(char, interval=delay)
-            return True
-        except Exception:
-            return False
-
-    def get_frequently_used_apps(self):
-        apps = self.memory.get_frequent_apps(limit=5)
-        return ", ".join(apps) if apps else "No usage history"
-
-    def get_system_info(self):
-        snap = self.live.snapshot
-        return {
-            "time": datetime.now().strftime("%I:%M %p"),
-            "date": datetime.now().strftime("%A, %B %d"),
-            "foreground_app": snap.get("foreground_window", "Unknown"),
-            "open_apps": snap.get("open_apps", [])[:5],
-            "cpu": f"{snap.get('cpu_percent', 0):.1f}%",
-            "ram": f"{snap.get('ram_percent', 0):.1f}%",
-        }
 
     # -- Enhanced-utils action handlers --------------------------------------
 
@@ -4259,181 +4151,6 @@ class Api:
         )
         return True
 
-    def _act_window_op(self, method_name, param):
-        if not self.enhanced_available:
-            self.last_result_text = "Window management module isn't available."
-            self.speak(self.last_result_text)
-            return False
-        fn = getattr(self.window_mgr, method_name)
-        ok = fn(param)
-        self.last_result_text = (
-            f"{method_name.replace('_', ' ').title()}: {param}"
-            if ok
-            else f"Could not find window: {param}"
-        )
-        self.speak(self.last_result_text)
-        return ok
-
-    def _act_window_activate(self, param):
-        """Find the window by title first, then focus it, so "not found" and
-        "Windows refused focus" are reported as the different facts they are.
-        One retry compares normalized titles (dashes, trailing separators)."""
-        if not self.enhanced_available:
-            self.last_result_text = "Window management module isn't available."
-            self.speak(self.last_result_text)
-            return False
-        win = None
-        try:
-            win = (self.window_mgr.find_window(param)
-                   or self.window_mgr.find_window_normalized(param))
-        except Exception as e:
-            print(f"[WindowActivate] lookup failed: {e if verbose_logs() else type(e).__name__}")
-        hwnd = getattr(win, "_hWnd", None)
-        if not hwnd:
-            self.last_result_text = f"Could not find window: {param}"
-            self.speak(self.last_result_text)
-            return False
-        title = (getattr(win, "title", "") or "")[:40]
-        ok, reason = self._focus_hwnd(hwnd)
-        self.last_result_text = (
-            f"Activate Window: {title}" if ok
-            else f"Found window '{title}' but could not bring it to the front: {reason}"
-        )
-        self.speak(self.last_result_text)
-        return ok
-
-    def _act_browser_open(self, param):
-            try:
-                self.browser.ensure_started()
-                if self.browser._start_error:
-                    self.last_result_text = self.browser._start_error
-                    return False
-                if param:
-                    url, title = self.browser.navigate(param)
-                    self.last_result_text = f"Opened {url} ({title})"
-                else:
-                    self.last_result_text = "Browser ready"
-                return True
-            except Exception as e:
-                self.last_result_text = f"browser_open failed: {e}"
-                return False
-
-    def _page_text(self):
-        try:
-            return " ".join((self.browser.get_text("") or "").split())
-        except Exception:
-            return ""
-
-    def _page_excerpt(self, limit=900, text=None):
-        """First chunk of the current page's real DOM text, for handing back
-        to the model in the same observation as a navigate/search. Without
-        this the model had to *know* to call browser_get_text as a second
-        step -- and a small model instead re-ran the search five times."""
-        text = self._page_text() if text is None else text
-        return text[:limit] + ("..." if len(text) > limit else "")
-
-    def _act_browser_navigate(self, param):
-        if not param:
-            self.last_result_text = "browser_navigate needs a URL"
-            return False
-        try:
-            url, title = self.browser.navigate(param)
-            text = self._page_text()
-            reason = blocked_page_reason(url, title, text)
-            if reason:
-                print(f"[Browser] browser_navigate: block page ({reason})")
-                self.last_result_text = (
-                    f"BLOCKED: {reason}. This is a block/CAPTCHA page, not the content; "
-                    f"do not try to solve it. Use browser_search for the information instead.")
-                return False
-            excerpt = self._page_excerpt(text=text)
-            self.last_result_text = f"Navigated to {url} ({title})."
-            if excerpt:
-                self.last_result_text += (
-                    f" PAGE TEXT (already read -- do NOT navigate again; use "
-                    f"browser_get_text with a selector only if you need more): "
-                    f"{excerpt}"
-                )
-            self.speak(f"Navigating to {url}")
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_navigate failed: {e}"
-            return False
-
-    def _act_browser_search(self, param):
-        if not param:
-            return False
-        blocked = []  # (route name, fixed reason) of each route that was blocked or empty
-        try:
-            for name, base in search_routes():
-                url, title = self.browser.navigate(search_url(base, param))
-                text = self._page_text()
-                reason = blocked_page_reason(url, title, text) or (
-                    "the results page was empty" if not text.strip() else None)
-                if reason:
-                    print(f"[Browser] browser_search: {name} showed a block page ({reason})")
-                    blocked.append((name, reason))
-                    continue
-                excerpt = self._page_excerpt(text=text)
-                self.last_result_text = f"Searched {name} for '{param}'."
-                if blocked:
-                    self.last_result_text += (
-                        f" ({', '.join(n for n, _ in blocked)} showed a block page.)")
-                if excerpt:
-                    self.last_result_text += (
-                        f" RESULTS PAGE TEXT (already read -- do NOT search again; "
-                        f"answer from this, or browser_click a result): {excerpt}"
-                    )
-                self.speak(f"Searching for {param}")
-                return True
-        except Exception as e:
-            self.last_result_text = f"browser_search failed: {e}"
-            return False
-        self.last_result_text = (
-            "BLOCKED: the search was blocked ("
-            + "; ".join(f"{n}: {r}" for n, r in blocked)
-            + "). Do not try to solve it or search another way (no browser app, no "
-            "address bar); tell the user the web search was blocked.")
-        return False
-
-    def _act_browser_close(self):
-        try:
-            self.browser.close()
-            self.last_result_text = "Browser closed"
-            self.speak("Browser closed")
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_close failed: {e}"
-            return False
-
-    def _act_browser_click(self, param):
-        if not param:
-            self.last_result_text = "browser_click needs the visible text to click"
-            return False
-        if "|" in param:
-            text, role = param.split("|", 1)
-        else:
-            text, role = param, None
-        try:
-            self.browser.click(text.strip(), role=(role.strip() if role else None))
-            self.last_result_text = f"Clicked '{text.strip()}' in the browser (real DOM match)"
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_click could not find/click '{text.strip()}': {e}"
-            return False
-
-    def _act_browser_fill(self, param):
-        if "|" not in (param or ""):
-            self.last_result_text = "browser_fill needs format: field label|text to type"
-            return False
-        field, text = param.split("|", 1)
-        try:
-            self.browser.fill(field.strip(), text)
-            self.last_result_text = f"Filled '{field.strip()}'"
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_fill could not find field '{field.strip()}': {e}"
-            return False
 
     def _act_browser_get_text(self, param):
         try:
@@ -4444,102 +4161,4 @@ class Api:
             self.last_result_text = f"browser_get_text failed: {e}"
             return False
 
-    def _act_browser_press_key(self, param):
-        if not param:
-            return False
-        try:
-            self.browser.press_key(param.strip())
-            self.last_result_text = f"Pressed '{param.strip()}' in the browser"
-            return True
-        except Exception as e:
-            self.last_result_text = f"browser_press_key failed: {e}"
-            return False
 
-    def _act_brightness_get(self):
-        if not self.enhanced_available:
-            self.speak("Brightness control isn't available.")
-            return False
-        level = self.screen_control.get_brightness()
-        self.last_result_text = (
-            f"Current brightness: {level}%"
-            if level is not None
-            else "Could not read brightness"
-        )
-        self.speak(self.last_result_text)
-        return level is not None
-
-    def _act_brightness_set(self, param):
-        if not self.enhanced_available:
-            self.speak("Brightness control isn't available.")
-            return False
-        try:
-            level = int(param)
-            ok = self.screen_control.set_brightness_level(level)
-            self.last_result_text = (
-                f"Brightness set to {level}%" if ok else "Could not set brightness"
-            )
-            self.speak(self.last_result_text)
-            return ok
-        except Exception:
-            return False
-
-    def _act_mss_screenshot(self, param):
-        if not self.enhanced_available:
-            return self.screenshot_to_file(param or "screenshot.png")
-        path = self.screen_control.take_screenshot(param if param else "screenshot.png")
-        self.last_result_text = f"Screenshot saved to {path}" if path else "Screenshot failed"
-        self.speak("Screenshot saved" if path else "Screenshot failed")
-        return bool(path)
-
-    def _act_schedule_reminder(self, param):
-        if not self.enhanced_available or not self.task_scheduler:
-            self.speak("Scheduling module isn't available.")
-            return False
-        try:
-            parts = param.split("|", 1)
-            seconds = int(parts[0].strip())
-            text = parts[1].strip() if len(parts) > 1 else "Reminder"
-
-            def _fire():
-                self.add_reminder(text)
-                self.speak(f"Reminder: {text}")
-
-            self.task_scheduler.schedule_once(seconds, _fire)
-            self.last_result_text = f"Scheduled reminder '{text}' in {seconds}s"
-            self.speak(f"I'll remind you about '{text}' in {seconds} seconds")
-            return True
-        except Exception as e:
-            print(f"[Schedule] Error: {e}")
-            return False
-
-    def _act_volume_mute(self, param=""):
-        try:
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = cast(interface, POINTER(IAudioEndpointVolume))
-            volume.SetMute(1, None)
-            self.last_result_text = "Muted"
-            return True
-        except Exception as e:
-            self.last_result_text = f"Mute failed: {e}"
-            return False
-
-    def _act_volume_unmute(self, param=""):
-        try:
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = cast(interface, POINTER(IAudioEndpointVolume))
-            volume.SetMute(0, None)
-            self.last_result_text = "Unmuted"
-            return True
-        except Exception as e:
-            self.last_result_text = f"Unmute failed: {e}"
-            return False
