@@ -433,16 +433,32 @@ class BrowserSession:
         return self._call(_do)
 
     # Read-only geometry for the floating orb's search tour: the window's
-    # screen metrics and the viewport rects of the first ``n`` matches, in CSS
-    # px (core/orb_layout.map_page_rects maps them to the screen). No text.
-    _LINK_BOXES_JS = """([sel, n]) => ({
-      screenX: window.screenX, screenY: window.screenY,
-      outerWidth: window.outerWidth, innerWidth: window.innerWidth,
-      outerHeight: window.outerHeight, innerHeight: window.innerHeight,
-      dpr: window.devicePixelRatio,
-      rects: Array.from(document.querySelectorAll(sel)).slice(0, n).map(e => {
-        const r = e.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]; })
-    })"""
+    # screen metrics, how many distinct matches there are ("found", one per
+    # link target) and the viewport rects of the first ``n``, in CSS px, each
+    # with flags (1 hidden, 2 inside an ad block); core/orb_layout
+    # .classify_page_rects maps them to the screen. Numbers only, no text.
+    _LINK_BOXES_JS = """([sel, n]) => {
+      const seen = new Set(), uniq = [];
+      for (const e of document.querySelectorAll(sel)) {
+        const key = e.href || e;
+        if (!seen.has(key)) { seen.add(key); uniq.push(e); }
+      }
+      const AD = '[data-testid="ad"], [data-layout="ad"], .result--ad, [data-nrn="ad"], #tads';
+      return {
+        screenX: window.screenX, screenY: window.screenY,
+        outerWidth: window.outerWidth, innerWidth: window.innerWidth,
+        outerHeight: window.outerHeight, innerHeight: window.innerHeight,
+        dpr: window.devicePixelRatio, found: uniq.length,
+        rects: uniq.slice(0, n).map(e => {
+          const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+          let f = 0;
+          if (!e.getClientRects().length || s.visibility === 'hidden' || s.display === 'none'
+              || Number(s.opacity) === 0) f |= 1;
+          if (e.closest(AD)) f |= 2;
+          return [r.left, r.top, r.right, r.bottom, f];
+        })
+      };
+    }"""
 
     def link_boxes(self, selector, n=4):
         """None when the browser is not running (never starts it)."""

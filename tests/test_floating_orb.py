@@ -594,10 +594,16 @@ def test_the_tween_is_time_based_and_can_be_cancelled(monkeypatch):
     monkeypatch.setattr(fo.Tween, "FRAME_S", 0)
     win, seen, done = _Win(), [], []
     tw = fo.Tween(win, 7, clock=_StepClock(0.05))
-    tw.play([((0, 0, 10), (100, 0, 10), 0.2, 0.0)], on_frame=seen.append,
+    tw.play([((0, 0, 10), (0, 0, 20), 0.2, 0.0)], on_frame=seen.append,
             done=lambda: done.append(1)).join(2)
-    assert seen[-1] == (100, 0, 10) and done == [1]
-    assert 2 <= len(seen) <= 4                     # ~0.2 s at 0.05 s per frame
+    assert seen[-1] == (0, 0, 20) and done == [1]
+    assert 2 <= len(seen) <= 4                     # a resize step: ~0.2 s at 0.05 s per frame
+    seen.clear()
+    tw = fo.Tween(win, 7, clock=_StepClock(0.05))
+    tw.play([((0, 0, 10), (100, 0, 10), 0.2, 0.0)], on_frame=seen.append,
+            done=lambda: done.append(2)).join(2)
+    assert seen[-1] == (100, 0, 10) and done == [1, 2]
+    assert 3 <= len(seen) <= 14                    # a spring move: settled by ~0.6 s
     gate = threading.Event()
     slow = fo.Tween(win, 7, clock=_StepClock(0.001))
     seen.clear()

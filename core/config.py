@@ -416,6 +416,23 @@ def orb_debug_capture():
     return not getattr(sys, "frozen", False) and env_flag("MISTAI_ORB_DEBUG_CAPTURE", False)
 
 
+def orb_frame_stats():
+    """MISTAI_ORB_FRAME_STATS=1: one numbers-only frame-timing line per orb
+    flight. Ignored in a built app."""
+    return not getattr(sys, "frozen", False) and env_flag("MISTAI_ORB_FRAME_STATS", False)
+
+
+ORB_MOTIONS = ("lively", "calm")
+
+
+def orb_motion():
+    """MISTAI_ORB_MOTION = lively (default: a springy flight with a small
+    overshoot) | calm (critically damped, no overshoot), read at call time;
+    anything else is the default."""
+    v = os.environ.get("MISTAI_ORB_MOTION", "").strip().lower()
+    return v if v in ORB_MOTIONS else "lively"
+
+
 def _env_or_saved(name, saved):
     """An env switch when set (1/0), else the saved Settings value ("on")."""
     flag = env_flag(name, None)

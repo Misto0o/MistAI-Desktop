@@ -760,6 +760,7 @@ def _tour_orb(info, browser_hwnd=77):
     orb._api.orb_option = lambda n: n == "orb_flight"
     now = [100.0]
     orb._clock = lambda: now[0]
+    orb._sleep = lambda s: None
     orb._tween.running = False
     return orb, played, now
 
@@ -770,7 +771,7 @@ FOUR = [[20, 100 + 90 * i, 600, 124 + 90 * i] for i in range(4)]
 def test_the_tour_hops_down_the_results_in_order_with_a_dwell(capsys):
     orb, played, now = _tour_orb(_info(rects=FOUR, sx=0, sy=0))
     orb._prepare_tour(orb._tour_gen)
-    assert orb._api.browser.calls == [(fo.RESULT_LINKS, 4)]
+    assert orb._api.browser.calls == [(fo.RESULT_LINKS, fo.TOUR_CANDIDATES)]
     assert len(orb._tour["stops"]) == 4
     played.clear()
     orb.tick()

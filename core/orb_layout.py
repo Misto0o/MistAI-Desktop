@@ -246,33 +246,74 @@ def dock_inside(window_rect, work, side, element=None, near=None, gap=8):
 
 # -- browser page rects and the search tour ---------------------------------------------------
 
-def map_page_rects(info, window_rect):
-    """Physical screen rects for the viewport rects in ``info`` (from
-    BrowserSession.link_boxes: CSS px plus the window's screenX/Y, outer and
-    inner sizes and devicePixelRatio, which in Firefox already includes the
-    Windows display scale). Content origin = screenX + side border
-    ((outerWidth - innerWidth) / 2), screenY + toolbar height (outerHeight -
-    innerHeight). Rects below the fold are dropped; None when a remaining
-    rect is empty or not inside ``window_rect`` (the mapping can't be trusted)."""
+TOUR_REJECTIONS = ("hidden", "ad", "above-fold", "below-fold", "outside-window", "limit")
+HIDDEN, AD = 1, 2          # flag bits link_boxes sets per candidate
+
+
+def classify_page_rects(info, window_rect, limit=4):
+    """(physical screen rects or None, counts) for the candidate rects in
+    ``info`` (from BrowserSession.link_boxes: CSS px viewport rects
+    [l, t, r, b, flags] plus the window's screenX/Y, outer and inner sizes and
+    devicePixelRatio, which in Firefox already includes the Windows display
+    scale). Content origin = screenX + side border ((outerWidth - innerWidth)
+    / 2), screenY + toolbar height (outerHeight - innerHeight).
+
+    In order, the first ``limit`` candidates that are visible, not ads and
+    have their centre inside the viewport are accepted (a partly visible one
+    is clipped to the viewport, not dropped). Rejections are counted by label
+    (TOUR_REJECTIONS). Any accepted rect that maps outside ``window_rect``
+    means the mapping can't be trusted: no rects. counts: found, measured,
+    accepted, rejected and one count per label. Never raises."""
+    counts = {"found": 0, "measured": 0, "accepted": 0, "rejected": 0}
+    counts.update({k: 0 for k in TOUR_REJECTIONS})
     try:
+        cands = list(info["rects"])
+        counts["measured"] = len(cands)
+        counts["found"] = max(len(cands), int(info.get("found", len(cands)) or 0))
         dpr = float(info["dpr"]) or 1.0
         ox = float(info["screenX"]) + (float(info["outerWidth"]) - float(info["innerWidth"])) / 2
         oy = float(info["screenY"]) + float(info["outerHeight"]) - float(info["innerHeight"])
-        inner_h = float(info["innerHeight"])
+        inner_w, inner_h = float(info["innerWidth"]), float(info["innerHeight"])
+        wl, wt, wr, wb = window_rect
         out = []
-        for left, top, right, bottom in info["rects"]:
-            if bottom > inner_h or top < 0:
-                continue                                  # not on screen now
-            r = (round((ox + left) * dpr), round((oy + top) * dpr),
-                 round((ox + right) * dpr), round((oy + bottom) * dpr))
-            wl, wt, wr, wb = window_rect
-            if r[2] - r[0] < 2 or r[3] - r[1] < 2 or not (
-                    wl <= r[0] and r[2] <= wr and wt <= r[1] and r[3] <= wb):
-                return None
-            out.append(r)
-        return out or None
+        for cand in cands:
+            left, top, right, bottom = (float(v) for v in cand[:4])
+            flags = int(cand[4]) if len(cand) > 4 else 0
+            why = None
+            if flags & HIDDEN or right - left < 2 or bottom - top < 2:
+                why = "hidden"
+            elif flags & AD:
+                why = "ad"
+            elif (top + bottom) / 2 < 0:
+                why = "above-fold"
+            elif (top + bottom) / 2 >= inner_h or not 0 <= (left + right) / 2 < inner_w:
+                why = "below-fold"
+            elif len(out) >= limit:
+                why = "limit"
+            if why is None:
+                top, bottom = max(0.0, top), min(inner_h, bottom)
+                left, right = max(0.0, left), min(inner_w, right)
+                r = (round((ox + left) * dpr), round((oy + top) * dpr),
+                     round((ox + right) * dpr), round((oy + bottom) * dpr))
+                if not (wl <= r[0] and r[2] <= wr and wt <= r[1] and r[3] <= wb):
+                    why = "outside-window"
+                else:
+                    out.append(r)
+            if why is not None:
+                counts[why] += 1
+                counts["rejected"] += 1
+        if counts["outside-window"]:
+            counts["rejected"] += len(out)
+            out = []
+        counts["accepted"] = len(out)
+        return (out or None), counts
     except Exception:
-        return None
+        return None, counts
+
+
+def map_page_rects(info, window_rect, limit=4):
+    """The accepted screen rects of classify_page_rects, or None."""
+    return classify_page_rects(info, window_rect, limit)[0]
 
 
 def margin_spot(element, area, side, gap=8):

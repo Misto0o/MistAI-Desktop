@@ -30,14 +30,16 @@ Logs carry numbers and Win32 error codes only.
 """
 
 import ctypes
+import sys
 import threading
 import time
 
 from . import events
-from .config import orb_background, orb_debug_capture, orb_sizes
-from .orb_layout import (answer_spot, coverage, dock_inside, dock_position, dock_side, flight_plan,
-                         map_page_rects, margin_spot, resize_about_center, square_at,
-                         tour_plan)
+from .config import orb_background, orb_debug_capture, orb_frame_stats, orb_motion, orb_sizes
+from .orb_layout import (RESIZE_S, TOUR_REJECTIONS, answer_spot, classify_page_rects, coverage, dock_inside,
+                         dock_position, dock_side, flight_plan, margin_spot, resize_about_center,
+                         square_at, tour_plan)
+from .orb_motion import Flight, frame_stats, stats_line, valid_refresh
 
 ORB_MARGIN = 16           # logical px from the work area's right and bottom edges
 MIN_SIZE = (1, 1)         # pywebview's default min_size (200, 100) clamps every resize
@@ -51,9 +53,14 @@ SHELL_CLASSES = frozenset({"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman",
 IGNORED_PROCESSES = ("taskmgr",)
 # MistAI's dedicated browser is Playwright's Firefox, run from its own folder.
 PLAYWRIGHT_PATH_HINTS = ("ms-playwright", ".local-browsers")
-# Organic result title links: DuckDuckGo (normal page, HTML endpoint), Google.
-RESULT_LINKS = 'a[data-testid="result-title-a"], a.result__a, #search a:has(h3)'
+# Organic result title links: DuckDuckGo's normal page (current and older
+# markup), its HTML endpoint, Google. Ads are flagged in the page and skipped.
+RESULT_LINKS = ('a[data-testid="result-title-a"], article[data-testid="result"] h2 a, '
+                'li[data-layout="organic"] h2 a, a.result__a, .result__title a, '
+                '#search a:has(h3), #rso a:has(h3)')
 TOUR_STOPS = 4
+TOUR_CANDIDATES = 12      # measured per read; the first TOUR_STOPS usable ones are kept
+TOUR_RETRY_S = 0.4        # fewer than TOUR_STOPS found: the page may still be rendering
 TOUR_DWELL_S = 0.7
 SPEECH_START_S = 1.0      # the voice may start a moment after the answer arrives
 WORDS_PER_S = 2.5         # speech-length estimate when the TTS has no speaking flag
@@ -74,6 +81,20 @@ HWND_TOPMOST = -1
 SWP_NOACTIVATE = 0x0010
 SWP_NOSIZE = 0x0001
 SWP_NOZORDER = 0x0004
+SWP_NOOWNERZORDER = 0x0200
+SWP_ASYNCWINDOWPOS = 0x4000
+# One flight frame: position only. ASYNCWINDOWPOS because the window belongs
+# to the WinForms UI thread: a synchronous cross-thread SetWindowPos would
+# block the animation thread whenever that thread is busy (each post is an
+# absolute position, so a late one is harmless). No SWP_NOCOPYBITS: it would
+# make WebView2 repaint on every move.
+SWP_FRAME = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS
+SPI_GETCLIENTAREAANIMATION = 0x1042
+ENUM_CURRENT_SETTINGS = -1
+THREAD_PRIORITY_ABOVE_NORMAL = 1
+CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2
+TIMER_ALL_ACCESS = 0x1F0003
+FLIGHT_SWITCH_INTERVAL = 0.001     # s, sys.setswitchinterval during a flight
 
 
 def orb_state(api):
@@ -223,9 +244,54 @@ class Win32:
         self.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (style | add) & ~remove)
 
     def move_only(self, hwnd, x, y):
-        """Position only: no resize, no z-order change, no activation."""
-        return bool(self.user32.SetWindowPos(hwnd, None, x, y, 0, 0,
-                                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE))
+        """Position only: no resize, no z-order change, no activation, and
+        posted to the window's own thread (SWP_FRAME)."""
+        return bool(self.user32.SetWindowPos(hwnd, None, x, y, 0, 0, SWP_FRAME))
+
+    def animations_enabled(self):
+        """SPI_GETCLIENTAREAANIMATION (Settings > Accessibility > Animation
+        effects); True when it can't be read."""
+        from ctypes import wintypes
+
+        v = wintypes.BOOL(1)
+        if not self.user32.SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(v), 0):
+            return True
+        return bool(v.value)
+
+    def refresh_rate(self, hwnd):
+        """The refresh rate (Hz) of the monitor the window is on, else 60."""
+        try:
+            import win32api
+
+            mon = win32api.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            device = win32api.GetMonitorInfo(mon)["Device"]
+            mode = win32api.EnumDisplaySettings(device, ENUM_CURRENT_SETTINGS)
+            return valid_refresh(mode.DisplayFrequency)
+        except Exception:
+            return 60
+
+    def make_pacer(self, hz):
+        return FramePacer(hz)
+
+    def _kernel32(self):
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentThread.restype = wintypes.HANDLE
+        k.GetThreadPriority.argtypes = [wintypes.HANDLE]
+        k.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        return k
+
+    def boost_thread(self):
+        """Raise the calling thread to above-normal; its old priority, or None."""
+        k = self._kernel32()
+        h = k.GetCurrentThread()
+        prev = k.GetThreadPriority(h)
+        return prev if k.SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL) else None
+
+    def restore_thread(self, prev):
+        k = self._kernel32()
+        k.SetThreadPriority(k.GetCurrentThread(), int(prev))
 
     def foreground(self):
         return self.user32.GetForegroundWindow()
@@ -341,53 +407,300 @@ def apply_square(win, hwnd, x, y, side, last_side=None):
         return False
 
 
+class FramePacer:
+    """Waits one display frame per wait(): DwmFlush() (returns after the next
+    DWM composition, i.e. vsync), else a high-resolution waitable timer
+    (CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) on
+    deadlines one refresh apart, else timeBeginPeriod(1) and time.sleep.
+    DwmFlush falls back for the rest of the flight when it fails or returns
+    in under 30% of a frame three times running (nothing to compose: it would
+    spin). ``kind`` is "dwm", "timer" or "sleep"; close() frees the timer and
+    ends the timer period. Never raises."""
+
+    FAST_SHARE = 0.3
+    FAST_LIMIT = 3
+
+    def __init__(self, hz, clock=time.perf_counter):
+        self.interval = 1.0 / valid_refresh(hz)
+        self._clock = clock
+        self._fast = 0
+        self._timer = None
+        self._period = False
+        self._k = None
+        self._next = clock() + self.interval
+        self.kind = "dwm"
+        try:
+            self._dwm = ctypes.WinDLL("dwmapi").DwmFlush
+            self._dwm.restype = ctypes.c_long
+        except Exception:
+            self._dwm = None
+            self._to_timer()
+
+    def _to_timer(self):
+        from ctypes import wintypes
+
+        self.kind = "timer"
+        try:
+            k = ctypes.WinDLL("kernel32")
+            k.CreateWaitableTimerExW.restype = wintypes.HANDLE
+            k.CreateWaitableTimerExW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                                 wintypes.DWORD, wintypes.DWORD]
+            k.SetWaitableTimer.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong),
+                                           ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p,
+                                           wintypes.BOOL]
+            k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            self._k = k
+            self._timer = k.CreateWaitableTimerExW(None, None,
+                                                   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                   TIMER_ALL_ACCESS) or None
+        except Exception:
+            self._timer = None
+        if self._timer is None:
+            self.kind = "sleep"
+            try:
+                ctypes.WinDLL("winmm").timeBeginPeriod(1)
+                self._period = True
+            except Exception:
+                pass
+        self._next = self._clock() + self.interval
+
+    def wait(self):
+        try:
+            if self.kind == "dwm":
+                t = self._clock()
+                hr = self._dwm()
+                if hr != 0:
+                    self._to_timer()
+                elif self._clock() - t < self.FAST_SHARE * self.interval:
+                    self._fast += 1
+                    if self._fast < self.FAST_LIMIT:
+                        return
+                    self._to_timer()
+                else:
+                    self._fast = 0
+                    return
+            now = self._clock()
+            self._next += self.interval
+            if self._next <= now:                    # a late frame: skip ahead, no catch-up
+                self._next = now + self.interval
+            delay = self._next - now
+            if self._timer is not None:
+                due = ctypes.c_longlong(-max(1, int(delay * 1e7)))     # relative, 100 ns units
+                if self._k.SetWaitableTimer(self._timer, ctypes.byref(due), 0, None, None, False):
+                    self._k.WaitForSingleObject(self._timer, int(delay * 1000) + 50)
+                    return
+            time.sleep(delay)
+        except Exception:
+            time.sleep(self.interval)
+
+    def close(self):
+        try:
+            if self._timer is not None:
+                self._k.CloseHandle(self._timer)
+                self._timer = None
+            if self._period:
+                ctypes.WinDLL("winmm").timeEndPeriod(1)
+                self._period = False
+        except Exception:
+            pass
+
+
+class _EventPacer:
+    """For a Win32 stand-in without make_pacer (tests): Event.wait(FRAME_S)."""
+
+    kind = "sleep"
+
+    def __init__(self, stop, seconds):
+        self._stop, self._s = stop, seconds
+
+    def wait(self):
+        if self._s > 0:
+            self._stop.wait(self._s)
+
+    def close(self):
+        pass
+
+
+_BOOST_LOCK = threading.Lock()
+_BOOST = {"n": 0, "interval": None}
+
+
+def _boost_enter(win):
+    """Above-normal priority for this thread and a 1 ms GIL switch interval
+    for the flight (ref-counted, so overlapping flights restore it once).
+    The thread's old priority, or None."""
+    prev = None
+    try:
+        prev = win.boost_thread() if hasattr(win, "boost_thread") else None
+    except Exception:
+        prev = None
+    with _BOOST_LOCK:
+        if _BOOST["n"] == 0:
+            _BOOST["interval"] = sys.getswitchinterval()
+            sys.setswitchinterval(FLIGHT_SWITCH_INTERVAL)
+        _BOOST["n"] += 1
+    return prev
+
+
+def _boost_exit(win, prev):
+    try:
+        if prev is not None and hasattr(win, "restore_thread"):
+            win.restore_thread(prev)
+    except Exception:
+        pass
+    with _BOOST_LOCK:
+        _BOOST["n"] = max(0, _BOOST["n"] - 1)
+        if _BOOST["n"] == 0 and _BOOST["interval"] is not None:
+            sys.setswitchinterval(_BOOST["interval"])
+            _BOOST["interval"] = None
+
+
 class Tween:
     """Plays flight segments [(from, to, seconds, bow), ...] on a worker
-    thread at about 60 fps, positions from elapsed time (so a slow frame
-    never slows the flight). A frame with an unchanged side only moves the
-    window; the region is recut only when the side changes. A new play()
-    (or cancel()) stops the one before at its next frame."""
+    thread, one frame per display refresh (FramePacer). A segment that keeps
+    the size is a spring move (core/orb_motion.Flight, MISTAI_ORB_MOTION read
+    per play): one SetWindowPos per frame and nothing else; its ``seconds`` is
+    only the caller's estimate. A segment that changes the size is a short
+    timed resize step (smoothstep), the region recut per frame. Positions come
+    from the clock, never from a frame count. retarget() redirects a spring
+    move in flight without a jump; a new play() (or cancel()) stops the one
+    before. With Windows animations off every segment ends at once.
+    MISTAI_ORB_FRAME_STATS=1 logs one numbers-only line per play."""
 
-    FRAME_S = 1 / 60
+    FRAME_S = 1 / 60          # only for a Win32 stand-in without make_pacer
+    JOIN_S = 0.05
+    _logged_animate = True    # log "animations off" once per change, not per flight
 
-    def __init__(self, win, hwnd, clock=time.monotonic):
+    def __init__(self, win, hwnd, clock=time.perf_counter):
         self._win, self._hwnd, self._clock = win, hwnd, clock
         self._stop = None
         self._thread = None
+        self._leg = None          # the spring Flight being flown, else None
+        self._pending = None      # (landing, tail segments) from retarget()
         self.side = None          # the side last applied (physical px)
+        self.goal = None          # where the current play ends
+        self.last_stats = None
+
+    def _ask(self, name, default):
+        fn = getattr(self._win, name, None)
+        if fn is None:
+            return default
+        try:
+            return fn(self._hwnd) if name == "refresh_rate" else fn()
+        except Exception:
+            return default
 
     def play(self, segments, on_frame=None, done=None):
         self.cancel()
+        old = self._thread
+        if old is not None and old.is_alive() and old is not threading.current_thread():
+            old.join(self.JOIN_S)                    # never two threads moving the window
+        segments = [tuple(s) for s in segments]
         stop = self._stop = threading.Event()
-
-        def run():
-            failed = frames_n = 0
-            last = None
-            for start, end, seconds, bow in segments:
-                t0 = self._clock()
-                while not stop.is_set():
-                    t = 1.0 if seconds <= 0 else (self._clock() - t0) / seconds
-                    sq = square_at(start, end, t, bow)
-                    if sq != last:
-                        frames_n += 1
-                        if not apply_square(self._win, self._hwnd, *sq, last_side=self.side):
-                            failed += 1
-                        self.side, last = sq[2], sq
-                        if on_frame:
-                            on_frame(sq)
-                    if t >= 1.0:
-                        break
-                    stop.wait(self.FRAME_S)
-                if stop.is_set():
-                    return
-            if failed:
-                print(f"[FloatingOrb] tween: {failed} of {frames_n} frames failed")
-            if done and not stop.is_set():
-                done()
-
-        t = self._thread = threading.Thread(target=run, daemon=True, name="OrbTween")
+        self._leg, self._pending = None, None
+        self.goal = tuple(segments[-1][1]) if segments else None
+        opts = {"motion": orb_motion(), "stats": orb_frame_stats(),
+                "animate": bool(self._ask("animations_enabled", True)),
+                "hz": valid_refresh(self._ask("refresh_rate", 60))}
+        if opts["animate"] != Tween._logged_animate:
+            Tween._logged_animate = opts["animate"]
+            if not opts["animate"]:
+                print("[FloatingOrb] Windows animation effects are off: the orb jumps")
+        t = self._thread = threading.Thread(target=self._run,
+                                            args=(stop, segments, on_frame, done, opts),
+                                            daemon=True, name="OrbTween")
         t.start()
         return t
+
+    def _apply(self, sq, on_frame, counts):
+        counts[0] += 1
+        if not apply_square(self._win, self._hwnd, *sq, last_side=self.side):
+            counts[1] += 1
+        self.side = sq[2]
+        if on_frame:
+            on_frame(sq)
+
+    def _run(self, stop, segments, on_frame, done, opts):
+        counts = [0, 0]                              # frames applied, failed
+        times = []
+        pacer = None
+        if not opts["animate"]:                      # Windows animations off: jump
+            for _start, end, _s, _bow in segments:
+                if stop.is_set():
+                    return
+                self._apply(tuple(end), on_frame, counts)
+        else:
+            pacer = (self._win.make_pacer(opts["hz"]) if hasattr(self._win, "make_pacer")
+                     else _EventPacer(stop, self.FRAME_S))
+            prev = _boost_enter(self._win)
+            try:
+                self._fly(stop, segments, on_frame, opts, counts, times, pacer)
+            finally:
+                _boost_exit(self._win, prev)
+                pacer.close()
+                self._leg, self._pending = None, None
+        if counts[1]:
+            print(f"[FloatingOrb] tween: {counts[1]} of {counts[0]} frames failed")
+        if opts["stats"] and times:
+            self.last_stats = frame_stats(times, opts["hz"])
+            print(stats_line(self.last_stats, pacer.kind if pacer else "none", opts["motion"]))
+        if done and not stop.is_set():
+            done()
+
+    def _fly(self, stop, segments, on_frame, opts, counts, times, pacer):
+        """The frame loop: one clock read per frame, no logging, no locks."""
+        queue = list(segments)
+        while queue and not stop.is_set():
+            start, end, seconds, bow = queue.pop(0)
+            last = tuple(start)                      # already there: no frame for it
+            now = t0 = self._clock()
+            side = end[2]
+            leg = None
+            if start[2] == side:                     # a move: the spring
+                leg = self._leg = Flight(start[:2], end[:2], now, opts["motion"], bow)
+            while not stop.is_set():
+                if opts["stats"]:
+                    times.append(now)
+                if leg is not None:
+                    pend = self._pending
+                    if pend is not None:
+                        self._pending = None
+                        leg.retarget(now, pend[0][:2])
+                        queue = list(pend[1])
+                    x, y, finished = leg.at(now)
+                    sq = (int(round(x)), int(round(y)), side)
+                else:                                # a resize step
+                    t = 1.0 if seconds <= 0 else (now - t0) / seconds
+                    sq = square_at(start, end, t, bow)
+                    finished = t >= 1.0
+                if sq != last:
+                    self._apply(sq, on_frame, counts)
+                    last = sq
+                if finished:
+                    break
+                pacer.wait()
+                now = self._clock()
+            self._leg, self._pending = None, None
+
+    @property
+    def in_flight(self):
+        """A spring move is flying (retarget() can redirect it)."""
+        return self._leg is not None and self.running
+
+    def retarget(self, goal):
+        """Redirect the spring move in flight to ``goal`` (x, y, side),
+        keeping its position and velocity: it lands at the current size on
+        the goal's centre, then resizes there. False when no move is flying."""
+        if not self.in_flight or self.side is None:
+            return False
+        goal = tuple(int(v) for v in goal)
+        side = self.side
+        land = goal if goal[2] == side else resize_about_center(goal[0], goal[1], goal[2], side)
+        tail = [] if land == goal else [(land, goal, RESIZE_S, 0.0)]
+        self.goal = goal
+        self._pending = (land, tail)
+        return True
 
     def cancel(self):
         if self._stop is not None:
@@ -396,7 +709,6 @@ class Tween:
     @property
     def running(self):
         return self._thread is not None and self._thread.is_alive()
-
 
 WM_MOUSEACTIVATE = 0x0021
 MA_NOACTIVATE = 3
@@ -584,6 +896,7 @@ class FloatingOrb:
         self._tour_gen = 0                 # bumped by every step: stale tours are dropped
         self._answer = None                # {"at", "words"} from the final AgentStep
         self._clock = time.monotonic
+        self._sleep = time.sleep           # the tour's one re-read (tests: no-op)
 
     TICK_S = 0.25
     DWELL_S = 1.5             # a docked arrival stays put this long
@@ -706,13 +1019,15 @@ class FloatingOrb:
         except Exception:
             return self.scale
 
-    def _goal(self, state):
+    def _goal(self, state, from_square=None):
         """(x, y, side) the orb should have now. Without flight: at home,
         resized about its center for the state. With flight (Settings "Orb
         follows the task"): docked small beside the task's window while one
         is known and in front, medium where it is while working or speaking,
-        else big at home."""
-        x, y, side = self.square
+        else big at home. ``from_square``: judge from there instead of the
+        current square (a flight's destination, so a goal re-checked in
+        flight doesn't wander with the orb)."""
+        x, y, side = from_square or self.square
         self.dock = None
         if not self._flight_on():
             return resize_about_center(x, y, side, round(size_for(state) * self.scale))
@@ -810,20 +1125,41 @@ class FloatingOrb:
         if self._tour is not None:
             self._tour = None
             try:
-                self._tween.cancel()
+                if not getattr(self._tween, "in_flight", False):
+                    self._tween.cancel()             # in flight: tick() retargets it instead
             except Exception:
                 pass
 
-    def _prepare_tour(self, gen):
-        """Worker thread: read the result link boxes and build the stops; any
-        missing or invalid rect skips the tour (the normal docking stays)."""
+    def _read_tour_rects(self):
+        """(screen rects or None, counts or None, browser window rect)."""
         try:
-            info = self._api.browser.link_boxes(RESULT_LINKS, TOUR_STOPS)
+            info = self._api.browser.link_boxes(RESULT_LINKS, TOUR_CANDIDATES)
             hwnd = self._win.browser_window()
             window = self._win.window_rect(hwnd) if hwnd else None
-            rects = map_page_rects(info, window) if info and window else None
+            if not (info and window):
+                return None, None, window
+            rects, counts = classify_page_rects(info, window, TOUR_STOPS)
+            return rects, counts, window
         except Exception:
-            rects, window = None, None
+            return None, None, None
+
+    def _prepare_tour(self, gen):
+        """Worker thread: read the result link boxes and build the stops; no
+        usable rect skips the tour (the normal docking stays). Fewer results
+        than stops found: the page may still be rendering, so it reads once
+        more after TOUR_RETRY_S. Logs counts and fixed labels only."""
+        rects, counts, window = self._read_tour_rects()
+        if counts and counts["found"] < TOUR_STOPS and gen == self._tour_gen:
+            self._sleep(TOUR_RETRY_S)
+            if gen == self._tour_gen:
+                again = self._read_tour_rects()
+                if again[1] and again[1]["found"] >= counts["found"]:
+                    rects, counts, window = again
+        if counts:
+            why = ", ".join(f"{k} {counts[k]}" for k in TOUR_REJECTIONS if counts.get(k))
+            print(f"[FloatingOrb] tour candidates found {counts['found']} measured "
+                  f"{counts['measured']} accepted {counts['accepted']} rejected "
+                  f"{counts['rejected']}" + (f" ({why})" if why else ""))
         if gen != self._tour_gen:
             return                                   # a step arrived meanwhile
         if not rects:
@@ -852,10 +1188,39 @@ class FloatingOrb:
         stop = tour["stops"][tour["i"]]
         plan = tour_plan(self.square, stop, tour["medium"])
         tour["i"] += 1
-        tour["next_at"] = self._clock() + sum(s[2] for s in plan) + TOUR_DWELL_S
+        tour["next_at"] = self._clock() + sum(s[2] for s in plan) + TOUR_DWELL_S   # estimate
         self.dock = "tour"
-        self._tween.play(plan, on_frame=self._set_square)
+        self._tween.play(plan, on_frame=self._set_square,
+                         done=lambda: self._hop_landed(tour))
         return True
+
+    def _hop_landed(self, tour):
+        """Tween thread: a hop has landed; dwell from now."""
+        if self._tour is tour:
+            tour["next_at"] = self._clock() + TOUR_DWELL_S
+
+    def _landed(self):
+        """Tween thread: a flight has landed; a dock dwells from now (finish,
+        then dwell)."""
+        if self.dock and self.dock != "tour" and not (self.aborted or self._stop_requested()):
+            self._dwell_until = self._clock() + self.DWELL_S
+
+    def _follow_in_flight(self):
+        """In flight and the goal moved (a new dock, the tour cancelled):
+        retarget the spring, keeping its position and velocity, instead of
+        waiting for it to land. The goal is judged from the destination."""
+        tw = self._tween
+        if self._tour is not None or not getattr(tw, "in_flight", False):
+            return
+        dest = getattr(tw, "goal", None)
+        if not dest:
+            return
+        goal = self._goal(orb_state(self._api), from_square=dest)
+        if max(abs(a - b) for a, b in zip(goal, dest)) <= 2:
+            return
+        if tw.retarget(goal) and self.dock != self._logged_dock:
+            self._logged_dock = self.dock
+            print(f"[FloatingOrb] dock {self.dock or 'none'} size {goal[2]} (retarget)")
 
     def _sync_panels(self, busy):
         """Task panels (Settings "Task panels"): created on first use, placed
@@ -939,6 +1304,7 @@ class FloatingOrb:
                 self._log_target(self._cur_target, why)
             self._sync_panels(busy)
             if self._tween.running:
+                self._follow_in_flight()
                 return
             if busy and self._tour_step():
                 return                               # touring the results
@@ -954,8 +1320,9 @@ class FloatingOrb:
                 return
             plan = flight_plan(self.square, goal)
             if self.dock:                            # a flight to a dock: finish, then dwell
+                # (an estimate now; _landed() restarts the dwell at the landing)
                 self._dwell_until = self._clock() + sum(s[2] for s in plan) + self.DWELL_S
-            self._tween.play(plan, on_frame=self._set_square)
+            self._tween.play(plan, on_frame=self._set_square, done=self._landed)
         except Exception as e:
             print(f"[FloatingOrb] tick error ({type(e).__name__})")
 
