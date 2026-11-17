@@ -192,6 +192,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
     _BROWSER_APP_NAMES = {"firefox", "chrome", "edge", "browser"}
 
     _DEFAULT_HOTKEY = "ctrl+k"  # fallback only if the LLM genuinely can't answer
+    CLIPBOARD_SET_TRIES = 3     # type_text: clipboard set attempts (about 0.5 s in all)
+    CLIPBOARD_RETRY_S = 0.25
     _PROJECT_MUTATION_CUES = re.compile(
         r"\b(?:convert|migrat|refactor|build|create|write|edit|modify|update|"
         r"install|add|remove|cleanup|delete)\b.*\b(?:project|website|app|react|"
@@ -3009,7 +3011,14 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 prev_clipboard = self.get_clipboard()
                 if prev_clipboard == "Clipboard is empty":
                     prev_clipboard = ""
-            if not self.set_clipboard(param):
+            # Another app may hold the clipboard for a moment: 3 tries over
+            # about 0.5 s, then fail closed with the field untouched.
+            for attempt in range(self.CLIPBOARD_SET_TRIES):
+                if attempt:
+                    time.sleep(self.CLIPBOARD_RETRY_S)
+                if self.set_clipboard(param):
+                    break
+            else:
                 self.last_result_text = (
                     "Could not set the clipboard (locked by another app); "
                     "the existing field was left unchanged."
@@ -3861,12 +3870,21 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             import win32clipboard
 
             win32clipboard.OpenClipboard()
+        except Exception:
+            return False
+        try:
             win32clipboard.EmptyClipboard()
             win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
-            win32clipboard.CloseClipboard()
             return True
         except Exception:
             return False
+        finally:
+            # A failed set must not leave the clipboard open: every later
+            # OpenClipboard (ours or another app's) would fail as "locked".
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
 
     def _vision_frame(self, label):
         """Frame for a vision read: captured after the last UI action

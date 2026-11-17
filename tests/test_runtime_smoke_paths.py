@@ -305,6 +305,61 @@ def test_type_text_does_not_clear_a_field_when_clipboard_staging_fails(monkeypat
     assert "left unchanged" in api.last_result_text
 
 
+def _clipboard_api(monkeypatch, results):
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(snapshot={"foreground_window": "Notepad"})
+    api.get_clipboard = lambda: "existing clipboard"
+    api._clipboard_text_full = lambda: None
+    api.sets, api.sleeps, api.events = [], [], []
+    results = list(results)
+
+    def set_clipboard(text):
+        api.sets.append(text)
+        return results.pop(0) if results else True
+
+    api.set_clipboard = set_clipboard
+    api.last_result_text = ""
+    monkeypatch.setattr("core.api.time.sleep", lambda s: api.sleeps.append(s))
+    monkeypatch.setattr("core.api.pyautogui.hotkey", lambda *k: api.events.append(k))
+    monkeypatch.setattr("core.api.pyautogui.press", lambda k: api.events.append(k))
+    return api
+
+
+def test_type_text_retries_a_locked_clipboard_and_succeeds_on_the_second_try(monkeypatch):
+    api = _clipboard_api(monkeypatch, [False, True])
+    assert Api._act_type_text(api, "new message") is True
+    # Two tries, then the user's clipboard is restored.
+    assert api.sets == ["new message", "new message", "existing clipboard"]
+    assert api.sleeps[0] == Api.CLIPBOARD_RETRY_S
+    assert ("ctrl", "v") in api.events
+
+
+def test_type_text_fails_closed_after_the_third_clipboard_try(monkeypatch):
+    api = _clipboard_api(monkeypatch, [False, False, False, True])
+    assert Api._act_type_text(api, "new message") is False
+    assert api.sets == ["new message"] * 3          # nothing staged, nothing restored
+    assert api.sleeps == [Api.CLIPBOARD_RETRY_S] * 2
+    assert sum(api.sleeps) <= 0.6
+    assert api.events == []                         # the field was never touched
+    assert "left unchanged" in api.last_result_text
+
+
+def test_set_clipboard_closes_the_clipboard_when_setting_fails(monkeypatch):
+    import sys
+    calls = []
+
+    def fail(*_a):
+        raise RuntimeError("busy")
+
+    fake = SimpleNamespace(OpenClipboard=lambda: calls.append("open"),
+                           EmptyClipboard=lambda: calls.append("empty"),
+                           SetClipboardData=fail, CF_UNICODETEXT=13,
+                           CloseClipboard=lambda: calls.append("close"))
+    monkeypatch.setitem(sys.modules, "win32clipboard", fake)
+    assert Api.set_clipboard(Api.__new__(Api), "x") is False
+    assert calls == ["open", "empty", "close"]
+
+
 def test_app_lookup_uses_literal_matching_and_rejects_empty_targets(monkeypatch):
     api = Api.__new__(Api)
     commands = []

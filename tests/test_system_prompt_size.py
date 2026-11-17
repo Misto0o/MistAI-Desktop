@@ -39,14 +39,16 @@ STATES = {
 # updated on purpose for the batched-steps LOOP rule (default on), then for the
 # merged BROWSER search rule (DuckDuckGo; two nearby rules tightened to make room),
 # then for the batch form moved from the LOOP rule into RESPONSE FORMAT (the model
-# never batched while the last format it read showed one action only).
+# never batched while the last format it read showed one action only), then for
+# the steps form naming its five input actions and that run_command, file, browser
+# and read actions are one per reply (the LOOP rule tightened to make room).
 PROMPT_HASHES = {
-    "plain": "4a8b30ab8ee55fb8e387712bb6d5630992ac28ea7f8f16fa51a12bfc7d7cdc91",
-    "project": "baa517b67c9c80be875990a1246165f681a43c6220a667da23600c9a88ddb311",
-    "long-screen": "3c2d8d4cedf1874cc32c644ad2b51e3fe624b01c5015c08c214e7dfd7368588c",
-    "hints-and-conversation": "8eb4ba0571938ceab3427a5374f1f3adf7bf5e62e0528cbc90c0a7c5d1ed3ef8",
+    "plain": "6135c7a5ebfb8eedf1d60523fec9d9538187a508c2699da2a8a6c338cae69e5d",
+    "project": "5a37832d469e0521a8400027a95f84a2f79bbe7f2a6c9c1ad72df36d32f9a69e",
+    "long-screen": "cae631008ee81c812e13c3c98f3a6d6b90ad54b3d1922c29a2bb101c89a80177",
+    "hints-and-conversation": "e153afcd0bdac1a31ad93b1bb30b92b00f60068bfb6fb89dbbf8a19ef438578e",
 }
-PLAIN_LENGTH = 21049            # 20,933 before the batch form moved into RESPONSE FORMAT
+PLAIN_LENGTH = 21056            # 21,049 before the steps form named its five actions
 
 
 def build(state):

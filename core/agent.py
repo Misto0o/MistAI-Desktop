@@ -28,7 +28,7 @@ from .config import (BACKEND_LIMIT_WARN_RATIO, BACKEND_MESSAGES_LIMIT, BACKEND_S
                      log_text, skip_verified_read_enabled, step_param_for_log, verbose_logs,
                      vision_gating_enabled)
 from .live_state import describe_open_apps
-from .tools import CLICK_FAMILY, READ_RESULT_CHARS
+from .tools import CLICK_FAMILY, READ_RESULT_CHARS, SPECS
 from .uia_text import text_is_sufficient
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
@@ -883,6 +883,7 @@ class AgentLoop:
         done_reminded = False
         batch_queue = []  # the rest of a batched reply (MISTAI_BATCH_STEPS)
         batch_ok = False  # the previous queued step executed cleanly
+        batch_note = ""  # steps of the last reply that will not run (observation)
 
         print(f"\n[AgentLoop] Task: {log_text(task)}")
         if self.api.caption_window and self.api.captions_enabled:
@@ -912,6 +913,11 @@ class AgentLoop:
                         f"[OBSERVATION] Batch stopped; these steps were NOT run: {left}. "
                         "Decide the next step from the current state.")})
                     batch_queue = []
+            if queued is None and batch_note:
+                # Steps of the last reply that were never queued (degraded
+                # list): told once the part that did run is over.
+                history.append({"role": "user", "content": batch_note})
+                batch_note = ""
             batch_ok = False
             steps_taken += 1
             snap = self.api.live.snapshot
@@ -1093,6 +1099,7 @@ class AgentLoop:
                     )
                     continue
                 batch_queue = cmd.pop("_batch", None) or []
+                batch_note = cmd.pop("_batch_note", "")
                 if batch_queue:
                     print(f"  [Batch] {len(batch_queue) + 1} steps in one reply")
             else:
@@ -1943,18 +1950,18 @@ class AgentLoop:
         batching = batch_steps_enabled()
         loop_rule = (
             "- You work in a LOOP: reply, then observe the result. A predictable input "
-            "sequence (open_app/switch_app, type_text, press_key, hotkey -- e.g. type, then "
-            f"Enter) goes in ONE reply as the steps form below (2-{BATCH_MAX_STEPS} steps, no "
-            "reads, no done); it stops at the first failure or question. Anything else is "
-            "one action per reply."
+            "sequence (e.g. type, then Enter) goes in ONE reply as the steps form below "
+            "(no reads, no done); it stops at the first failure or question."
             if batching else
             "- You work in a LOOP. Each iteration, analyze the screen and decide exactly ONE "
             "action. Observe the result before proceeding.")
         submit_hint = " (both in one steps reply)" if batching else ""
         response_format = (
             '{"thinking":"brief reasoning","action":"...","parameter":"...","speech":""}'
-            + ('\nor, for an input sequence: {"thinking":"...","steps":[{"action":"...",'
-               '"parameter":"..."}, ...]}' if batching else ""))
+            + (f'\nor 2-{BATCH_MAX_STEPS} input steps (ONLY open_app/switch_app/type_text/'
+               'press_key/hotkey; run_command, file, browser and read actions are one per '
+               'reply): {"thinking":"...","steps":[{"action":"...","parameter":"..."}, ...]}'
+               if batching else ""))
 
         return f"""You are MistAI, a JARVIS-like desktop AI assistant with FULL system-level control.
 
@@ -2225,36 +2232,115 @@ VS Code evidence; it never creates or edits files.
 RESPONSE FORMAT (JSON ONLY):
 {response_format}"""
 
+    _BATCH_SET = "/".join(sorted(BATCHABLE_ACTIONS))
     BATCH_RETRY_NOTE = (
-        "[OBSERVATION] Your \"steps\" list was malformed and NOTHING was run. A batch is "
-        f"2-{BATCH_MAX_STEPS} steps, each {{\"action\",\"parameter\"}}, only "
-        + "/".join(sorted(BATCHABLE_ACTIONS)) + " (no reads, no done, no top-level action). "
+        "[OBSERVATION] Your \"steps\" list was not usable ({why}) and NOTHING was run. A "
+        f"batch is 2-{BATCH_MAX_STEPS} steps, each {{{{\"action\",\"parameter\"}}}}, only "
+        + _BATCH_SET + " (no reads, no done, no top-level action). "
         "Otherwise reply with ONE action: "
-        '{"thinking":"...","action":"...","parameter":"...","speech":""}')
+        '{{"thinking":"...","action":"...","parameter":"...","speech":""}}')
+    BATCH_DROP_NOTE = (
+        "[OBSERVATION] These steps of your list were NOT run ({why}): {left}. A steps list "
+        "may hold only " + _BATCH_SET + "; every other action (run_command, file, browser, "
+        "read actions, done, ask_user) takes one reply of its own. Decide the next step "
+        "from the current state.")
+    # Content-free reason labels (logged) -> what the model is told.
+    BATCH_REASONS = {
+        "not-json": "the reply was not valid JSON",
+        "not-objects": 'a step was not an {{"action","parameter"}} object',
+        "too-few": "the list had no steps",
+        "too-many": f"a list holds at most {BATCH_MAX_STEPS} steps",
+        "missing-field": "a step had no action",
+        "bad-parameter": "a step's parameter was not plain text",
+        "non-batchable-action": "'{action}' cannot share a reply with other steps",
+        "mixed-form": "the reply had both a top-level action and a steps list",
+    }
+
+    @classmethod
+    def _batch_reason(cls, label, action=""):
+        """(log label, model text). The log names an action only by a fixed
+        menu id; anything else the model wrote is "unknown"."""
+        known = action in SPECS or action in cls.META_ACTIONS
+        log = f"{label} {action if known else 'unknown'}" if label == "non-batchable-action" else label
+        return log, cls.BATCH_REASONS[label].format(action=action[:40])
+
+    @classmethod
+    def _batch_retry(cls, label, action=""):
+        log, why = cls._batch_reason(label, action)
+        print(f"  [Batch] malformed steps list ({log}) -- parse retry")
+        return {"action": "parse_retry", "parameter": "", "speech": "",
+                "thinking": "Malformed steps list, retrying",
+                "retry_note": cls.BATCH_RETRY_NOTE.format(why=why)}
+
+    @staticmethod
+    def _step_problem(st):
+        """None for a step that is a valid single action, else its reason label."""
+        if not isinstance(st, dict):
+            return "not-objects"
+        action = st.get("action")
+        if not isinstance(action, str) or not action.strip() or action.strip() == "parse_retry":
+            return "missing-field"
+        if isinstance(st.get("parameter", ""), (dict, list)):
+            return "bad-parameter"
+        return None
 
     @classmethod
     def _batch_cmd(cls, obj):
-        """A {"steps": [...]} reply as its first step plus "_batch" (the rest),
-        or parse_retry with BATCH_RETRY_NOTE when the list is not a valid batch."""
+        """A {"steps": [...]} reply as its longest valid prefix of 2+ batchable
+        steps (first step plus "_batch"), else its first step alone as a single
+        action. Steps after that are never run: "_batch_note" tells the model
+        which and why. parse_retry (with the reason) only when not even the
+        first step is a usable action."""
         steps = obj.get("steps")
-        ok = (isinstance(steps, list) and 2 <= len(steps) <= BATCH_MAX_STEPS
-              and not str(obj.get("action") or "").strip())
-        clean = []
-        for st in steps if ok else []:
-            action = st.get("action") if isinstance(st, dict) else None
-            param = st.get("parameter", "") if isinstance(st, dict) else None
-            if (not isinstance(action, str) or action.strip() not in BATCHABLE_ACTIONS
-                    or isinstance(param, (dict, list))):
-                ok = False
+        if str(obj.get("action") or "").strip():
+            return cls._batch_retry("mixed-form")
+        if not isinstance(steps, list):
+            return cls._batch_retry("not-objects")
+        if not steps:
+            return cls._batch_retry("too-few")
+        problem = cls._step_problem(steps[0])
+        if problem:
+            return cls._batch_retry(problem)
+
+        prefix, stop = [], None
+        for st in steps:
+            if len(prefix) == BATCH_MAX_STEPS:
+                stop = ("too-many", "")
                 break
-            clean.append({"action": action.strip(), "parameter": "" if param is None else param})
-        if not ok:
-            print("  [Batch] malformed steps list -- parse retry")
-            return {"action": "parse_retry", "parameter": "", "speech": "",
-                    "thinking": "Malformed steps list, retrying",
-                    "retry_note": cls.BATCH_RETRY_NOTE}
-        first = dict(clean[0], thinking=obj.get("thinking", ""), speech="")
-        first["_batch"] = clean[1:]
+            problem = cls._step_problem(st)
+            if problem:
+                stop = (problem, "")
+                break
+            action = st["action"].strip()
+            if action not in BATCHABLE_ACTIONS:
+                stop = ("non-batchable-action", action)
+                break
+            param = st.get("parameter", "")
+            prefix.append({"action": action, "parameter": "" if param is None else param})
+
+        if len(prefix) >= 2:
+            first = dict(prefix[0], thinking=obj.get("thinking", ""), speech="")
+            first["_batch"] = prefix[1:]
+        else:
+            # Only the first step is usable: it runs alone, as a single action.
+            st = steps[0]
+            action = st["action"].strip()
+            param = st.get("parameter", "")
+            speech = st.get("speech") or (obj.get("speech") if action == "done" else "") or ""
+            first = {"action": action, "parameter": "" if param is None else param,
+                     "thinking": st.get("thinking") or obj.get("thinking", ""),
+                     "speech": speech if isinstance(speech, str) else ""}
+            prefix = [first]
+        dropped = steps[len(prefix):]
+        if dropped:
+            log, why = cls._batch_reason(*stop)
+            print(f"  [Batch] malformed steps list ({log}) -- running {len(prefix)} of "
+                  f"{len(steps)} steps")
+            left = ", ".join(
+                (f"{s.get('action')}({str(s.get('parameter', ''))[:40]})"
+                 if isinstance(s, dict) else "(not a step)")
+                for s in dropped)
+            first["_batch_note"] = cls.BATCH_DROP_NOTE.format(why=why, left=left)
         return first
 
     def _parse_cmd(self, raw):
@@ -2292,10 +2378,9 @@ RESPONSE FORMAT (JSON ONLY):
                 return self._batch_cmd(parsed)
             if (isinstance(parsed, list) and batch_steps_enabled()
                     and len(parsed) >= 2 and all(isinstance(x, dict) for x in parsed)
-                    and all(str(x.get("action") or "").strip() in BATCHABLE_ACTIONS
-                            for x in parsed)):
-                # A bare list of input steps is the steps form without its
-                # wrapper; _batch_cmd validates it like any other batch.
+                    and self._step_problem(parsed[0]) is None):
+                # A bare list of steps is the steps form without its wrapper;
+                # _batch_cmd runs its valid prefix and reports the rest.
                 return self._batch_cmd({"thinking": parsed[0].get("thinking", ""),
                                         "steps": parsed})
             if isinstance(parsed, list):
@@ -2315,6 +2400,8 @@ RESPONSE FORMAT (JSON ONLY):
                     outer = None
                 if isinstance(outer, dict) and "steps" in outer:
                     return self._batch_cmd(outer)
+                if not re.search(r"\{[^{}]+\}", cleaned, re.DOTALL):
+                    return self._batch_retry("not-json")
             m = re.search(r"\{[^{}]+\}", cleaned, re.DOTALL)
 
             if m:
