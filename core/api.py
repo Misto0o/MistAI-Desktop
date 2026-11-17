@@ -81,6 +81,7 @@ from .config import (
 from . import conversation, file_search
 from .events import EventBus
 from .executor import Executor
+from . import clipboard as clip
 from .live_state import LiveStateTracker, window_belongs_to
 from .memory import Memory, recall_builtin
 from .screen import ScreenBuffer
@@ -192,8 +193,9 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
     _BROWSER_APP_NAMES = {"firefox", "chrome", "edge", "browser"}
 
     _DEFAULT_HOTKEY = "ctrl+k"  # fallback only if the LLM genuinely can't answer
-    CLIPBOARD_SET_TRIES = 3     # type_text: clipboard set attempts (about 0.5 s in all)
-    CLIPBOARD_RETRY_S = 0.25
+    # type_text: while another app holds the clipboard, retry after short
+    # jittered waits (clip.retry_delays, 1.5 s in all), then fall back to keys.
+    CLIPBOARD_BUDGET_S = clip.RETRY_BUDGET_S
     _PROJECT_MUTATION_CUES = re.compile(
         r"\b(?:convert|migrat|refactor|build|create|write|edit|modify|update|"
         r"install|add|remove|cleanup|delete)\b.*\b(?:project|website|app|react|"
@@ -3002,6 +3004,9 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             report += " No app was opened or switched to, so the text was appended; nothing was cleared."
         prev_clipboard = None
         clipboard_staged = False
+        # One lock across read, stage, paste and restore: MistAI's own watcher
+        # and tools never touch the clipboard in the middle of a paste.
+        clip.lock.acquire()
         try:
             # Stage text on the clipboard BEFORE changing the target field.
             # The old order cleared a draft with Ctrl+A/Delete and only then
@@ -3011,20 +3016,24 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 prev_clipboard = self.get_clipboard()
                 if prev_clipboard == "Clipboard is empty":
                     prev_clipboard = ""
-            # Another app may hold the clipboard for a moment: 3 tries over
-            # about 0.5 s, then fail closed with the field untouched.
-            for attempt in range(self.CLIPBOARD_SET_TRIES):
-                if attempt:
-                    time.sleep(self.CLIPBOARD_RETRY_S)
-                if self.set_clipboard(param):
+            # Another app may hold the clipboard for a moment: retry after
+            # short jittered waits (1.5 s at most).
+            staged = self.set_clipboard(param)
+            for d in clip.retry_delays(self.CLIPBOARD_BUDGET_S):
+                if staged:
                     break
-            else:
-                self.last_result_text = (
-                    "Could not set the clipboard (locked by another app); "
-                    "the existing field was left unchanged."
-                )
-                return False
-            clipboard_staged = True
+                time.sleep(d)
+                staged = self.set_clipboard(param)
+            by_keys = False
+            if not staged:
+                if not clip.can_send_as_keys(param):
+                    self.last_result_text = (
+                        "Could not set the clipboard (locked by another app); "
+                        "the existing field was left unchanged."
+                    )
+                    return False
+                by_keys = True      # short one-line text: type it as key events
+            clipboard_staged = staged
 
             time.sleep(0.2)
             if replace:
@@ -3032,10 +3041,17 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 time.sleep(0.05)
                 pyautogui.press("delete")
                 time.sleep(0.2)
-            pyautogui.hotkey("ctrl", "v")
+            if by_keys:
+                if not clip.send_unicode(param):
+                    self.last_result_text = "Keyboard fallback failed; text may be incomplete."
+                    return False
+                report += " The clipboard was busy, so the text was entered with keyboard events."
+            else:
+                pyautogui.hotkey("ctrl", "v")
             time.sleep(0.15)
             self.last_result_text = report
-            print(f"[TypeText] {self._input_report_for_log(report, True)}")
+            print(f"[TypeText] {self._input_report_for_log(report, True)}"
+                  + (" via=keys" if by_keys else ""))
             return True
         except Exception as e:
             print(f"[TypeText] Error: {e if verbose_logs() else type(e).__name__}")
@@ -3044,6 +3060,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             # Preserve the user's clipboard even if UI input itself fails.
             if clipboard_staged:
                 self.set_clipboard(prev_clipboard)
+            clip.lock.release()
 
     def _get_app_search_hotkey(self, app):
         """Look up (and permanently cache) an app's quick-switch/search
@@ -3830,61 +3847,20 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         """The whole clipboard text ("" when it holds no text), or None when
         it cannot be read. get_clipboard() truncates; restoring from it would
         cut a long clipboard short."""
-        try:
-            import win32clipboard
-
-            win32clipboard.OpenClipboard()
-            try:
-                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-                    return str(win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT))
-                return ""
-            finally:
-                win32clipboard.CloseClipboard()
-        except Exception:
-            return None
+        return clip.read_text()
 
     def get_clipboard(self):
         """Live clipboard text; the LiveState snapshot (300 chars, may be
         stale) is only a fallback."""
-        content = None
-        try:
-            import win32clipboard
-
-            win32clipboard.OpenClipboard()
-            try:
-                content = ""
-                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-                    content = str(
-                        win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-                    )
-            finally:
-                win32clipboard.CloseClipboard()
-        except Exception:
-            content = None
+        content = clip.read_text()
         if content is None:
             content = self.live.snapshot.get("clipboard", "")
         return content[:_RESULT_MEMORY_CHARS] if content else "Clipboard is empty"
 
     def set_clipboard(self, text):
-        try:
-            import win32clipboard
-
-            win32clipboard.OpenClipboard()
-        except Exception:
-            return False
-        try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
-            return True
-        except Exception:
-            return False
-        finally:
-            # A failed set must not leave the clipboard open: every later
-            # OpenClipboard (ours or another app's) would fail as "locked".
-            try:
-                win32clipboard.CloseClipboard()
-            except Exception:
-                pass
+        # clip.set_text always closes the clipboard (even after a failed set)
+        # and logs the holder (self|other|unknown) when it is busy.
+        return clip.set_text(text)
 
     def _vision_frame(self, label):
         """Frame for a vision read: captured after the last UI action

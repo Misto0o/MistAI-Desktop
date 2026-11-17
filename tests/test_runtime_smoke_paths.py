@@ -300,7 +300,8 @@ def test_type_text_does_not_clear_a_field_when_clipboard_staging_fails(monkeypat
         "core.api.pyautogui.press", lambda key: input_events.append(("press", key))
     )
 
-    assert Api._act_type_text(api, "new message") is False
+    # Long text cannot use the keyboard fallback, so it fails closed.
+    assert Api._act_type_text(api, "x" * 300) is False
     assert input_events == []
     assert "left unchanged" in api.last_result_text
 
@@ -330,16 +331,17 @@ def test_type_text_retries_a_locked_clipboard_and_succeeds_on_the_second_try(mon
     assert Api._act_type_text(api, "new message") is True
     # Two tries, then the user's clipboard is restored.
     assert api.sets == ["new message", "new message", "existing clipboard"]
-    assert api.sleeps[0] == Api.CLIPBOARD_RETRY_S
+    assert 0 < api.sleeps[0] <= 0.4                 # one short jittered wait
     assert ("ctrl", "v") in api.events
 
 
-def test_type_text_fails_closed_after_the_third_clipboard_try(monkeypatch):
-    api = _clipboard_api(monkeypatch, [False, False, False, True])
-    assert Api._act_type_text(api, "new message") is False
-    assert api.sets == ["new message"] * 3          # nothing staged, nothing restored
-    assert api.sleeps == [Api.CLIPBOARD_RETRY_S] * 2
-    assert sum(api.sleeps) <= 0.6
+def test_type_text_fails_closed_for_long_text_when_the_clipboard_stays_busy(monkeypatch):
+    api = _clipboard_api(monkeypatch, [False] * 100)
+    text = "new message " * 30
+    assert Api._act_type_text(api, text) is False
+    assert set(api.sets) == {text}                  # nothing staged, nothing restored
+    assert len(api.sets) > 3
+    assert 0.5 < sum(api.sleeps) <= 1.5
     assert api.events == []                         # the field was never touched
     assert "left unchanged" in api.last_result_text
 

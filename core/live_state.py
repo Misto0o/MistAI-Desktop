@@ -10,6 +10,7 @@ import time
 import psutil
 import pyautogui
 
+from . import clipboard
 from .config import (
     TRACKED_APPS,
     TRACKED_PROCESS_NAMES,
@@ -198,28 +199,9 @@ class LiveStateTracker:
         s["open_apps"] = apps[:20]
         s["background_apps"] = [a for a in s["open_apps"] if a not in windowed]
 
-        clip = ""
-        try:
-            import win32clipboard
-            win32clipboard.OpenClipboard()
-            try:
-                clip = str(win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT))[:300]
-            except Exception:
-                pass
-            finally:
-                win32clipboard.CloseClipboard()
-        except Exception:
-            try:
-                r = subprocess.run(
-                    ["powershell", "-command", "Get-Clipboard"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1,
-                )
-                clip = r.stdout.strip()[:300]
-            except Exception:
-                pass
-        s["clipboard"] = clip
+        # Opens the clipboard only when its sequence number changed. No
+        # PowerShell fallback: Get-Clipboard opens it too and only adds contention.
+        s["clipboard"] = clipboard.peek_text(300)
 
         try:
             s["cpu_percent"] = psutil.cpu_percent(interval=None)
