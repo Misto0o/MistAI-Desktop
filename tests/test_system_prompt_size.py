@@ -41,14 +41,18 @@ STATES = {
 # then for the batch form moved from the LOOP rule into RESPONSE FORMAT (the model
 # never batched while the last format it read showed one action only), then for
 # the steps form naming its five input actions and that run_command, file, browser
-# and read actions are one per reply (the LOOP rule tightened to make room).
+# and read actions are one per reply (the LOOP rule tightened to make room), then
+# for the action menu generated from core/tools.py (per-action text moved there),
+# then for the compact menu (one line per action; details via describe_action),
+# then for the rules merged without dropping one (toggles, UIA inputs, browser),
+# then for one short thinking sentence in RESPONSE FORMAT.
 PROMPT_HASHES = {
-    "plain": "6135c7a5ebfb8eedf1d60523fec9d9538187a508c2699da2a8a6c338cae69e5d",
-    "project": "5a37832d469e0521a8400027a95f84a2f79bbe7f2a6c9c1ad72df36d32f9a69e",
-    "long-screen": "cae631008ee81c812e13c3c98f3a6d6b90ad54b3d1922c29a2bb101c89a80177",
-    "hints-and-conversation": "e153afcd0bdac1a31ad93b1bb30b92b00f60068bfb6fb89dbbf8a19ef438578e",
+    "plain": "653ddd2fe110da29b1abd10ad4c2c780efe4e1821f71f2b0078063a55a4bdf10",
+    "project": "40e68057a35ccff2329fbf6acf91bad9cdf5d9b18ed523af8026bf80342ab87c",
+    "long-screen": "b38042578c376094c431f08c0ecd1b78541e76defe9dee1a6fb314e2fdd54a2c",
+    "hints-and-conversation": "9fe72f4cb61f99c157997d1ee0cd160c2fb57430262dfdd3f4a4db1d2a619f5d",
 }
-PLAIN_LENGTH = 21056            # 21,049 before the steps form named its five actions
+PLAIN_LENGTH = 13532            # 13,417 before the thinking cap; 21,056 originally
 
 
 def build(state):
@@ -85,16 +89,13 @@ def _template_lines():
 
 
 def test_the_template_has_no_indentation_or_trailing_spaces():
-    # One line keeps its 4 spaces: tests/test_grounding_rules.py finds the end of
-    # the quick_message menu entry by it ("\n    - ").
-    kept = ["    - open_project_in_vscode : open an EXISTING project folder in a NEW VS Code"]
-    bad = [l for l in _template_lines() if l != l.strip() and l not in kept]
+    bad = [l for l in _template_lines() if l != l.strip()]
     assert not bad, bad[:3]
     text = build("plain")
     # Line breaks and list markers are kept.
-    assert "\n- run_command       : Execute a PowerShell command" in text   # inner spacing stays
+    assert "\n- run_command <the command>: Run PowerShell" in text
     assert "\n1. run_command (PowerShell)" in text
-    assert "\n- done              : Task is complete." in text
+    assert "\n- done: End the task" in text
 
 
 def test_interpolated_blocks_keep_their_own_layout():

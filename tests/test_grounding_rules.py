@@ -110,9 +110,9 @@ def test_bare_app_name_and_message_source_clauses_are_merged_into_existing_rules
     assert ("A goal that is only an app's name means open or switch to it; "
             "once it is in front, call done.") in rule
     assert system.count("only an app's name") == 1
-    # Merged into the quick_message menu line.
-    menu = system[system.index("- quick_message      :"):]
-    menu = " ".join(menu[:menu.index("\n    - ")].split())
+    # Merged into the messaging flow's quick_message step (a rule, so it stays in
+    # the prompt; the menu line is one short line generated from core/tools.py).
+    menu = next(l for l in system.splitlines() if "ALWAYS try `quick_message" in l)
     assert ("The recipient and the message must both come from the user's words; "
             "if either is missing,") in menu
     assert "use ask_user FIRST" in menu

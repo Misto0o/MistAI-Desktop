@@ -405,4 +405,4 @@ def test_system_prompt_lists_known_folders_and_path_rule():
     assert "Known folders:" in system and "Downloads=D:\\Dl" in system
     assert "{downloads}" in system
     assert "Never invent environment variables" in system
-    assert system.count("brightness_get    :") == 1
+    assert system.count("\n- brightness_get:") == 1

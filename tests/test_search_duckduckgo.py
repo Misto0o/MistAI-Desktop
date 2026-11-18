@@ -161,5 +161,5 @@ def test_the_prompt_says_to_search_with_browser_search_only():
     assert "never open the user's browser app or type into an address bar to search" in rule
     assert "only when the user asks to open or use it" in rule
     assert len(re.findall(r"^- BROWSER", text, re.M)) == 1          # merged, not a new section
-    assert "browser_search    : Web search (DuckDuckGo)" in text
+    assert "- browser_search <search query>: Web search (DuckDuckGo)" in text
     assert "Google search" not in text

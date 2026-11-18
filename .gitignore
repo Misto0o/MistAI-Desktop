@@ -46,3 +46,4 @@ node_modules/
 
 # tools/live_checks.py personal settings (contact names)
 tools/live_checks.local.json
+plan.md

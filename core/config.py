@@ -366,6 +366,13 @@ BATCHABLE_ACTIONS = frozenset({"open_app", "switch_app", "type_text", "press_key
 BATCH_MAX_STEPS = 4
 
 
+def single_shot_enabled():
+    """MISTAI_SINGLE_SHOT (default off): the router also says whether a task
+    is one deliverable; only its explicit yes for that same message skips the
+    planning call (anything else plans as before)."""
+    return env_flag("MISTAI_SINGLE_SHOT", False)
+
+
 def batch_steps_enabled():
     """MISTAI_BATCH_STEPS (default on): accept a reply's "steps" list
     (BATCHABLE_ACTIONS, at most BATCH_MAX_STEPS). 0 = one action per reply."""

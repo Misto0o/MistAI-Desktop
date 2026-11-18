@@ -217,6 +217,13 @@ class ToolSpec:
     # Max chars of the handler's result text shown to the model per step.
     # >= READ_RESULT_CHARS marks a READ-type tool (see AgentLoop).
     result_chars: int = 300
+    # The model's playbook (filled from _PLAYBOOK below): what it does in one
+    # line, the exact parameter format (separators verbatim), longer details
+    # and an optional example. The prompt's action menu is generated from it.
+    purpose: str = ""
+    args: str = ""
+    limits: str = ""
+    example: str = ""
 
 
 READ_RESULT_CHARS = 4000
@@ -525,17 +532,232 @@ SPECS = dict(
             result_chars=1500,
         ),
         _T("schedule_reminder", base_confidence=0.9, categories=("memory",)),
+        # Read-only: returns an action's playbook entry (no screen, no input).
         _T(
-            "take_notes",
-            requires_focus=True,
-            expected_runtime=3.0,
-            categories=("type",),
+            "describe_action",
+            settle=0.0,
+            base_confidence=0.99,
+            categories=("info",),
+            result_chars=1500,
         ),
         # -- Meta (never routed through the Executor, listed for completeness) ---
         _T("ask_user", categories=("meta",)),
         _T("done", categories=("meta",)),
     ]
 )
+
+# The model's playbook: name -> (purpose, args, limits[, example]). purpose is
+# the one short line the menu always shows; args is the exact parameter format
+# ("" = no parameter, separators verbatim); limits holds the longer details that
+# describe_action returns. "{submit_hint}" is filled by action_menu().
+_PLAYBOOK = {
+    "open_app": ("Open an app (switches to it if already running)", "app name"),
+    "switch_app": ("Switch to a running app", "app name",
+                   'Preferred over open_app when listed in "Open apps".'),
+    "open_project_in_vscode": (
+        "Open an EXISTING project folder in a NEW VS Code window", "folder path",
+        "Use it instead of open_app/switch_app('code'), which reuse an unrelated window. "
+        "The folder must come from the user or reliable VS Code evidence; it never "
+        "creates or edits files."),
+    "window_list": ("List all open windows", ""),
+    "window_activate": ("Bring a window into focus", "window title"),
+    "window_close": ("Close a window", "window title"),
+    "window_maximize": ("Maximize a window", "window title"),
+    "window_minimize": ("Minimize a window", "window title"),
+    "minimize_all": ("Minimize all windows (ONLY when the user explicitly asks)", ""),
+    "active_app": ("Show the active application", ""),
+    "list_apps": ("List running applications", ""),
+    "uia_click": ("Click a native-app element by name via the accessibility tree",
+                  "element name",
+                  'If an edit control field lacks an exact text match, try control type "Edit".'),
+    "uia_find_input": ("Click into a native app's text input, chat field or search bar "
+                       "to focus it", ""),
+    "click_on_text": ("Find and click text via OCR/Vision", "text"),
+    "click_nth": ("Click the Nth item of a type", "N|type"),
+    "click_coords": ("Click raw pixels (LAST RESORT ONLY)", "x,y",
+                     "Use exact coordinates verified via read_screen_text."),
+    "type_text": (
+        "Type into the app you opened/switched to, replacing the field (with no such app "
+        "it only appends). It does NOT submit: follow it with press_key('enter'){submit_hint}",
+        "text",
+        "For a command, expression, or form, submit it with press_key('enter') or end the "
+        "text with the app's submit key."),
+    "type_search": ("Type text and press Enter", "text"),
+    "hotkey": ("Press a key combo", "ctrl+t"),
+    "press_key": ("Press one key", "key"),
+    "scroll": ("Scroll the window", "up or down"),
+    "quick_message": (
+        "Send a message to a named person (try this first)", "app|recipient|message",
+        "Uses the app's own quick-switch/search hotkey. ALWAYS TRY THIS FIRST for messaging "
+        "a SPECIFIC, CLEARLY NAMED person; if it fails, use the manual flow.",
+        "discord|Alex|running 5 minutes late"),
+    "run_command": ("Run PowerShell, get exact stdout/stderr (your DEFAULT tool for system "
+                    "tasks)", "the command"),
+    "write_file": (
+        "Create a file; on an existing file it REPLACES THE ENTIRE FILE (NEVER appends)",
+        "path|||complete content",
+        "It NEVER merges. On an existing file, inspect_file is required first and user "
+        'confirmation is required before execution. Never use write_file(existing_file, "a '
+        'new section") expecting an append: that would discard the old file. The path MUST '
+        'include a filename, never just "{desktop}|||hello" or a literal C:\\Users\\... path.',
+        "{desktop}\\status.txt|||hello"),
+    "inspect_file": ("Read and fingerprint an existing file before changing it", "file path",
+                     "REQUIRED before replacing a pre-existing file with write_file or "
+                     "patch_json."),
+    "patch_json": ("Merge JSON properties into an inspected existing JSON/config file",
+                   "path|||json object",
+                   "Use this for package.json changes so scripts and dependencies are "
+                   "preserved."),
+    "patch_file": (
+        "Replace ONE exact, unique fragment in an inspected existing text file",
+        "path|||exact existing text|||replacement text",
+        'Use this for a source edit such as adding a section: replace a unique anchor like '
+        '"</main>" with the new section plus "</main>". It refuses missing or ambiguous '
+        "anchors and does NOT append automatically.",
+        "{documents}\\site\\index.html|||</main>|||<section>About</section></main>"),
+    "find_file": (
+        "Find a file by name; with several results, act only on the one whose filename "
+        "matches what was asked, after checking its path",
+        'filename, wildcard like "*.pdf", or "folder\\name"',
+        "Searches the workspace root, Desktop, Documents, Downloads, home (skips "
+        "node_modules/.git/build/cache)."),
+    "organize_desktop": ("Move loose desktop files into categorized folders", ""),
+    "screenshot": ("Take a screenshot", "filename"),
+    "mss_screenshot": ("Fast full-screen capture (MSS)", ""),
+    "get_clipboard": ("Read the clipboard", ""),
+    "set_clipboard": ("Write text to the clipboard", "text"),
+    "lock_screen": ("Lock the workstation", ""),
+    "battery_status": ("Battery percentage", ""),
+    "brightness_get": ("Read screen brightness", ""),
+    "brightness_set": ("Set screen brightness", "0-100"),
+    "volume_mute": ("Mute system audio", "",
+                    "Windows Core Audio API -- deterministic, no toggle guessing."),
+    "volume_unmute": ("Unmute system audio", "",
+                      "Windows Core Audio API -- deterministic, no toggle guessing."),
+    "browser_open": ("Start MistAI's browser", "optional starting URL"),
+    "browser_navigate": ("Go to a URL in MistAI's browser", "url",
+                         "A channel is youtube.com/@handle; a YouTube search is "
+                         "youtube.com/results?search_query=YOUR+TERMS (one step instead "
+                         "of six)."),
+    "browser_search": ("Web search (DuckDuckGo) in one step", "search query"),
+    "browser_close": ("Close MistAI's browser", ""),
+    "browser_click": (
+        "Click by visible text in MistAI's browser",
+        'text, or text|role (e.g. "Subscribe|button")',
+        "Use text|role for precision when plain text matches more than one element "
+        "(role examples: button, link, checkbox, textbox). Talks to the real page "
+        "structure -- raises a real error if nothing matches, never silently clicks the "
+        "wrong thing."),
+    "browser_fill": ("Fill a form field in MistAI's browser",
+                     "field label or placeholder|text to type"),
+    "browser_get_text": (
+        "Read the page's exact DOM text (trust it, don't re-verify)",
+        "optional CSS selector, empty = whole page",
+        "Not a vision guess: use this instead of read_screen_text/analyze_screen for "
+        "anything inside a browser page."),
+    "browser_press_key": (
+        "Press a key in MistAI's browser page", 'key name, e.g. "k", "f", "Escape", "Enter"',
+        "For a video player use keyboard shortcuts rather than clicking: k or space = "
+        "play/pause, f = fullscreen, m = mute, j/l = back/forward 10s, arrow keys = "
+        "seek/volume, c = captions. Click once on the video area with browser_click first "
+        "to give the player focus."),
+    "browser_import_cookies": (
+        "Import one domain's cookies from the user's real Firefox (rarely needed)",
+        "domain, or domain1|domain2",
+        "MistAI's browser AUTO-SEEDS from the user's real Firefox logins on its own "
+        'first-ever launch -- do NOT call this for a normal "am I logged in" / "use my '
+        "cookies\" request. Only for ONE SPECIFIC domain that wasn't part of the original "
+        "seed."),
+    "browser_use_daily_profile": (
+        "Re-seed MistAI's browser from the user's real Firefox (rarely needed)", "",
+        "Only if the user wants to REFRESH with a login added since the original "
+        "auto-seed. Not needed on a normal first use."),
+    "open_url": ("Open a website in the user's own browser", "url"),
+    "check_email": ("Check unread emails", ""),
+    "analyze_screen": ("General visual description of the screen", ""),
+    "read_screen_text": ("Answer a SPECIFIC question about content VISIBLE on screen",
+                         "your question",
+                         "Use it to check a conversation header or other UI text you "
+                         "need; not to confirm an action that reported success."),
+    "remember": ("Store a long-term fact", "fact text"),
+    "recall": ("Retrieve stored facts", "search query"),
+    "remind_me": ("Add a reminder", "text|due_time"),
+    "get_reminders": ("List pending reminders", ""),
+    "schedule_reminder": ("Remind N seconds from now", "seconds|text"),
+    "describe_action": ("An action's full details: format, limits, example", "action name"),
+    "ask_user": ("Ask the user and wait for the answer", "your question"),
+    "done": ("End the task (its speech is the answer)", ""),
+}
+for _name, _doc in _PLAYBOOK.items():
+    _doc = tuple(_doc) + ("",) * (4 - len(_doc))
+    SPECS[_name].purpose, SPECS[_name].args, SPECS[_name].limits, SPECS[_name].example = _doc
+
+# Structural parameter checks for the actions with a fixed format. A mismatch
+# never blocks the action; the observation then carries the action's entry.
+_ARG_RX = {
+    "write_file": r"[^|]*\S[^|]*\|\|\|",
+    "patch_json": r"[^|]*\S[^|]*\|\|\|",
+    "patch_file": r"[^|]*\S[^|]*\|\|\|.+?\|\|\|",
+    "quick_message": r"[^|]*\S[^|]*\|[^|]*\S[^|]*\|\s*\S",
+    "browser_fill": r"[^|]*\S[^|]*\|",
+    "click_nth": r"\s*\d+\s*\|\s*\S",
+    "click_coords": r"\s*\d+\s*,\s*\d+\s*$",
+    "brightness_set": r"\s*(100|\d{1,2})\s*%?\s*$",
+    "schedule_reminder": r"\s*\d+\s*(\||$)",
+    "scroll": r"(?i)\s*(up|down)\b",
+}
+
+
+def _fill(text, submit_hint):
+    return text.replace("{submit_hint}", submit_hint)
+
+
+def action_line(name, submit_hint=""):
+    """The menu's one line for an action: name, <parameter format>, purpose."""
+    s = SPECS[name]
+    return f"- {name}" + (f" <{s.args}>" if s.args else "") + ": " + _fill(s.purpose, submit_hint)
+
+
+def action_entry(name, submit_hint=""):
+    """One action's full playbook entry (describe_action, format notes)."""
+    s = SPECS[name]
+    text = action_line(name, submit_hint)
+    text += "" if text.endswith(".") else "."
+    if s.limits:
+        text += " " + _fill(s.limits, submit_hint)
+    if s.example:
+        text += f" Example parameter: {s.example}"
+    return text
+
+
+def action_menu(submit_hint=""):
+    """The prompt's AVAILABLE ACTIONS list, generated from SPECS: every action,
+    one line each."""
+    return "\n".join(action_line(n, submit_hint) for n in SPECS)
+
+
+def closest_actions(name, n=3):
+    """Registered action names closest to ``name`` (spelling only)."""
+    import difflib
+
+    return difflib.get_close_matches(str(name or "").strip().lower(), list(SPECS), n=n, cutoff=0.5)
+
+
+def describe_action(name):
+    """describe_action's result: the full entry, or the closest names."""
+    key = str(name or "").strip().lower()
+    if key in SPECS:
+        return action_entry(key)
+    close = closest_actions(key)
+    return (f"No action named '{str(name)[:40]}'."
+            + (f" Closest: {', '.join(close)}." if close else " See AVAILABLE ACTIONS."))
+
+
+def arg_problem(name, parameter):
+    """True when ``parameter`` does not fit ``name``'s fixed format."""
+    rx = _ARG_RX.get(name)
+    return bool(rx) and not re.match(rx, str(parameter or ""), re.S)
+
 
 _GENERIC = ToolSpec(name="unknown", base_confidence=0.6, base_reliability=0.6)
 

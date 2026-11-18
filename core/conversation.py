@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 
 from . import planner
-from .config import DEFAULT_MODEL, chat_timeout, verbose_logs
+from .config import DEFAULT_MODEL, chat_timeout, single_shot_enabled, verbose_logs
 
 _PROMPT = """You are Mist, a desktop assistant inspired by JARVIS: quick, confident, dry and a little playful, natural when spoken aloud, never robotic, and you don't narrate yourself.{address}
 
@@ -28,16 +28,41 @@ Use "task" for everything else: anything about this computer, its screen, files,
 In a chat reply, never claim you did, opened, checked, saw or changed anything on the computer."""
 
 
-def build_prompt(message, now, history="", title=""):
+# MISTAI_SINGLE_SHOT only: the extra field and its rule (the default prompt is unchanged).
+_REPLY_FIELD = '"reply": "your spoken answer, empty for task"}'
+_SINGLE_RULE = ('\nFor "task", "single" is true only when the message asks for ONE deliverable '
+                "that one run can finish (one answer, one app action, one file); false for "
+                "several deliverables and whenever you are unsure.")
+
+
+def build_prompt(message, now, history="", title="", single=False):
     """The routing prompt. ``now`` is the system clock string, ``history`` the
-    agent's recent-conversation block, ``title`` "sir"/"ma'am" or ""."""
-    return _PROMPT.format(
+    agent's recent-conversation block, ``title`` "sir"/"ma'am" or "".
+    ``single`` adds the one-deliverable field (MISTAI_SINGLE_SHOT)."""
+    text = _PROMPT.format(
         address=f" Occasionally address the user as {title}, not in every reply."
         if title else "",
         now=now,
         history=history,
         message=json.dumps(str(message)),
     )
+    if single:
+        text = text.replace(_REPLY_FIELD, _REPLY_FIELD[:-1] + ', "single": true or false}', 1)
+        text += _SINGLE_RULE
+    return text
+
+
+def parse_single(raw):
+    """True only for an explicit {"route": "task", "single": true}."""
+    try:
+        cleaned = (raw or "").strip()
+        for fence in ("```json", "```"):
+            if fence in cleaned:
+                cleaned = cleaned.split(fence)[1].split("```")[0]
+        data = json.loads(cleaned.strip())
+    except Exception:
+        return False
+    return isinstance(data, dict) and data.get("route") == "task" and data.get("single") is True
 
 
 def route_reason(raw):
@@ -94,6 +119,11 @@ def try_chat(api, message, gender="none", model=None):
     t0 = time.monotonic()
     timeout = chat_timeout()
     reason = ""
+    single = single_shot_enabled()
+    try:
+        api._single_shot_goal = None    # a hint is only ever for this message
+    except Exception:
+        pass
     try:
         try:
             history = api.agent._recent_conversation_block(message)
@@ -103,7 +133,7 @@ def try_chat(api, message, gender="none", model=None):
         now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
         raw = planner._llm(
             api,
-            build_prompt(message, now, history, title),
+            build_prompt(message, now, history, title, single=single),
             _model_for(api, model),
             timeout=timeout,
             label="Conversation",
@@ -111,6 +141,11 @@ def try_chat(api, message, gender="none", model=None):
         )
         reply = parse_route(raw)
         reason = route_reason(raw)
+        if single and reply is None:
+            one = parse_single(raw)
+            print(f"[Conversation] single deliverable: {'yes' if one else 'no'}")
+            if one:
+                api._single_shot_goal = str(message)
     except Exception as e:
         print(f"[Conversation] Router failed ({e if verbose_logs() else type(e).__name__}) "
               "-- routing to agent")

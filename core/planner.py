@@ -34,7 +34,7 @@ import requests
 
 from . import events
 from .api_manager import describe_api_error
-from .config import confirmation_answer, log_text, verbose_logs
+from .config import confirmation_answer, log_text, single_shot_enabled, verbose_logs
 
 PENDING = "pending"
 RUNNING = "running"
@@ -191,45 +191,22 @@ _PLAN_PROMPT = """You are decomposing a desktop-automation GOAL into PHASES.
 
 GOAL: "{goal}"
 
-WORKSPACE CONTEXT (ground truth; existing files must be preserved and migrated,
-not recreated as a blank template):
+WORKSPACE CONTEXT (ground truth; existing files must be preserved and migrated, not recreated as a blank template):
 {workspace}
 
-A phase is a DELIVERABLE -- something that exists in the world when the phase
-is done (a file written, an app configured, a form submitted). A phase is
-NEVER a UI micro-step. The agent running each phase already handles finding,
-focusing, verifying, and clicking on its own; it does not need those spelled
-out, and splitting them across phases makes it repeat the same action several
-times (on a toggle button, that UNDOES the action).
+A phase is a DELIVERABLE -- something that exists in the world when it is done (a file written, an app configured, a form submitted), NEVER a UI micro-step. The agent running each phase finds, focuses, clicks and verifies on its own; splitting those across phases makes it repeat actions (on a toggle button, that UNDOES them).
 
 Reply ONLY with JSON, no other text:
 {{"task_name": "ShortName", "nodes": [{{"id": "snake_case_id", "desc": "self-contained phase instruction", "depends_on": ["ids of phases whose OUTPUT this phase needs"]}}]}}
 
 Rules:
-- DEFAULT TO ONE NODE. Only split when the goal contains genuinely separate
-  deliverables. One node is the right answer far more often than not.
-- NEVER create nodes like "locate the button", "verify the button is enabled",
-  "move the cursor", "click it", "check if X exists", "confirm it worked",
-  "open the editor". Those are steps INSIDE a phase, not phases.
-  BAD  (4 nodes): locate_button -> verify_button -> move_to_button -> click_button
-  GOOD (1 node):  subscribe_to_channel: "Subscribe to the channel on the open video"
-- No verification-only nodes. Each phase verifies its own work.
-- Use 2-{max_nodes} nodes only for multiple real deliverables, e.g. three
-  different files, or "set up the project" + "deploy it".
-- depends_on means "cannot start until that phase's OUTPUT exists". Do NOT
-  chain independent phases (style.css does not depend on script.js -- both
-  depend only on the folder existing).
-- Each desc must name its OWN deliverable only, and must be executable given
-  just its dependencies' results.
-- Plan ONLY what remains. Things the goal or WORKSPACE says are already done
-  are context, not phases.
-- Deliver only what was asked, and NEVER specify an output format the user
-  didn't ask for: no "return true/false", "output a list", "write a report",
-  "save to a file". A QUESTION's deliverable is the spoken answer, so its desc
-  just says what to find out. When the goal DOES ask for an output ("...then
-  write the names in Notepad"), that output is a deliverable and must have a phase.
-- Don't split steps into phases when they use the same tool and can't fail
-  independently: creating a folder and a file inside it is ONE phase."""
+- DEFAULT TO ONE NODE; use 2-{max_nodes} only for genuinely separate deliverables (e.g. three different files, or "set up the project" + "deploy it").
+- NEVER create nodes like "locate the button", "verify the button is enabled", "move the cursor", "click it", "check if X exists", "confirm it worked", "open the editor": those are steps INSIDE a phase. BAD (4 nodes): locate_button -> verify_button -> move_to_button -> click_button. GOOD (1 node): subscribe_to_channel: "Subscribe to the channel on the open video". No verification-only nodes: each phase verifies its own work.
+- Don't split steps that use the same tool and can't fail independently: creating a folder and a file inside it is ONE phase.
+- depends_on means "cannot start until that phase's OUTPUT exists"; do NOT chain independent phases (style.css does not depend on script.js -- both depend only on the folder).
+- Each desc names its OWN deliverable in one sentence and must be executable given just its dependencies' results.
+- Plan ONLY what remains. Things the goal or WORKSPACE says are already done are context, not phases.
+- Deliver only what was asked, and NEVER specify an output format the user didn't ask for: no "return true/false", "output a list", "write a report", "save to a file". A QUESTION's deliverable is the spoken answer, so its desc just says what to find out. When the goal DOES ask for an output ("...then write the names in Notepad"), that output is a deliverable and must have a phase."""
 
 
 # Goals this short and simple never need decomposition; skipping the planning
@@ -326,6 +303,14 @@ def make_plan(api, goal, model):
     parsing/validation problem -- planning must never be the thing that
     breaks a task."""
     goal = goal.strip().strip("\"\u201c\u201d'\u2018\u2019")
+    # MISTAI_SINGLE_SHOT: the router's "one deliverable" hint, consumed here
+    # whatever happens, and trusted only for this exact goal.
+    hinted = getattr(api, "_single_shot_goal", None)
+    if hinted is not None:
+        try:
+            api._single_shot_goal = None
+        except Exception:
+            pass
     if (
         len(goal.split()) < 2
         or _is_browser_task_goal(goal)
@@ -333,6 +318,10 @@ def make_plan(api, goal, model):
         or _is_question_goal(goal)
     ):
         print("[Planner] Simple goal -- running directly, no decomposition")
+        return Plan([PlanNode("main", goal)]), ""
+    if (single_shot_enabled() and isinstance(hinted, str)
+            and hinted.strip().strip("\"\u201c\u201d'\u2018\u2019") == goal):
+        print("[Planner] Router: one deliverable -- running directly, no planning call")
         return Plan([PlanNode("main", goal)]), ""
 
     try:

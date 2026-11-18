@@ -84,11 +84,14 @@ inherits them. Methods that read a module-level name tests patch on
 
 ## Adding an action
 
-Four places: a `ToolSpec` in `core/tools.py` `SPECS` (settle time,
+Three places: a `ToolSpec` in `core/tools.py` `SPECS` (settle time,
 confidence, destructive/confirmation flags, fallbacks, verifier,
-`result_chars`); a dispatch line in `Api._exec_sync`; optionally a verifier
-in `core/verify.py`; and its description in the prompt menu in
-`AgentLoop._build_system` (the only way the model learns about it).
+`result_chars`) plus its `_PLAYBOOK` entry (one-line purpose, exact parameter
+format, limits, example), from which the prompt's action menu is generated;
+a dispatch line in `Api._exec_sync`; optionally a verifier in
+`core/verify.py`. The model sees one line per action and can call
+`describe_action` for the full entry. `tests/test_action_playbook.py` keeps
+the registry, the dispatch and the menu in sync.
 
 ## Safety gates
 

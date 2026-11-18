@@ -2225,8 +2225,6 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 # fails -- type_text/keys then warn instead of a silent ok.
                 self._last_opened_app = param.lower().strip()
                 return self.switch_to_app(param)
-            elif action == "take_notes":
-                return self.take_notes(param)
             elif action == "uia_find_input":
                 return self._act_uia_find_input(param)
             elif action == "window_list":
@@ -2286,7 +2284,11 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             elif action == "browser_import_cookies":
                 return self._act_browser_import_cookies(param)
             elif action == "browser_use_daily_profile":
-                return self._act_browser_use_daily_profile(param)  
+                return self._act_browser_use_daily_profile(param)
+            elif action == "describe_action":
+                from .tools import SPECS, describe_action
+                self.last_result_text = describe_action(param)
+                return param.strip().lower() in SPECS
         except Exception as e:
             print(f"[Exec] Error in {action}: "
                   f"{e if verbose_logs() else type(e).__name__}")  # may quote the parameter
