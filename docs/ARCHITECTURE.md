@@ -13,7 +13,7 @@ from `ui/html.py`'s JavaScript. Python talks back to the page with
 
 Long work never runs on the UI thread: the agent runs on its own thread
 (`AgentLoop.run_project`), the wake-word and push-to-talk listeners have
-theirs, the event bus (`core/events.py`) has one dispatch thread, and the
+theirs, the event bus (`core/live_state.py`) has one dispatch thread, and the
 floating orb has a 4 Hz control thread plus a per-flight animation thread.
 `Api._agent_lock` is the run gate: one task at a time; a second request is
 answered "I'm still working on ..." instead of queued.
@@ -23,7 +23,7 @@ answered "I'm still working on ..." instead of queued.
 1. **`Api.ask_mistai(message)`** (core/api.py). Handles a typed "stop",
    "resume <name>" and fixed filler replies ("thanks") without any model
    call.
-2. **Router** (`core/conversation.py` `try_chat`): one small model call
+2. **Router** (`core/planner.py` `try_chat`): one small model call
    returns `{"route": "chat"|"task", "reply"}`. Chat replies are answered
    at once. Anything doubtful, failed or slow (`MISTAI_CHAT_TIMEOUT`,
    default 5 s) goes to the agent; the log line says why
@@ -32,7 +32,7 @@ answered "I'm still working on ..." instead of queued.
    simple goals (short commands, questions, "go to X and read Y") as one
    phase with no planning call; other goals get one planning call that
    returns a small DAG of phases. A failed phase blocks only the phases
-   that depend on it; progress is saved in `core/task_store.py`.
+   that depend on it; progress is saved in `core/memory.py`.
 4. **`AgentLoop._loop`** (`core/agent.py`) runs one phase, at most 15
    steps. Each step:
    - screen context: by default only the window title and the Open apps
@@ -55,7 +55,7 @@ answered "I'm still working on ..." instead of queued.
      or input went astray, the model gets one reminder.
 5. **`Executor.run`** (`core/executor.py`): reroutes UIA actions to OCR in
    browsers, calls `Api._exec_sync`, waits the tool's settle time, runs the
-   ground-truth verifier (`core/verify.py`), scores confidence, and falls
+   ground-truth verifier (`core/executor.py`), scores confidence, and falls
    back to the tool's `fallback_tools` when confidence is low.
 6. **`Api._exec_sync`** dispatches to an `_act_*` handler, which reports its
    detail in `api.last_result_text`.
@@ -65,22 +65,27 @@ answered "I'm still working on ..." instead of queued.
 | area | files |
 |---|---|
 | UI pages (main, floating orb, panels) | `ui/html.py` |
-| glue, handlers, voice, settings | `core/api.py` + mixins `core/api_browser.py`, `core/api_system.py`, `core/api_windows.py` |
-| router / planner / loop / execution | `core/conversation.py`, `core/planner.py`, `core/agent.py`, `core/executor.py` |
+| glue, handlers, voice, settings | `core/api.py` (`Api` plus its browser, system and window mixin classes) |
+| router / planner | `core/planner.py` (conversation router, planner, `PlanRunner`) |
+| loop / execution / verification | `core/agent.py`, `core/executor.py` (`Executor` and the verifiers) |
 | tool metadata and the confirmation rule | `core/tools.py` (`SPECS`, `requires_confirmation`) |
-| verification | `core/verify.py` |
-| screen | `core/screen.py` (frame buffer), `core/vision.py` (Cohere), `core/uia_text.py`, `core/uia_nav.py`, `core/click_handler.py` (OCR/UIA/vision clicks) |
+| screen | `core/screen.py` (frame buffer, Cohere vision, accessibility text), `core/click_handler.py` (OCR/UIA/vision clicks, UIA navigator) |
 | browser | `core/browser_session.py` (Playwright Firefox, own profile) |
-| live state and events | `core/live_state.py`, `core/watchers.py`, `core/events.py` |
-| storage | `core/memory.py`, `core/task_store.py`, `core/task_memory.py`, `core/tools.py` stats (SQLite in `~/MistAI/memory.db`, or `MISTAI_DB_PATH`) |
-| settings and pure helpers | `core/config.py` |
-| floating orb and panels | `core/floating_orb.py`, `core/orb_panels.py`, `core/orb_layout.py` (geometry), `core/orb_motion.py` (spring motion) |
+| live state and events | `core/live_state.py` (event bus, clipboard owner, live state, watchers) |
+| storage | `core/memory.py` (Memory, TaskMemory, TaskStore), `core/tools.py` stats (SQLite in `~/MistAI/memory.db`, or `MISTAI_DB_PATH`) |
+| settings and pure helpers | `core/config.py` (also the backend URL/key choice) |
+| voice | `core/tts.py` (speech, voice-turn timing, wake recalibration) |
+| files and projects | `core/workspace.py` (workspace state, `find_file` search) |
+| overlays | `core/caption.py` (caption window, click indicator) |
+| floating orb and panels | `core/floating_orb.py` (window, geometry, spring motion, panels) |
 
-The `Api` mixins are a plain split by topic: methods moved verbatim, `Api`
-inherits them. Methods that read a module-level name tests patch on
-`core.api` (`wake_clips_enabled`, `recipient_match`, `_show_window_async`,
-`HEARTBEAT_SECONDS`), or constants defined in api.py, stay in api.py;
-`tests/test_api_structure.py` pins that.
+Each merged file starts with a section index; every section has a banner
+(`# ====` / TITLE / `# ====`), so Ctrl+F on a title lands in one place.
+
+The `Api` mixin classes group handlers by topic and `Api` inherits them.
+They never read a module-level name tests patch on `core.api`
+(`wake_clips_enabled`, `recipient_match`, `_show_window_async`,
+`HEARTBEAT_SECONDS`); `tests/test_api.py` (API STRUCTURE section) pins that.
 
 ## Adding an action
 
@@ -89,8 +94,8 @@ confidence, destructive/confirmation flags, fallbacks, verifier,
 `result_chars`) plus its `_PLAYBOOK` entry (one-line purpose, exact parameter
 format, limits, example), from which the prompt's action menu is generated;
 a dispatch line in `Api._exec_sync`; optionally a verifier in
-`core/verify.py`. The model sees one line per action and can call
-`describe_action` for the full entry. `tests/test_action_playbook.py` keeps
+`core/executor.py`. The model sees one line per action and can call
+`describe_action` for the full entry. `tests/test_agent.py` (ACTION PLAYBOOK section) keeps
 the registry, the dispatch and the menu in sync.
 
 ## Safety gates

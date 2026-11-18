@@ -389,13 +389,13 @@ def install_stub_fences(stub, plan_reply):
 
 
 def disable_vision():
-    import core.vision
+    import core.screen
 
-    saved = core.vision.CohereVision.ready
-    core.vision.CohereVision.ready = property(lambda self: False)
+    saved = core.screen.CohereVision.ready
+    core.screen.CohereVision.ready = property(lambda self: False)
 
     def undo():
-        core.vision.CohereVision.ready = saved
+        core.screen.CohereVision.ready = saved
 
     return undo
 
@@ -673,8 +673,8 @@ def reset_session(api, db_path):
     os.environ["MISTAI_DB_PATH"] = db_path
     try:
         from core.memory import Memory
-        from core.task_memory import TaskMemory
-        from core.task_store import TaskStore
+        from core.memory import TaskMemory
+        from core.memory import TaskStore
         from core.tools import ToolRegistry
 
         api.memory = Memory()
@@ -959,9 +959,9 @@ class Runner:
 
     def run_plan(self, sc, rep=None):
         from core import planner
-        from core.api_manager import APIKeyManager
+        from core.config import APIKeyManager
         from core.config import AGENT_MODEL
-        from core.events import EventBus
+        from core.live_state import EventBus
         from core.workspace import Workspace
 
         log_name = sc["name"] + (f"--r{rep}" if rep else "")

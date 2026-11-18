@@ -1,33 +1,342 @@
-"""Conversation layer: routing prompt, fail-closed parsing, router call.
+# ============================================================
+# PLANNER AND ROUTER TESTS
+# ============================================================
+#
+# The planner, the tool registry and the conversation router.
+#
+# SECTION INDEX
+#   1. PLANNER AND TOOLS
+#   2. PLANNER AND TOOLS HELPERS
+#   3. PLANNER AND TOOLS TESTS
+#   4. CONVERSATION ROUTER
+#   5. CONVERSATION ROUTER HELPERS
+#   6. CONVERSATION ROUTER TESTS
+#   7. CONVERSATION ROUTER API
+#   8. CONVERSATION ROUTER TESTS (2)
+#   9. CONVERSATION ROUTER HELPERS (2)
+#   10. CONVERSATION ROUTER AGENT
+#   11. CONVERSATION ROUTER ROUTING API
+#   12. CONVERSATION ROUTER HELPERS (3)
+#   13. CONVERSATION ROUTER TESTS (3)
+#   14. CONVERSATION ROUTER BUS
+#   15. API AFTER FAILED COMMAND
+#   16. CONVERSATION ROUTER TESTS (4)
+#   17. CONVERSATION ROUTER RESP
+#   18. CONVERSATION ROUTER TESTS (5)
+#   19. CONVERSATION ROUTER HELPERS (4)
+#   20. CONVERSATION ROUTER TESTS (6)
+#   21. CONVERSATION ROUTER GENDER API
+#   22. CONVERSATION ROUTER TESTS (7)
+#   23. CONVERSATION ROUTER HOTKEY MODELS
+#   24. CONVERSATION ROUTER TESTS (8)
+# ============================================================
 
-Merged by area (pure moves, no test changed) from: test_conversation_layer.py, test_model_choice.py."""
+"""The planner, the tool registry and the conversation router."""
 
-from types import SimpleNamespace
-import pytest
-from core import conversation
-from core.config import CHAT_TIMEOUT, DEFAULT_MODEL
-import threading  # noqa: E402
-from core.api import Api  # noqa: E402
 import json
 import threading
-import core.api as api_mod
-from core import config, planner
-from core.agent import AgentLoop
+from types import SimpleNamespace
+
+import pytest
+
+from core import planner, planner as conversation, config
+from core.memory import TaskRecord
+from core.tools import ToolRegistry, command_is_mutating, SPECS
+from core.config import CHAT_TIMEOUT, DEFAULT_MODEL, describe_api_error
 from core.api import Api
-from core.api_manager import describe_api_error
-from core.tools import SPECS
+import core.api as api_mod
+from core.agent import AgentLoop
 
 
+# ============================================================
+# PLANNER AND TOOLS
+# ============================================================
 
-# ==========================================================================
-# moved from tests/test_conversation_layer.py
-# ==========================================================================
+
+# ============================================================
+# PLANNER AND TOOLS HELPERS
+# ============================================================
+
+def _plan_from(payload):
+    return json.dumps(payload)
+
+
+# ============================================================
+# PLANNER AND TOOLS TESTS
+# ============================================================
+
+def test_make_plan_normalizes_dependency_ids_and_deduplicates_them(monkeypatch):
+    """Model IDs may vary in case, whitespace, and punctuation."""
+    raw = _plan_from(
+        {
+            "task_name": "StaticSite",
+            "nodes": [
+                {
+                    "id": "Create Folder!",
+                    "desc": "Create the project directory",
+                    "depends_on": [],
+                },
+                {
+                    "id": "Write-Assets",
+                    "desc": "Write the project asset files",
+                    "depends_on": ["CREATE FOLDER!", "create-folder"],
+                },
+            ],
+        }
+    )
+    monkeypatch.setattr(planner, "_llm", lambda *args, **kwargs: raw)
+
+    plan, name = planner.make_plan(
+        object(), "Build a project with separate folders and assets", "test-model"
+    )
+
+    assert name == "StaticSite"
+    assert plan.order == ["createfolder", "writeassets"]
+    assert plan.nodes["writeassets"].depends_on == ["createfolder"]
+
+
+def test_make_plan_falls_back_when_a_dependency_is_unknown(monkeypatch):
+    """An unknown dependency must not leave a phase permanently unrunnable."""
+    goal = "Build a deliverable with setup and final output"
+    raw = _plan_from(
+        {
+            "task_name": "BrokenPlan",
+            "nodes": [
+                {"id": "setup", "desc": "Prepare the workspace", "depends_on": []},
+                {
+                    "id": "deliver",
+                    "desc": "Build the requested deliverable",
+                    "depends_on": ["missing phase"],
+                },
+            ],
+        }
+    )
+    monkeypatch.setattr(planner, "_llm", lambda *args, **kwargs: raw)
+
+    plan, _ = planner.make_plan(object(), goal, "test-model")
+
+    assert plan.order == ["main"]
+    assert plan.nodes["main"].desc == goal
+    assert [node.id for node in plan.ready_nodes()] == ["main"]
+
+
+def test_write_file_confirmation_uses_resolved_placeholder_path(tmp_path):
+    """Overwrite checks must inspect the actual Desktop/Documents path."""
+    existing = tmp_path / "redirected_desktop" / "note.txt"
+    existing.parent.mkdir()
+    existing.write_text("old", encoding="utf-8")
+    registry = ToolRegistry(db_path=str(tmp_path / "memory.db"))
+    seen = []
+
+    def resolve_path(path):
+        seen.append(path)
+        return str(existing)
+
+    try:
+        parameter = "{desktop}\\note.txt|||new contents"
+        assert registry.is_destructive(
+            "write_file", parameter, resolve_path=resolve_path
+        )
+        assert seen == ["{desktop}\\note.txt"]
+        assert registry.requires_confirmation(
+            "write_file", parameter, resolve_path=resolve_path
+        )
+    finally:
+        if registry._conn:
+            registry._conn.close()
+
+
+def test_new_resolved_write_file_does_not_require_confirmation(tmp_path):
+    registry = ToolRegistry(db_path=str(tmp_path / "memory.db"))
+    try:
+        assert not registry.requires_confirmation(
+            "write_file",
+            "{documents}\\new.txt|||contents",
+            resolve_path=lambda _path: str(tmp_path / "new.txt"),
+        )
+    finally:
+        if registry._conn:
+            registry._conn.close()
+
+
+def test_quick_message_is_explicitly_confirmation_gated(tmp_path):
+    registry = ToolRegistry(db_path=str(tmp_path / "memory.db"))
+    try:
+        spec = registry.get("quick_message")
+        assert spec.destructive
+        assert not spec.reversible
+        assert spec.requires_confirmation
+        assert registry.requires_confirmation("quick_message", "discord|Ava|hello")
+    finally:
+        if registry._conn:
+            registry._conn.close()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cmd /c del C:/temporary.txt",
+        'powershell -Command "Remove-Item C:/temporary.txt"',
+        "& { Remove-Item C:/temporary.txt }",
+        "& 'Remove-Item' C:/temporary.txt",
+        "Copy-Item source.txt destination.txt -Force",
+    ],
+)
+def test_command_wrappers_and_copy_overwrites_are_confirmation_worthy(command):
+    assert command_is_mutating(command)
+
+
+def test_read_only_help_is_not_classified_as_mutating():
+    assert not command_is_mutating("Get-Help Remove-Item")
+
+
+def test_manual_send_and_close_shortcuts_are_confirmation_worthy(tmp_path):
+    registry = ToolRegistry(db_path=str(tmp_path / "memory.db"))
+    try:
+        assert registry.requires_confirmation("press_key", "Enter")
+        assert registry.requires_confirmation("browser_press_key", "return")
+        assert registry.requires_confirmation("hotkey", "alt+f4")
+        assert registry.requires_confirmation("browser_click", "Send|button")
+        assert registry.requires_confirmation("click_on_text", "Delete")
+        assert registry.requires_confirmation("click_coords", "740,320")
+        assert not registry.requires_confirmation("hotkey", "ctrl+a")
+    finally:
+        if registry._conn:
+            registry._conn.close()
+
+
+def test_stop_during_continue_prompt_pauses_instead_of_finishing_as_partial():
+    """A stop that wakes the prompt is not the same as declining a retry."""
+
+    class _Bus:
+        def publish(self, *_args, **_kwargs):
+            pass
+
+        def subscribe(self, *_args, **_kwargs):
+            return lambda: None
+
+    class _Store:
+        def save(self, _record):
+            pass
+
+    class _Api:
+        def __init__(self):
+            self._stop_requested = threading.Event()
+            self.bus = _Bus()
+            self.task_store = _Store()
+            self.workspace = SimpleNamespace(record_task_output=lambda *_args: None)
+            self.caption_window = None
+            self.captions_enabled = False
+            self.spoken = []
+
+        def speak(self, text):
+            self.spoken.append(text)
+
+    class _FailingAgent:
+        def _loop(self, *_args, **_kwargs):
+            return {"success": False, "error": "phase failed", "steps": 1}
+
+    api = _Api()
+    plan = planner.Plan(
+        [
+            planner.PlanNode("first", "first deliverable"),
+            planner.PlanNode("second", "independent deliverable"),
+        ]
+    )
+    record = TaskRecord("test", "Test", "goal", plan.to_dict())
+    runner = planner.PlanRunner(api, _FailingAgent())
+
+    def stop_at_prompt(*_args):
+        api._stop_requested.set()
+        return False
+
+    runner._confirm = stop_at_prompt
+    result = runner._drive(record, plan, "model", "none", "text", None)
+
+    assert result["paused"] is True
+    assert record.status == "paused"
+
+
+def test_phase_hints_match_only_the_phase_goal_not_the_framed_prompt():
+    """WORKSPACE file names and other phase IDs must not trigger hints."""
+
+    class _Bus:
+        def publish(self, *_args, **_kwargs):
+            pass
+
+        def subscribe(self, *_args, **_kwargs):
+            return lambda: None
+
+    calls = []
+
+    class _RecordingAgent:
+        def _loop(self, task, *_args, hint_text=None):
+            calls.append((task, hint_text))
+            return {"success": False, "error": "phase failed", "steps": 1}
+
+    api = SimpleNamespace(
+        _stop_requested=threading.Event(),
+        bus=_Bus(),
+        task_store=SimpleNamespace(save=lambda _record: None),
+        workspace=SimpleNamespace(
+            context_block=lambda: "discord_notes.txt",
+            record_task_output=lambda *_args: None,
+        ),
+        caption_window=None,
+        captions_enabled=False,
+        speak=lambda _text: None,
+    )
+
+    def run(desc):
+        api._stop_requested.clear()
+        plan = planner.Plan(
+            [
+                planner.PlanNode("write_page", desc),
+                planner.PlanNode("open_spotify", "independent deliverable"),
+            ]
+        )
+        record = TaskRecord("test", "Test", "build a page", plan.to_dict())
+        runner = planner.PlanRunner(api, _RecordingAgent())
+
+        def stop_at_prompt(*_args):
+            api._stop_requested.set()
+            return False
+
+        runner._confirm = stop_at_prompt
+        runner._drive(record, plan, "model", "none", "text", None)
+        return calls[-1]
+
+    task, hint_text = run("Write index.html")
+    assert "discord_notes.txt" in task and "open_spotify" in task
+    assert hint_text == "Write index.html"
+
+    # An empty desc must stay empty, not fall back to the framed prompt.
+    _task, hint_text = run("")
+    assert hint_text == ""
+
+
+# ============================================================
+# CONVERSATION ROUTER
+# ============================================================
+
+# Conversation layer: routing prompt, fail-closed parsing, router call.
+#
+# Merged by area (pure moves, no test changed) from: test_conversation_layer.py, test_model_choice.py.
+
+
+# ============================================================
+# CONVERSATION ROUTER HELPERS
+# ============================================================
 
 NOW = "Tuesday, October 06, 2026 at 03:15 PM"
 
 
 # -- Prompt grounding ---------------------------------------------------------
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS
+# ============================================================
 
 def test_prompt_supplies_the_clock_and_the_message():
     p = conversation.build_prompt('tell me a "joke"', NOW)
@@ -86,6 +395,10 @@ def test_parse_route_returns_a_reply_only_for_a_clean_chat_route(raw, expected):
 # -- Router call ---------------------------------------------------------------
 
 
+# ============================================================
+# CONVERSATION ROUTER API
+# ============================================================
+
 def _api(history="", history_raises=False):
     def block(_task):
         if history_raises:
@@ -94,6 +407,10 @@ def _api(history="", history_raises=False):
 
     return SimpleNamespace(agent=SimpleNamespace(_recent_conversation_block=block))
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (2)
+# ============================================================
 
 def test_try_chat_sends_one_small_call_and_returns_the_reply(monkeypatch):
     calls = []
@@ -168,8 +485,16 @@ def test_try_chat_fails_closed_without_api_manager():
     assert conversation.try_chat(SimpleNamespace(), "open calculator") is None
 
 
+# ============================================================
+# CONVERSATION ROUTER HELPERS (2)
+# ============================================================
+
 CHAT = '{"route": "chat", "reply": "Ha."}'
 
+
+# ============================================================
+# CONVERSATION ROUTER AGENT
+# ============================================================
 
 class _Agent:
     def __init__(self):
@@ -184,6 +509,10 @@ class _Agent:
         self.runs.append(("resume", args))
         self.callbacks = kwargs
 
+
+# ============================================================
+# CONVERSATION ROUTER ROUTING API
+# ============================================================
 
 def _routing_api(monkeypatch, llm_reply, resumable=None):
     """Bare Api like the smoke tests, with recorders and a scripted router."""
@@ -220,10 +549,18 @@ def _routing_api(monkeypatch, llm_reply, resumable=None):
     return api
 
 
+# ============================================================
+# CONVERSATION ROUTER HELPERS (3)
+# ============================================================
+
 def _finish(api):
     if api.agent.callbacks:
         api.agent.callbacks["on_done"]({"success": True, "steps": 1})
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (3)
+# ============================================================
 
 @pytest.mark.parametrize("mode", ["text", "voice"])
 def test_chat_reply_skips_gate_agent_and_minimize(monkeypatch, mode):
@@ -300,6 +637,10 @@ def test_resume_never_calls_the_router(monkeypatch):
 # -- Workspace state across requests -------------------------------------------
 
 
+# ============================================================
+# CONVERSATION ROUTER BUS
+# ============================================================
+
 class _Bus:
     def subscribe(self, *_args):
         return lambda: None
@@ -307,6 +648,10 @@ class _Bus:
     def publish(self, *_args):
         pass
 
+
+# ============================================================
+# API AFTER FAILED COMMAND
+# ============================================================
 
 def _api_after_failed_command(monkeypatch, tmp_path, llm_reply):
     from core.workspace import Workspace
@@ -320,6 +665,10 @@ def _api_after_failed_command(monkeypatch, tmp_path, llm_reply):
     assert "Last command (FAILED)" in api.workspace.context_block()
     return api
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (4)
+# ============================================================
 
 def test_new_agent_request_forgets_the_previous_run_but_keeps_the_project(
         monkeypatch, tmp_path):
@@ -342,13 +691,17 @@ def test_chat_routed_turn_leaves_the_workspace_alone(monkeypatch, tmp_path):
     assert "Last command (FAILED)" in context and "Recent actions" in context
 
 
-
 # ==========================================================================
 # moved from tests/test_model_choice.py
 # The user's model choice: one validated, saved setting that every LLM call
 # uses (agent, planner, router, hotkey lookup). A running request keeps its
 # model; failures are reported plainly and never switch to another model.
 # ==========================================================================
+
+
+# ============================================================
+# CONVERSATION ROUTER RESP
+# ============================================================
 
 class _Resp:
     def __init__(self, status, body=None, text=None):
@@ -364,6 +717,11 @@ class _Resp:
 
 # -- constants and the accessor ------------------------------------------------
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (5)
+# ============================================================
+
 def test_choices_labels_and_default():
     assert config.MODEL_CHOICES == ("gemini", "cohere", "mistral")
     assert config.MODEL_LABELS == {"gemini": "Nova", "cohere": "Sage", "mistral": "Flux"}
@@ -372,6 +730,10 @@ def test_choices_labels_and_default():
     assert not hasattr(config, "CHAT_MODEL")
     assert Api.__new__(Api).current_model() == "cohere"   # bare test object
 
+
+# ============================================================
+# CONVERSATION ROUTER HELPERS (4)
+# ============================================================
 
 @pytest.fixture
 def memory(monkeypatch, tmp_path):
@@ -387,6 +749,10 @@ def _api_with(memory):
     api._model = api._load_model_choice()
     return api
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (6)
+# ============================================================
 
 def test_set_model_validates_saves_and_survives_a_restart(memory):
     api = _api_with(memory)
@@ -440,6 +806,10 @@ def test_get_user_gender_validates_the_saved_value(memory, saved, expected):
     assert api.get_user_gender() == expected
 
 
+# ============================================================
+# CONVERSATION ROUTER GENDER API
+# ============================================================
+
 def _gender_api(memory):
     voices = []
     api = Api.__new__(Api)
@@ -447,6 +817,10 @@ def _gender_api(memory):
     api.tts = SimpleNamespace(set_gender=voices.append)
     return api, voices
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (7)
+# ============================================================
 
 def test_set_user_gender_saves_a_valid_choice(memory):
     api, voices = _gender_api(memory)
@@ -477,6 +851,11 @@ def test_get_user_gender_never_raises(capsys):
 
 # -- one model per request: router, agent, hotkey -------------------------------
 
+
+# ============================================================
+# CONVERSATION ROUTER HOTKEY MODELS
+# ============================================================
+
 def _hotkey_models(monkeypatch, api):
     sent = []
     monkeypatch.setattr(api_mod.requests, "post", lambda url, json=None, **_k: (
@@ -484,6 +863,10 @@ def _hotkey_models(monkeypatch, api):
     api.api_manager = SimpleNamespace(get_headers=lambda: {}, get_api_url=lambda: "u")
     return sent
 
+
+# ============================================================
+# CONVERSATION ROUTER TESTS (8)
+# ============================================================
 
 def test_request_uses_the_choice_everywhere_and_keeps_it_while_running(monkeypatch):
     api = _routing_api(monkeypatch, '{"route": "task", "reply": ""}')

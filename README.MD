@@ -105,7 +105,7 @@ $env:PLAYWRIGHT_BROWSERS_PATH = "0"; python -m PyInstaller MistAI.spec --clean -
 UI (pywebview, ui/html.py) ──► Api.ask_mistai (core/api.py)
         │
         ├─ stop / resume / filler replies
-        ├─ conversation router (core/conversation.py): chat reply, or ...
+        ├─ conversation router (core/planner.py): chat reply, or ...
         ▼
   PlanRunner (core/planner.py)      one phase for simple goals, else a small DAG
         ▼

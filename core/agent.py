@@ -17,20 +17,34 @@ import time
 import requests
 
 from . import planner
-from .api_manager import describe_api_error
+from .config import (
+    describe_api_error,
+    BACKEND_LIMIT_WARN_RATIO,
+    BACKEND_MESSAGES_LIMIT,
+    BACKEND_SYSTEM_LIMIT,
+    BATCH_MAX_STEPS,
+    BATCHABLE_ACTIONS,
+    batch_steps_enabled,
+    confirm_listen_profile,
+    confirmation_answer,
+    credential_failure_reason,
+    injection_flags,
+    scrub_outbound,
+    scrub_outbound_enabled,
+    send_is_grounded,
+    lazy_vision_mode,
+    uia_first_enabled,
+    log_text,
+    skip_verified_read_enabled,
+    step_param_for_log,
+    verbose_logs,
+    vision_gating_enabled,
+)
 from .executor import Executor
-from .config import (BACKEND_LIMIT_WARN_RATIO, BACKEND_MESSAGES_LIMIT, BACKEND_SYSTEM_LIMIT,
-                     BATCH_MAX_STEPS, BATCHABLE_ACTIONS, batch_steps_enabled,
-                     confirm_listen_profile, confirmation_answer, credential_failure_reason,
-                     injection_flags, scrub_outbound, scrub_outbound_enabled,
-                     send_is_grounded,
-                     lazy_vision_mode, uia_first_enabled,
-                     log_text, skip_verified_read_enabled, step_param_for_log, verbose_logs,
-                     vision_gating_enabled)
 from .live_state import describe_open_apps
 from .tools import (CLICK_FAMILY, READ_RESULT_CHARS, SPECS, action_entry, action_menu,
                     arg_problem)
-from .uia_text import text_is_sufficient
+from .screen import text_is_sufficient
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
 # on screen (core/api.py read_screen_text).
@@ -775,7 +789,7 @@ class AgentLoop:
 
     def _publish_step(self, action, speech=None):
         """events.AGENT_STEP for the orb's panels (never logged)."""
-        from .events import AGENT_STEP
+        from .live_state import AGENT_STEP
 
         data = {"action": str(action)}
         if speech is not None:

@@ -1,3 +1,19 @@
+# ============================================================
+# VOICE MODULE
+# ============================================================
+#
+# Voice helpers: neural text-to-speech with the pyttsx3 fallback, the
+# [VoiceTiming] log of one spoken turn, and wake-loop noise recalibration.
+#
+# SECTION INDEX
+#   1. OPTIONAL SPEECH LIBRARIES
+#   2. NEURAL SPEECH
+#   3. VOICE TIMING
+#   4. VOICE TURN TIMER
+#   5. WAKE CALIBRATION
+#   6. NOISE RECALIBRATION POLICY
+# ============================================================
+
 """
 core/tts.py — Neural (edge-tts) text-to-speech with pyttsx3 fallback.
 
@@ -21,7 +37,19 @@ import threading
 import time
 from queue import Queue, Empty
 
-from .config import EDGE_TTS_VOICE
+from .config import (
+    EDGE_TTS_VOICE,
+    WAKE_ENERGY_MAX,
+    WAKE_ENERGY_MIN,
+    WAKE_RECAL_AFTER_FAILURES,
+    WAKE_RECAL_IDLE_S,
+    WAKE_RECAL_RETRY_S,
+)
+
+
+# ============================================================
+# OPTIONAL SPEECH LIBRARIES
+# ============================================================
 
 try:
     import edge_tts
@@ -33,6 +61,10 @@ except ImportError:
     EDGE_TTS_AVAILABLE = False
     sd = None
 
+
+# ============================================================
+# NEURAL SPEECH
+# ============================================================
 
 class NeuralTTS:
     # After an edge-tts failure (no network, TLS interception, ...) skip the
@@ -253,3 +285,130 @@ class NeuralTTS:
                 return
         self._engine.say(text)
         self._engine.runAndWait()
+
+
+# ============================================================
+# VOICE TIMING
+# ============================================================
+
+# core/voice_timing.py — [VoiceTiming] log lines for one spoken turn.
+#
+# A turn starts when the wake clip ends (or when a follow-up listen opens).
+# Each mark logs the seconds since the previous mark and since the start, and
+# the turn ends at the first agent step, a chat reply, or a failed listen.
+# Durations and mark names only, never transcript text.
+
+# ============================================================
+# VOICE TURN TIMER
+# ============================================================
+
+class VoiceTimer:
+    def __init__(self, clock=time.monotonic, log=print):
+        self._clock = clock
+        self._log = log
+        self._lock = threading.Lock()
+        self._label = ""
+        self._t0 = None
+        self._last = None
+
+    @property
+    def active(self):
+        with self._lock:
+            return self._t0 is not None
+
+    @property
+    def label(self):
+        """The active turn's label, or "" when no turn is active."""
+        with self._lock:
+            return self._label if self._t0 is not None else ""
+
+    def start(self, label, t0=None):
+        with self._lock:
+            self._label = label
+            self._t0 = self._clock() if t0 is None else t0
+            self._last = self._t0
+
+    def mark(self, name, end=False):
+        """Log one step of the active turn; a no-op when none is active."""
+        with self._lock:
+            if self._t0 is None:
+                return
+            now = self._clock()
+            delta, total = now - self._last, now - self._t0
+            self._last = now
+            label = self._label
+            if end:
+                self._t0 = None
+        self._log(f"[VoiceTiming] {label}: {name} +{delta:.2f}s (total {total:.2f}s)")
+
+
+# ============================================================
+# WAKE CALIBRATION
+# ============================================================
+
+# core/wake_calibration.py — when the wake loop re-measures room noise.
+#
+# The wake loop runs with a fixed energy threshold (dynamic adjustment raised
+# the bar during a loud "hey" until a quiet "mist" counted as silence). A fixed
+# threshold goes stale, so it is re-calibrated:
+#   * at startup,
+#   * after WAKE_RECAL_IDLE_S with no clip heard,
+#   * after WAKE_RECAL_AFTER_FAILURES untranscribable clips in a row (noise is
+#     opening clips: the threshold is too low),
+#   * once, WAKE_RECAL_RETRY_S after a result outside the band (it is clamped
+#     meanwhile; a second out-of-band result is kept, clamped, to avoid a loop).
+# Pure bookkeeping: the caller owns the microphone, TTS and lock checks.
+
+# ============================================================
+# NOISE RECALIBRATION POLICY
+# ============================================================
+
+class WakeCalibration:
+    def __init__(self, low=WAKE_ENERGY_MIN, high=WAKE_ENERGY_MAX,
+                 idle_s=WAKE_RECAL_IDLE_S, max_failures=WAKE_RECAL_AFTER_FAILURES,
+                 retry_s=WAKE_RECAL_RETRY_S):
+        self.low, self.high = low, high
+        self.idle_s, self.max_failures, self.retry_s = idle_s, max_failures, retry_s
+        self._forced = "startup"
+        self._retry_at = None
+        self._last_activity = None
+        self._failures = 0
+
+    def due(self, now):
+        """The reason a calibration is due now, or None."""
+        if self._forced:
+            return self._forced
+        if self._retry_at is not None and now >= self._retry_at:
+            return "threshold out of band"
+        if self._last_activity is not None and now - self._last_activity >= self.idle_s:
+            return f"idle {self.idle_s:.0f}s"
+        return None
+
+    def calibrated(self, measured, now):
+        """Record a finished calibration; return the threshold to use."""
+        was_retry = self._retry_at is not None
+        threshold = min(max(measured, self.low), self.high)
+        self._forced = None
+        self._failures = 0
+        self._last_activity = now
+        self._retry_at = (now + self.retry_s
+                          if threshold != measured and not was_retry else None)
+        return threshold
+
+    def failed(self, now):
+        """A calibration raised: keep the old threshold, retry when idle."""
+        self._forced = None
+        self._retry_at = None
+        self._last_activity = now
+
+    def heard(self, transcribed, now):
+        """A clip ended. transcribed: True, False (no speech found) or None
+        (recognizer/network error, which says nothing about the threshold)."""
+        self._last_activity = now
+        if transcribed is True:
+            self._failures = 0
+        elif transcribed is False:
+            self._failures += 1
+            if self._failures >= self.max_failures:
+                self._forced = f"{self.max_failures} untranscribed clips"
+                self._failures = 0

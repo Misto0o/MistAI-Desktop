@@ -1,3 +1,82 @@
+# ============================================================
+# CONFIG MODULE
+# ============================================================
+#
+# Shared constants, settings read at call time, paths and small text
+# utilities, plus the backend URL/key choice and API error wording.
+#
+# SECTION INDEX
+#   1. VERSION, URLS AND MODELS
+#   2. ROUTER TIMEOUT
+#   3. WAKE WORDS AND PUSH-TO-TALK TIMING
+#   4. WAKE WORD CANDIDATES
+#   5. FUZZY WAKE MATCH
+#   6. TITLE DASHES
+#   7. WINDOW TITLE NORMALIZATION
+#   8. WAKE PREFIX STRIPPING
+#   9. YES AND NO PATTERNS
+#   10. CONFIRMATION ANSWERS
+#   11. VOICE, APPS AND ENTER RULES
+#   12. ENVIRONMENT FLAGS
+#   13. VERBOSE BANNER STATE
+#   14. VERBOSE LOGS FLAG
+#   15. VERBOSE BANNER AND READ TRACING
+#   16. CONTENT-FREE LOG TEXT
+#   17. LOGGED PARAMETERS AND KEYS
+#   18. LOGGABLE KEY NAMES
+#   19. STEP PARAMETER LOGGING
+#   20. RESTORE AND VISION GATING FLAGS
+#   21. LAZY VISION MODE
+#   22. BATCHING, SINGLE-SHOT AND READ FLAGS
+#   23. ORB SIZES
+#   24. ORB BACKGROUND
+#   25. ORB DEBUG AND MOTION FLAGS
+#   26. ORB MOTION STYLE
+#   27. ORB FLIGHT, PANELS AND ANCHOR FLAGS
+#   28. VISION CLICK NUDGE
+#   29. CONFIRMATION LISTEN SETTINGS
+#   30. CONFIRMATION LISTEN PROFILE
+#   31. RE-MINIMIZE AFTER CONFIRMATION
+#   32. RECIPIENT MATCH LIMITS
+#   33. PERSON NAME NORMALIZATION
+#   34. RECIPIENT MATCH
+#   35. ASK BEFORE SENDING
+#   36. GROUNDED SEND CHECK
+#   37. VOICE DIAGNOSTICS FLAG
+#   38. NARRATION MODES
+#   39. NARRATION MODE
+#   40. WAKE CLIPS, HOTKEYS AND FACT CATEGORIES
+#   41. FACTS FILE PATH
+#   42. DATABASE PATH
+#   43. HISTORY RETENTION DEFAULT
+#   44. HISTORY RETENTION
+#   45. OWN PROCESS AND APP ALIASES
+#   46. PROCESS NAME NORMALIZATION
+#   47. APP PROCESS NAMES
+#   48. VENDOR PREFIXES
+#   49. PROCESS NAME CORES
+#   50. PROCESS MATCHING
+#   51. TRACKED PROCESSES AND SECRET FILE PATTERNS
+#   52. SECRET FILE REFERENCES
+#   53. OUTBOUND SCRUB PATTERNS
+#   54. CARD NUMBER CHECKSUM
+#   55. OUTBOUND SCRUB
+#   56. INJECTION FLAGS
+#   57. SECRET OUTPUT GUARD
+#   58. CREDENTIAL FAILURE PATTERNS
+#   59. CREDENTIAL FAILURE HINT
+#   60. SEARCH ENGINES AND ROUTES
+#   61. BLOCKED SEARCH PAGES
+#   62. SECRET TEXT GUARD
+#   63. BUNDLED RESOURCE PATHS
+#   64. JAVASCRIPT STRING ESCAPING
+#   65. TESSERACT SETUP
+#   66. BACKEND SELECTION
+#   67. API ERROR REDACTION
+#   68. API ERROR WORDING
+#   69. BACKEND URL AND KEY
+# ============================================================
+
 """
 core/config.py — shared constants, paths, and small text utilities.
 """
@@ -8,6 +87,11 @@ import re
 import difflib
 import unicodedata
 import urllib.parse
+
+
+# ============================================================
+# VERSION, URLS AND MODELS
+# ============================================================
 
 VERSION = "2.0"
 STATUS_URL = "https://mist-ai.fly.dev/api/status"
@@ -37,6 +121,10 @@ AGENT_MODEL = DEFAULT_MODEL  # alias: the default before the user picks one
 CHAT_TIMEOUT = 5
 
 
+# ============================================================
+# ROUTER TIMEOUT
+# ============================================================
+
 def chat_timeout():
     """MISTAI_CHAT_TIMEOUT seconds for the routing call (read at call time;
     default CHAT_TIMEOUT, clamped to 1-30; bad input = the default)."""
@@ -45,6 +133,11 @@ def chat_timeout():
     except ValueError:
         return CHAT_TIMEOUT
     return min(30.0, max(1.0, value)) if value == value else CHAT_TIMEOUT
+
+
+# ============================================================
+# WAKE WORDS AND PUSH-TO-TALK TIMING
+# ============================================================
 
 WAKE_WORDS = ["mist", "hey mist", "mistai", "mist ai"]
 
@@ -85,6 +178,10 @@ WAKE_WORD_ALTERNATIVES = {
 _WAKE_CANDIDATES = None
 
 
+# ============================================================
+# WAKE WORD CANDIDATES
+# ============================================================
+
 def _wake_candidates():
     """(phrase, canonical, is_alternative, regex), longest phrase first."""
     global _WAKE_CANDIDATES
@@ -104,6 +201,10 @@ def _wake_candidates():
         ]
     return _WAKE_CANDIDATES
 
+
+# ============================================================
+# FUZZY WAKE MATCH
+# ============================================================
 
 def fuzzy_wake(text, anchored=False):
     """Return (canonical_wake_word, command_after_it) or (None, None).
@@ -141,8 +242,16 @@ def fuzzy_wake(text, anchored=False):
     return None, None
 
 
+# ============================================================
+# TITLE DASHES
+# ============================================================
+
 _TITLE_DASHES = str.maketrans({"—": "-", "–": "-"})
 
+
+# ============================================================
+# WINDOW TITLE NORMALIZATION
+# ============================================================
 
 def normalize_window_title(text):
     """A window title for loose comparison: em/en dashes as '-', spaces
@@ -153,6 +262,10 @@ def normalize_window_title(text):
     return t.rstrip(" -|:·•").strip()
 
 
+# ============================================================
+# WAKE PREFIX STRIPPING
+# ============================================================
+
 def strip_wake_prefix(command):
     """A user who repeats 'hey mist ...' because the assistant was slow ends
     up with the wake phrase inside the COMMAND. Strip it (leading only) so
@@ -161,9 +274,17 @@ def strip_wake_prefix(command):
     return rest if ww else (command or "").strip()
 
 
+# ============================================================
+# YES AND NO PATTERNS
+# ============================================================
+
 _ANSWER_NO_RX = re.compile(r"\b(no|nope|nah|not|don't|do not|cancel|stop|abort|never mind)\b")
 _ANSWER_YES_RX = re.compile(r"\b(yes|yeah|yep|confirm|confirmed|sure|proceed)\b")
 
+
+# ============================================================
+# CONFIRMATION ANSWERS
+# ============================================================
 
 def confirmation_answer(answer, extra_yes=()):
     """A confirmation answer as "yes", "no" or "unclear". A no word always
@@ -181,6 +302,10 @@ def confirmation_answer(answer, extra_yes=()):
         return "yes"
     return "unclear"
 
+
+# ============================================================
+# VOICE, APPS AND ENTER RULES
+# ============================================================
 
 EDGE_TTS_VOICE = {
     "male": "en-US-GuyNeural",
@@ -246,6 +371,10 @@ ENTER_CONFIRM_APPS = (
 _SELF_PROCESS_NAMES = {"msedgewebview2"}
 
 
+# ============================================================
+# ENVIRONMENT FLAGS
+# ============================================================
+
 def env_flag(name, default):
     """Boolean environment switch: 1/true/yes/on or 0/false/no/off; anything
     else (including unset) means ``default``."""
@@ -262,8 +391,17 @@ def env_flag(name, default):
 # on-screen text, queries and window titles print as lengths. A dev run can
 # set MISTAI_VERBOSE_LOGS=1 for full text; a built app (sys.frozen) never does.
 
+
+# ============================================================
+# VERBOSE BANNER STATE
+# ============================================================
+
 _verbose_banner_shown = False
 
+
+# ============================================================
+# VERBOSE LOGS FLAG
+# ============================================================
 
 def verbose_logs():
     """MISTAI_VERBOSE_LOGS, read at call time; always off when frozen. The
@@ -277,6 +415,10 @@ def verbose_logs():
     return True
 
 
+# ============================================================
+# VERBOSE BANNER AND READ TRACING
+# ============================================================
+
 def announce_verbose_logs():
     """Called once when the Api starts: prints the banner up front when the
     flag is on (still once per process), instead of at the first log line."""
@@ -289,6 +431,10 @@ def trace_reads_enabled():
     return not getattr(sys, "frozen", False) and os.environ.get("MISTAI_TRACE_READS") == "1"
 
 
+# ============================================================
+# CONTENT-FREE LOG TEXT
+# ============================================================
+
 def log_text(text, limit=None, unit="chars"):
     """A log's view of content: repr(text[:limit]) under verbose_logs(), else
     its length in chars or words."""
@@ -298,6 +444,10 @@ def log_text(text, limit=None, unit="chars"):
     n = len(text.split()) if unit == "words" else len(text)
     return f"<{n} {unit}>"
 
+
+# ============================================================
+# LOGGED PARAMETERS AND KEYS
+# ============================================================
 
 # The step log never shows content (message text, contact names, typed text,
 # queries, URLs, window titles). Only these actions' parameters are printed;
@@ -312,6 +462,10 @@ _LOG_NAMED_KEYS = frozenset(
     | {f"f{n}" for n in range(1, 25)})
 
 
+# ============================================================
+# LOGGABLE KEY NAMES
+# ============================================================
+
 def _loggable_keys(param):
     """A named key, or a combination with a modifier whose other parts are
     named keys or single characters. A bare letter or digit is not."""
@@ -325,6 +479,10 @@ def _loggable_keys(param):
                     for p in parts))
 
 
+# ============================================================
+# STEP PARAMETER LOGGING
+# ============================================================
+
 def step_param_for_log(action, param):
     """The step log's view of a parameter: printed only for LOGGED_PARAM_ACTIONS
     and loggable keys, else its length; an empty parameter is ''."""
@@ -335,6 +493,10 @@ def step_param_for_log(action, param):
         return repr(text[:60])
     return f"<{len(text)} chars>"
 
+
+# ============================================================
+# RESTORE AND VISION GATING FLAGS
+# ============================================================
 
 def restore_after_task_enabled():
     """Bring MistAI's minimized window back (without taking focus) when an
@@ -349,6 +511,10 @@ def vision_gating_enabled():
     return env_flag("MISTAI_VISION_GATING", True)
 
 
+# ============================================================
+# LAZY VISION MODE
+# ============================================================
+
 def lazy_vision_mode():
     """MISTAI_LAZY_VISION: how a phase's first screen read is done. 2 (default)
     = "no first read": title + Open apps only (no UIA walk, no vision); 1 =
@@ -359,6 +525,10 @@ def lazy_vision_mode():
     flag = env_flag("MISTAI_LAZY_VISION", None)
     return 2 if flag is None else (1 if flag else 0)
 
+
+# ============================================================
+# BATCHING, SINGLE-SHOT AND READ FLAGS
+# ============================================================
 
 # Batched steps: one model reply may carry a short "steps" list of these
 # predictable input actions; each still runs through the full per-step path.
@@ -400,6 +570,10 @@ ORB_TINT = {
 }
 
 
+# ============================================================
+# ORB SIZES
+# ============================================================
+
 def orb_sizes():
     """(big, medium, small) logical px: MISTAI_ORB_SIZES="big,med,small", read
     at call time; three whole numbers 12..400 with big >= med >= small, else
@@ -418,6 +592,10 @@ def orb_sizes():
     return sizes
 
 
+# ============================================================
+# ORB BACKGROUND
+# ============================================================
+
 def orb_background():
     """The orb window's solid colour: ORB_TINT's edge colour over near-black,
     so any pixel the page has not painted yet looks like the disc's rim."""
@@ -426,6 +604,10 @@ def orb_background():
     r, g, b, a = (float(v) for v in _re.findall(r"[\d.]+", ORB_TINT["edge"]))
     return "#%02x%02x%02x" % tuple(round(a * c + (1 - a) * d) for c, d in ((r, 5), (g, 8), (b, 15)))
 
+
+# ============================================================
+# ORB DEBUG AND MOTION FLAGS
+# ============================================================
 
 def orb_debug_capture():
     """MISTAI_ORB_DEBUG_CAPTURE=1: leave the orb and panels capturable for
@@ -442,6 +624,10 @@ def orb_frame_stats():
 ORB_MOTIONS = ("lively", "calm")
 
 
+# ============================================================
+# ORB MOTION STYLE
+# ============================================================
+
 def orb_motion():
     """MISTAI_ORB_MOTION = lively (default: a springy flight with a small
     overshoot) | calm (critically damped, no overshoot), read at call time;
@@ -449,6 +635,10 @@ def orb_motion():
     v = os.environ.get("MISTAI_ORB_MOTION", "").strip().lower()
     return v if v in ORB_MOTIONS else "lively"
 
+
+# ============================================================
+# ORB FLIGHT, PANELS AND ANCHOR FLAGS
+# ============================================================
 
 def _env_or_saved(name, saved):
     """An env switch when set (1/0), else the saved Settings value ("on")."""
@@ -504,6 +694,10 @@ def skip_verified_read_enabled():
 VISION_Y_NUDGE_DEFAULT = 30
 
 
+# ============================================================
+# VISION CLICK NUDGE
+# ============================================================
+
 def vision_y_nudge():
     """MISTAI_VISION_Y_NUDGE: pixels added to y for a vision-resolved click
     with y < 80 (click_handler._execute_click). Default 30 (unchanged
@@ -513,9 +707,17 @@ def vision_y_nudge():
     return int(v) if v.isdigit() else VISION_Y_NUDGE_DEFAULT
 
 
+# ============================================================
+# CONFIRMATION LISTEN SETTINGS
+# ============================================================
+
 CONFIRM_LISTEN_PROFILES = ("shared", "ptt", "lead")
 CONFIRM_LEAD_IN_SECONDS = 0.4      # "lead": wait this long after TTS ends
 
+
+# ============================================================
+# CONFIRMATION LISTEN PROFILE
+# ============================================================
 
 def confirm_listen_profile():
     """MISTAI_CONFIRM_LISTEN: how voice confirmation and ask_user listens
@@ -528,6 +730,10 @@ def confirm_listen_profile():
     return v if v in CONFIRM_LISTEN_PROFILES else "shared"
 
 
+# ============================================================
+# RE-MINIMIZE AFTER CONFIRMATION
+# ============================================================
+
 def confirm_reminimize_enabled():
     """MISTAI_CONFIRM_REMINIMIZE: a confirmation prompt restores MistAI's
     window so its Yes/No buttons are visible, then minimizes it again once
@@ -536,12 +742,20 @@ def confirm_reminimize_enabled():
     return env_flag("MISTAI_CONFIRM_REMINIMIZE", True)
 
 
+# ============================================================
+# RECIPIENT MATCH LIMITS
+# ============================================================
+
 # quick_message recipient checks (Api._act_quick_message): vision is asked
 # what the chat header / selected result shows, never told the expected
 # name, and its answer is compared here.
 RECIPIENT_FUZZY_MIN_LEN = 5        # compact length both names need for a fuzzy accept
 RECIPIENT_FUZZY_RATIO = 0.85
 
+
+# ============================================================
+# PERSON NAME NORMALIZATION
+# ============================================================
 
 def normalize_person_name(name):
     """Casefolded, punctuation and symbols removed, whitespace collapsed."""
@@ -550,6 +764,10 @@ def normalize_person_name(name):
                 if ch.isspace() or unicodedata.category(ch)[0] not in "PS")
     return " ".join(s.split())
 
+
+# ============================================================
+# RECIPIENT MATCH
+# ============================================================
 
 def recipient_match(seen, expected):
     """(matched, exact) for a name vision read against the intended
@@ -570,6 +788,10 @@ def recipient_match(seen, expected):
         return True, False
     return False, False
 
+
+# ============================================================
+# ASK BEFORE SENDING
+# ============================================================
 
 # Ask before sending (quick_message only), profile key "ask_before_sending":
 # set by the Settings page only (Api.set_ask_before_sending), never by the
@@ -596,6 +818,10 @@ def ask_before_sending_choice(saved):
     return v if v in ASK_BEFORE_SENDING_CHOICES else ASK_BEFORE_SENDING_DEFAULT
 
 
+# ============================================================
+# GROUNDED SEND CHECK
+# ============================================================
+
 def send_is_grounded(parameter, user_text):
     """quick_message: are the recipient AND the message both the user's own
     words? Each, normalized (normalize_person_name), must occur as whole
@@ -612,6 +838,10 @@ def send_is_grounded(parameter, user_text):
     return True
 
 
+# ============================================================
+# VOICE DIAGNOSTICS FLAG
+# ============================================================
+
 def voice_diag_enabled():
     """MISTAI_VOICE_DIAG=1: one "[VoiceDiag]" line per _listen_once with
     numbers only (clip length, levels, sample rate, threshold, seconds since
@@ -620,8 +850,16 @@ def voice_diag_enabled():
     return env_flag("MISTAI_VOICE_DIAG", False)
 
 
+# ============================================================
+# NARRATION MODES
+# ============================================================
+
 NARRATION_MODES = ("off", "milestones")
 
+
+# ============================================================
+# NARRATION MODE
+# ============================================================
 
 def narration_mode():
     """MISTAI_NARRATION: "milestones" (default) speaks a short fixed progress
@@ -631,6 +869,10 @@ def narration_mode():
     return v if v in NARRATION_MODES else "milestones"
 
 
+# ============================================================
+# WAKE CLIPS, HOTKEYS AND FACT CATEGORIES
+# ============================================================
+
 def wake_clips_enabled():
     """MISTAI_WAKE_SAVE_CLIPS=1: the wake loop saves every clip it hears (WAV
     + JSON sidecar) to wake_clip_dir() for offline tuning. Off by default."""
@@ -639,7 +881,6 @@ def wake_clips_enabled():
 
 def wake_clip_dir():
     return os.path.join(os.path.expanduser("~"), "MistAI", "logs", "wake-clips")
-
 
 
 # -- Built-in knowledge: read from code, never written to the database --------
@@ -690,6 +931,10 @@ MISTAI_FACTS = (
 USER_FACT_CATEGORIES = ("general", "imported")
 
 
+# ============================================================
+# FACTS FILE PATH
+# ============================================================
+
 def my_facts_path():
     """The user's own facts file for "Import my facts" (Api.import_my_facts).
     Outside the repo; MISTAI_MY_FACTS_PATH overrides it (tests)."""
@@ -697,6 +942,10 @@ def my_facts_path():
         os.path.expanduser("~"), "MistAI", "my_facts.json"
     )
 
+
+# ============================================================
+# DATABASE PATH
+# ============================================================
 
 def memory_db_path():
     """The SQLite file for memory/tasks/tool stats. MISTAI_DB_PATH overrides
@@ -706,8 +955,16 @@ def memory_db_path():
     )
 
 
+# ============================================================
+# HISTORY RETENTION DEFAULT
+# ============================================================
+
 HISTORY_HOURS_DEFAULT = 24.0
 
+
+# ============================================================
+# HISTORY RETENTION
+# ============================================================
 
 def history_hours():
     """How long stored conversation turns are kept: MISTAI_HISTORY_HOURS, read
@@ -722,6 +979,10 @@ def history_hours():
         return HISTORY_HOURS_DEFAULT
     return max(1.0, hours)
 
+
+# ============================================================
+# OWN PROCESS AND APP ALIASES
+# ============================================================
 
 def is_self_process(name, pid=None):
     return pid == os.getpid() or (name or "").lower().replace(".exe", "") in _SELF_PROCESS_NAMES
@@ -748,6 +1009,10 @@ APP_PROCESS_ALIASES = {
 }
 
 
+# ============================================================
+# PROCESS NAME NORMALIZATION
+# ============================================================
+
 def normalize_process_name(name):
     """'OBS64.exe' -> 'obs', 'ms-teams' -> 'msteams', 'Notepad++' -> 'notepad++'."""
     n = str(name or "").lower().strip()
@@ -756,6 +1021,10 @@ def normalize_process_name(name):
     n = re.sub(r"[_\-\s]?(?:x64|x86|64|32)$", "", n)
     return re.sub(r"[^a-z0-9+]", "", n)
 
+
+# ============================================================
+# APP PROCESS NAMES
+# ============================================================
 
 def app_process_names(app_name):
     """Exact (normalized) process names that count as ``app_name``: the name
@@ -771,8 +1040,16 @@ def app_process_names(app_name):
     return {n for n in names if len(n) >= 2}
 
 
+# ============================================================
+# VENDOR PREFIXES
+# ============================================================
+
 _VENDOR_PREFIXES = ("microsoft", "windows", "system", "ms", "win")
 
+
+# ============================================================
+# PROCESS NAME CORES
+# ============================================================
 
 def _process_cores(proc):
     """The process name plus forms with one vendor prefix and/or an "app"
@@ -785,6 +1062,10 @@ def _process_cores(proc):
     cores |= {c[:-3] for c in cores if c.endswith("app") and len(c) >= 6}
     return cores
 
+
+# ============================================================
+# PROCESS MATCHING
+# ============================================================
 
 def process_matches(app_name, process_name):
     proc = normalize_process_name(process_name)
@@ -800,6 +1081,10 @@ def process_matches(app_name, process_name):
         return False
     return bool(_process_cores(proc) & names)
 
+
+# ============================================================
+# TRACKED PROCESSES AND SECRET FILE PATTERNS
+# ============================================================
 
 # Exact process names tracked in LiveState's "Open apps" list.
 TRACKED_PROCESS_NAMES = frozenset(
@@ -862,6 +1147,10 @@ def is_secret_file(name):
     return bool(base) and any(fnmatch.fnmatchcase(base, p) for p in SECRET_FILE_PATTERNS)
 
 
+# ============================================================
+# SECRET FILE REFERENCES
+# ============================================================
+
 def secret_file_in(text):
     """First token in ``text`` whose file name matches SECRET_FILE_PATTERNS."""
     for token in _TOKEN_SPLIT_RX.split(str(text or "")):
@@ -869,6 +1158,10 @@ def secret_file_in(text):
             return token
     return None
 
+
+# ============================================================
+# OUTBOUND SCRUB PATTERNS
+# ============================================================
 
 # -- Outbound scrub -------------------------------------------------------------
 # Secrets redacted from what the agent sends to the backend (screen context and
@@ -892,6 +1185,10 @@ _CARD_RX = re.compile(r"(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])")
 _CARD_PREFIX_RX = re.compile(r"^(?:4|5[1-5]|2[2-7]|3[47]|6(?:011|5)|35|30[0-5]|36|38)")
 
 
+# ============================================================
+# CARD NUMBER CHECKSUM
+# ============================================================
+
 def luhn_ok(digits):
     """The Luhn checksum of a digit string."""
     total = 0
@@ -902,6 +1199,10 @@ def luhn_ok(digits):
         total += d
     return total % 10 == 0
 
+
+# ============================================================
+# OUTBOUND SCRUB
+# ============================================================
 
 def scrub_outbound(text):
     """(clean_text, {kind: count}): private key blocks, JWTs, long Bearer
@@ -929,6 +1230,10 @@ def scrub_outbound(text):
 
     return _CARD_RX.sub(card, text), counts
 
+
+# ============================================================
+# INJECTION FLAGS
+# ============================================================
 
 # -- Instruction-like text in untrusted observations -------------------------
 # Flag only (AgentLoop appends a note); nothing is blocked or rewritten. Each
@@ -962,6 +1267,10 @@ def scrub_outbound_enabled():
     return env_flag("MISTAI_SCRUB_OUTBOUND", True)
 
 
+# ============================================================
+# SECRET OUTPUT GUARD
+# ============================================================
+
 def secret_output_reason(command, output=""):
     """Why run_command output must be withheld from the model, or None.
 
@@ -983,6 +1292,10 @@ def secret_output_reason(command, output=""):
         return "output contains a private key block"
     return None
 
+
+# ============================================================
+# CREDENTIAL FAILURE PATTERNS
+# ============================================================
 
 # A command that failed (or "succeeded" with an error body: curl.exe exits 0
 # on a 401) because the route needs a credential the agent doesn't have.
@@ -1010,6 +1323,10 @@ _CRED_PLACEHOLDER_RX = re.compile(
 )
 
 
+# ============================================================
+# CREDENTIAL FAILURE HINT
+# ============================================================
+
 def credential_failure_reason(command, output=""):
     """Why a run_command result shows a route that needs credentials the agent
     doesn't have, or None. Checks success and failure alike. The caller passes
@@ -1024,6 +1341,10 @@ def credential_failure_reason(command, output=""):
         return "the response says a credential is missing or invalid"
     return None
 
+
+# ============================================================
+# SEARCH ENGINES AND ROUTES
+# ============================================================
 
 # browser_search routes per engine, tried in order; a block or empty page moves
 # on to the next one (once). DuckDuckGo (default) never leaves DuckDuckGo: its
@@ -1067,6 +1388,10 @@ _BLOCK_PAGE_RX = (
 BLOCK_PAGE_MAX_CHARS = 1500
 
 
+# ============================================================
+# BLOCKED SEARCH PAGES
+# ============================================================
+
 def blocked_page_reason(url, title, text):
     """A short fixed reason when a loaded page is a block/CAPTCHA page, else
     None. Never returns anything taken from the page."""
@@ -1085,6 +1410,10 @@ def blocked_page_reason(url, title, text):
     return None
 
 
+# ============================================================
+# SECRET TEXT GUARD
+# ============================================================
+
 def secret_text_reason(text):
     """Why on-screen text (e.g. a UIA snapshot) must be withheld, or None:
     a private key block or a credential-looking token. Textual, not airtight."""
@@ -1096,6 +1425,10 @@ def secret_text_reason(text):
     return None
 
 
+# ============================================================
+# BUNDLED RESOURCE PATHS
+# ============================================================
+
 def get_resource_path(rel):
     try:
         base = sys._MEIPASS  # PyInstaller bundle
@@ -1103,6 +1436,10 @@ def get_resource_path(rel):
         base = os.path.abspath(".")
     return os.path.join(base, rel)
 
+
+# ============================================================
+# JAVASCRIPT STRING ESCAPING
+# ============================================================
 
 def esc(s):
     """Escape a string for safe inline embedding inside a JS call."""
@@ -1117,6 +1454,10 @@ def esc(s):
         .replace("\u2029", " ")
     )
 
+
+# ============================================================
+# TESSERACT SETUP
+# ============================================================
 
 def setup_tesseract():
     """Point pytesseract at MistAI's bundled OCR engine instead of relying
@@ -1166,3 +1507,114 @@ def setup_tesseract():
 
     print("[Tesseract] Not found -- OCR disabled")
     return False
+
+
+# ============================================================
+# BACKEND SELECTION
+# ============================================================
+
+# core/api_manager.py — handles which backend/API key MistAI talks to.
+
+# ============================================================
+# API ERROR REDACTION
+# ============================================================
+
+# Removed from a backend error message before it is shown or logged, in case
+# the backend echoes something sensitive back.
+_ERROR_REDACT = re.compile(
+    r"https?://\S+|\b(?:bearer\s+)?(?:mistai|sk|pk|key|tok)[-_][A-Za-z0-9_-]{6,}",
+    re.I,
+)
+ERROR_DETAIL_CHARS = 120
+
+
+# ============================================================
+# API ERROR WORDING
+# ============================================================
+
+def describe_api_error(response, model=""):
+    """One plain sentence for a failed LLM response: the status code plus the
+    body's "error"/"message" field (capped, URLs and key-like strings
+    removed). Never headers, keys, URLs or the request text. The caller
+    decides what to do; nothing here retries or switches models."""
+    status = getattr(response, "status_code", None)
+    detail = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            value = body.get("error") or body.get("message") or ""
+            if isinstance(value, dict):
+                value = value.get("message") or value.get("error") or ""
+            detail = " ".join(_ERROR_REDACT.sub("[removed]", str(value)).split())
+    except Exception:
+        pass
+    if len(detail) > ERROR_DETAIL_CHARS:
+        detail = detail[: ERROR_DETAIL_CHARS - 3].rstrip() + "..."
+    # The name the user sees in Settings (MODEL_LABELS), not the backend id.
+    name = MODEL_LABELS.get(model) or (model or "the model").capitalize()
+    code = f"HTTP {status}" if status else "no status"
+    reason = f"{code}: {detail}" if detail else code
+    if status == 429:
+        return (f"{name} is rate-limited or unavailable right now ({reason}). "
+                f"Pick another model in Settings or try again later.")
+    return f"{name} request failed ({reason})."
+
+
+# ============================================================
+# BACKEND URL AND KEY
+# ============================================================
+
+class APIKeyManager:
+    def __init__(self):
+        self._api_key = os.environ.get("MISTAI_API_KEY", "")
+        configured_backend = os.environ.get(
+            "MISTAI_USE_BACKEND", "true" if API_MODE == "backend" else "false"
+        )
+        self._use_backend = configured_backend.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._primary_api = PRIMARY_API
+        self._fallback_api = FALLBACK_API
+
+        if self._api_key:
+            print("[APIKey] API key loaded from environment.")
+        else:
+            print("[APIKey] No API key found in environment. Backend fallback enabled.")
+
+    def set_api_key(self, key):
+        self._api_key = key
+        print("[APIKey] API key updated.")
+
+    def use_backend(self, enabled):
+        self._use_backend = enabled
+        print(f"[APIKey] Backend mode: {enabled}")
+
+    def get_headers(self):
+        if self._api_key:
+            return {
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            }
+        return {"Content-Type": "application/json"}
+
+    def get_api_url(self):
+        if self._use_backend:
+            return "https://mist-ai.fly.dev/api/chat"
+        return self._primary_api
+
+    def get_fallback_url(self):
+        # The public backend endpoint is intentionally usable without a
+        # bearer token.  Its /api/v1 fallback is not: trying it with no key
+        # only turns a useful public-route error into a misleading 401.
+        # Return no fallback in that configuration so callers can report the
+        # original failure honestly.
+        if self._use_backend and not self._api_key:
+            return None
+        return self._fallback_api
+
+    @property
+    def has_key(self):
+        return self._api_key != ""

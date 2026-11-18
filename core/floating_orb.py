@@ -1,3 +1,74 @@
+# ============================================================
+# FLOATING ORB MODULE
+# ============================================================
+#
+# The optional floating orb and everything it needs: pure layout geometry
+# (docking, tours, panel anchors), spring motion and frame pacing, the orb
+# window itself, and the task panels beside it.
+#
+# SECTION INDEX
+#   1. ORB LAYOUT GEOMETRY
+#   2. RESIZE ABOUT THE CENTER
+#   3. STRAIGHT-LINE FLIGHT FRAMES
+#   4. CLAMPING SQUARES TO THE WORK AREA
+#   5. DOCKING SIDE CHOICE
+#   6. DOCKING POSITION BESIDE A WINDOW
+#   7. RECT OVERLAP AND PANEL SPACING
+#   8. PANEL COLUMN LAYOUT
+#   9. PANEL COLLISION TEST
+#   10. PANEL ANCHORING
+#   11. EASED SQUARE ALONG A FLIGHT
+#   12. FLIGHT TIMINGS
+#   13. FLIGHT PLANNING
+#   14. WORK AREA COVERAGE
+#   15. DOCKING INSIDE A MAXIMIZED WINDOW
+#   16. TOUR REJECTION REASONS
+#   17. SEARCH RESULT LINK CLASSIFICATION
+#   18. PAGE TO SCREEN RECT MAPPING
+#   19. PAGE MARGIN SPOT
+#   20. SEARCH RESULT TOUR PLAN
+#   21. ANSWER PANEL SPOT
+#   22. ORB MOTION
+#   23. SPRING SETTINGS
+#   24. CRITICAL DAMPING SETTLE POINT
+#   25. SPRING PARAMETERS PER DISTANCE
+#   26. DAMPED SPRING FORMULA
+#   27. RETARGETABLE SPRING FLIGHT
+#   28. REFRESH RATE VALIDATION
+#   29. FRAME TIMING STATISTICS
+#   30. FRAME STATS LOG LINE
+#   31. ORB WINDOW SETTINGS
+#   32. ORB STATE FROM PYTHON FACTS
+#   33. ORB PAGE BRIDGE
+#   34. HOME PLACEMENT ON THE PRIMARY MONITOR
+#   35. ROUND REGION BOX
+#   36. ORB SIZE PER STATE
+#   37. WIN32 CALLS
+#   38. MOVING AND RESIZING THE WINDOW
+#   39. FRAME PACING
+#   40. TEST FRAME PACER
+#   41. TIMER RESOLUTION BOOST STATE
+#   42. TIMER RESOLUTION BOOST ON
+#   43. TIMER RESOLUTION BOOST OFF
+#   44. FLIGHT PLAYER
+#   45. NO-ACTIVATE MOUSE ANSWER
+#   46. NO-ACTIVATE WINDOW SUBCLASS
+#   47. TASKBAR HIDING
+#   48. WIN32 FAILURE LOGGING
+#   49. ORB WINDOW HARDENING
+#   50. CREATE-TIME CORNER POSITION
+#   51. ORB CONTROLLER
+#   52. TASK PANELS
+#   53. TASK PANEL SETTINGS
+#   54. STEP LABELS
+#   55. TOOL CATEGORY LOOKUP
+#   56. PANEL MODEL
+#   57. PANEL PAGE BRIDGE
+#   58. PANEL WINDOW HARDENING
+#   59. PANEL ROUNDED CORNERS
+#   60. PANEL WINDOWS
+# ============================================================
+
 """
 core/floating_orb.py — the optional floating orb (Settings > "Floating orb", off
 by default): a small frameless always-on-top window that shows only the orb,
@@ -33,13 +104,702 @@ import ctypes
 import sys
 import threading
 import time
+import math
 
-from . import events
-from .config import orb_background, orb_debug_capture, orb_frame_stats, orb_motion, orb_sizes
-from .orb_layout import (RESIZE_S, TOUR_REJECTIONS, answer_spot, classify_page_rects, coverage, dock_inside,
-                         dock_position, dock_side, flight_plan, margin_spot, resize_about_center,
-                         square_at, tour_plan)
-from .orb_motion import Flight, frame_stats, stats_line, valid_refresh
+from . import live_state as events
+from .config import (
+    orb_background,
+    orb_debug_capture,
+    orb_frame_stats,
+    orb_motion,
+    orb_sizes,
+    panel_anchor,
+    panel_blur_enabled,
+)
+
+
+# ============================================================
+# ORB LAYOUT GEOMETRY
+# ============================================================
+
+# core/orb_layout.py — pure geometry for the floating orb and its panels.
+# Everything here is physical pixels; rects are (l, t, r, b), the orb is a
+# square (x, y, side). No Win32, no threads: core/floating_orb.py and
+# core/orb_panels.py apply the results.
+
+# ============================================================
+# RESIZE ABOUT THE CENTER
+# ============================================================
+
+def resize_about_center(x, y, side, new_side):
+    """(x, y, new_side) keeping the square's center where it was."""
+    cx, cy = x + side / 2.0, y + side / 2.0
+    new_side = max(1, int(round(new_side)))
+    return int(round(cx - new_side / 2.0)), int(round(cy - new_side / 2.0)), new_side
+
+
+# ============================================================
+# STRAIGHT-LINE FLIGHT FRAMES
+# ============================================================
+
+def frames(start, end, n=10, bow=0.0):
+    """``n`` squares (x, y, side) from ``start`` to ``end`` (both included as
+    the last frame; the first frame is one step in). With ``bow`` > 0 the
+    path is a quadratic arc whose control point sits ``bow`` x the distance
+    ABOVE the midpoint (an upward bow, the screen's y grows down); 0 is a
+    straight line. Sides and positions ease in and out (smoothstep)."""
+    n = max(1, int(n))
+    (x0, y0, s0), (x1, y1, s1) = start, end
+    dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0 - bow * dist
+    out = []
+    for i in range(1, n + 1):
+        t = i / n
+        t = t * t * (3 - 2 * t)
+        u = 1 - t
+        x = u * u * x0 + 2 * u * t * cx + t * t * x1
+        y = u * u * y0 + 2 * u * t * cy + t * t * y1
+        out.append((int(round(x)), int(round(y)), max(1, int(round(s0 + (s1 - s0) * t)))))
+    return out
+
+
+# ============================================================
+# CLAMPING SQUARES TO THE WORK AREA
+# ============================================================
+
+def clamp_square(x, y, side, work):
+    """Move the square fully inside ``work`` (it is shrunk only if it cannot fit)."""
+    l, t, r, b = (int(v) for v in work)
+    side = max(1, min(int(side), max(1, r - l), max(1, b - t)))
+    return min(max(int(x), l), r - side), min(max(int(y), t), b - side), side
+
+
+def _clip(rect, work):
+    l, t, r, b = rect
+    wl, wt, wr, wb = work
+    return max(l, wl), max(t, wt), min(r, wr), min(b, wb)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(v, hi)) if hi >= lo else lo
+
+
+# ============================================================
+# DOCKING SIDE CHOICE
+# ============================================================
+
+def dock_side(target_rect, work, side, gap=0):
+    """Which side of the target the orb docks on: "right", "left", "above",
+    "below" (the first with room for ``side`` + 2*``gap``, in that order), or
+    "edge" when none fits."""
+    wl, wt, wr, wb = (int(v) for v in work)
+    l, t, r, b = _clip([int(v) for v in target_rect], (wl, wt, wr, wb))
+    need = side + 2 * gap
+    room = {"right": wr - r, "left": l - wl, "above": t - wt, "below": wb - b}
+    for name in ("right", "left", "above", "below"):
+        if room[name] >= need:
+            return name
+    return "edge"
+
+
+# ============================================================
+# DOCKING POSITION BESIDE A WINDOW
+# ============================================================
+
+def dock_position(target_rect, work, side, gap=8):
+    """(x, y) for the docked orb (a square of ``side``): beside the target's
+    top on its right, else its left, else above or below near its right
+    end; never over the target when a side has room, always fully inside
+    ``work``. When no side has room (the target fills the screen): the work
+    area's top-right corner, against the screen edge."""
+    wl, wt, wr, wb = (int(v) for v in work)
+    side = max(1, min(int(side), wr - wl, wb - wt))
+    l, t, r, b = _clip([int(v) for v in target_rect], (wl, wt, wr, wb))
+    where = dock_side(target_rect, work, side, gap)
+    y_beside = _clamp(t + gap, wt, wb - side)
+    x_near_right = _clamp(r - side - gap, wl, wr - side)
+    if where == "right":
+        x, y = r + gap, y_beside
+    elif where == "left":
+        x, y = l - gap - side, y_beside
+    elif where == "above":
+        x, y = x_near_right, t - gap - side
+    elif where == "below":
+        x, y = x_near_right, b + gap
+    else:
+        x, y = wr - side - gap, wt + gap
+    return _clamp(x, wl, wr - side), _clamp(y, wt, wb - side)
+
+
+# ============================================================
+# RECT OVERLAP AND PANEL SPACING
+# ============================================================
+
+def overlaps(a, b):
+    """Do rects a and b (l, t, r, b; right/bottom exclusive) share a pixel?"""
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+PANEL_INSET = 16      # logical px from the work area's edges
+PANEL_GAP = 12        # logical px between stacked panels
+PANEL_ORDER = ("top-right", "top-left", "top-center")
+
+
+# ============================================================
+# PANEL COLUMN LAYOUT
+# ============================================================
+
+def _panel_column(sizes, work, anchor, inset, gap, y0=None):
+    wl, wt, wr, wb = (int(v) for v in work)
+    y = wt + inset if y0 is None else y0
+    out = []
+    for w, h in sizes:
+        if anchor == "top-left":
+            x = wl + inset
+        elif anchor == "top-center":
+            x = (wl + wr) // 2 - w // 2
+        else:
+            x = wr - inset - w
+        out.append((_clamp(x, wl, wr - w), _clamp(y, wt, wb - h)))
+        y += h + gap
+    return out
+
+
+# ============================================================
+# PANEL COLLISION TEST
+# ============================================================
+
+def _hits(spots, sizes, rect):
+    return rect is not None and any(overlaps((x, y, x + w, y + h), rect)
+                                    for (x, y), (w, h) in zip(spots, sizes))
+
+
+# ============================================================
+# PANEL ANCHORING
+# ============================================================
+
+def anchored_panels(sizes, work, anchor="top-right", scale=1.0, target_rect=None,
+                    maximized=False, orb=None):
+    """((x, y) per panel, anchor used): panels stacked downward from the top
+    of ``work`` (the target's monitor), inset PANEL_INSET and PANEL_GAP apart
+    (x ``scale``), at ``anchor``. Independent of the orb, except that they
+    never cover it (the stack moves below the orb, else to another anchor).
+    A non-maximized target covering the stack moves it to the first anchor of
+    PANEL_ORDER that is clear of it; a maximized one keeps ``anchor``."""
+    inset, gap = round(PANEL_INSET * scale), round(PANEL_GAP * scale)
+    order = [anchor] + [a for a in PANEL_ORDER if a != anchor]
+    choice = anchor
+    if target_rect is not None and not maximized:
+        choice = next((a for a in order
+                       if not _hits(_panel_column(sizes, work, a, inset, gap), sizes,
+                                    target_rect)), anchor)
+    orb_rect = (orb[0], orb[1], orb[0] + orb[2], orb[1] + orb[2]) if orb else None
+    spots = _panel_column(sizes, work, choice, inset, gap)
+    if not _hits(spots, sizes, orb_rect):
+        return spots, choice
+    below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[3] + gap)
+    if not _hits(below, sizes, orb_rect):
+        return below, choice
+    for a in order:
+        spots = _panel_column(sizes, work, a, inset, gap)
+        if not _hits(spots, sizes, orb_rect):
+            return spots, a
+    return spots, choice
+
+
+# -- time-based flights (fix: smooth movement) ------------------------------------------
+
+
+# ============================================================
+# EASED SQUARE ALONG A FLIGHT
+# ============================================================
+
+def square_at(start, end, t, bow=0.0):
+    """The square at progress ``t`` (0..1, eased with smoothstep) on the
+    path from ``start`` to ``end``: a quadratic arc bowed upward by ``bow``
+    x the distance (0 = straight); the side is interpolated."""
+    t = min(1.0, max(0.0, float(t)))
+    e = t * t * (3 - 2 * t)
+    (x0, y0, s0), (x1, y1, s1) = start, end
+    dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0 - bow * dist
+    u = 1 - e
+    x = u * u * x0 + 2 * u * e * cx + e * e * x1
+    y = u * u * y0 + 2 * u * e * cy + e * e * y1
+    return int(round(x)), int(round(y)), max(1, int(round(s0 + (s1 - s0) * e)))
+
+
+# ============================================================
+# FLIGHT TIMINGS
+# ============================================================
+
+RESIZE_S = 0.12
+FLIGHT_S = 0.5
+NUDGE_S = 0.2
+
+
+# ============================================================
+# FLIGHT PLANNING
+# ============================================================
+
+def flight_plan(start, goal):
+    """Segments [(from, to, seconds, bow), ...] from ``start`` to ``goal``.
+    A short move or a pure resize is one straight segment. A flight keeps
+    the size fixed while it moves (so the window is only moved, never
+    resized, mid-flight): shrinking happens before take-off, growing after
+    landing, each as a short resize about the center."""
+    (x0, y0, s0), (x1, y1, s1) = start, goal
+    far = abs((x1 + s1 / 2) - (x0 + s0 / 2)) + abs((y1 + s1 / 2) - (y0 + s0 / 2)) > s0
+    if not far:
+        return [(start, goal, NUDGE_S, 0.0)]
+    if s1 < s0:                                   # shrink first, then fly small
+        shrunk = resize_about_center(x0, y0, s0, s1)
+        segs = [(start, shrunk, RESIZE_S, 0.0)] if shrunk != start else []
+        return segs + [(shrunk, goal, FLIGHT_S, 0.3)]
+    # fly at the current size to where the goal's center is, then grow
+    landing = resize_about_center(x1, y1, s1, s0)
+    segs = [(start, landing, FLIGHT_S, 0.3)]
+    return segs + ([(landing, goal, RESIZE_S, 0.0)] if landing != goal else [])
+
+
+# -- maximized targets (fix: follow the element, not the screen corner) -------------------
+
+
+# ============================================================
+# WORK AREA COVERAGE
+# ============================================================
+
+def coverage(rect, work):
+    """Fraction of ``work`` covered by ``rect`` (0..1)."""
+    l, t, r, b = _clip([int(v) for v in rect], [int(v) for v in work])
+    area = max(1, (work[2] - work[0]) * (work[3] - work[1]))
+    return max(0, r - l) * max(0, b - t) / area
+
+
+# ============================================================
+# DOCKING INSIDE A MAXIMIZED WINDOW
+# ============================================================
+
+def dock_inside(window_rect, work, side, element=None, near=None, gap=8):
+    """(x, y) for a small orb INSIDE a (maximized) window. With ``element``
+    (the rect the current step touches): beside it on the emptier side
+    (right/left by the room inside the window, then below/above), not over
+    it when a side fits. Without one: at the MIDDLE of the window's inner
+    edge nearest ``near`` (the orb's current center), never in a corner.
+    Always inside both the window and the work area."""
+    area = _clip([int(v) for v in window_rect], [int(v) for v in work])
+    al, at, ar, ab = area
+    if ar - al < 1 or ab - at < 1:
+        al, at, ar, ab = (int(v) for v in work)
+    side = max(1, min(int(side), ar - al, ab - at))
+    if element is not None:
+        el, et, er, eb = _clip([int(v) for v in element], (al, at, ar, ab))
+        need = side + 2 * gap
+        room = {"right": ar - er, "left": el - al, "below": ab - eb, "above": et - at}
+        y_mid = _clamp((et + eb) // 2 - side // 2, at, ab - side)
+        x_mid = _clamp((el + er) // 2 - side // 2, al, ar - side)
+        horiz = max(("right", "left"), key=lambda k: room[k])
+        vert = max(("below", "above"), key=lambda k: room[k])
+        for where in (horiz, vert):
+            if room[where] >= need:
+                x, y = {"right": (er + gap, y_mid), "left": (el - gap - side, y_mid),
+                        "below": (x_mid, eb + gap), "above": (x_mid, et - gap - side)}[where]
+                return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+        x, y = er + gap, y_mid                     # no room anywhere: as close as fits
+        return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+    cx, cy = near if near is not None else ((al + ar) / 2.0, (at + ab) / 2.0)
+    dists = {"left": cx - al, "right": ar - cx, "top": cy - at, "bottom": ab - cy}
+    edge = min(dists, key=dists.get)
+    x = _clamp(int((al + ar) / 2 - side / 2), al + gap, ar - side - gap)
+    y = _clamp(int((at + ab) / 2 - side / 2), at + gap, ab - side - gap)
+    if edge == "left":
+        x = al + gap
+    elif edge == "right":
+        x = ar - side - gap
+    elif edge == "top":
+        y = at + gap
+    else:
+        y = ab - side - gap
+    return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+
+
+# -- browser page rects and the search tour ---------------------------------------------------
+
+
+# ============================================================
+# TOUR REJECTION REASONS
+# ============================================================
+
+TOUR_REJECTIONS = ("hidden", "ad", "above-fold", "below-fold", "outside-window", "limit")
+HIDDEN, AD = 1, 2          # flag bits link_boxes sets per candidate
+
+
+# ============================================================
+# SEARCH RESULT LINK CLASSIFICATION
+# ============================================================
+
+def classify_page_rects(info, window_rect, limit=4):
+    """(physical screen rects or None, counts) for the candidate rects in
+    ``info`` (from BrowserSession.link_boxes: CSS px viewport rects
+    [l, t, r, b, flags] plus the window's screenX/Y, outer and inner sizes and
+    devicePixelRatio, which in Firefox already includes the Windows display
+    scale). Content origin = screenX + side border ((outerWidth - innerWidth)
+    / 2), screenY + toolbar height (outerHeight - innerHeight).
+
+    In order, the first ``limit`` candidates that are visible, not ads and
+    have their centre inside the viewport are accepted (a partly visible one
+    is clipped to the viewport, not dropped). Rejections are counted by label
+    (TOUR_REJECTIONS). Any accepted rect that maps outside ``window_rect``
+    means the mapping can't be trusted: no rects. counts: found, measured,
+    accepted, rejected and one count per label. Never raises."""
+    counts = {"found": 0, "measured": 0, "accepted": 0, "rejected": 0}
+    counts.update({k: 0 for k in TOUR_REJECTIONS})
+    try:
+        cands = list(info["rects"])
+        counts["measured"] = len(cands)
+        counts["found"] = max(len(cands), int(info.get("found", len(cands)) or 0))
+        dpr = float(info["dpr"]) or 1.0
+        ox = float(info["screenX"]) + (float(info["outerWidth"]) - float(info["innerWidth"])) / 2
+        oy = float(info["screenY"]) + float(info["outerHeight"]) - float(info["innerHeight"])
+        inner_w, inner_h = float(info["innerWidth"]), float(info["innerHeight"])
+        wl, wt, wr, wb = window_rect
+        out = []
+        for cand in cands:
+            left, top, right, bottom = (float(v) for v in cand[:4])
+            flags = int(cand[4]) if len(cand) > 4 else 0
+            why = None
+            if flags & HIDDEN or right - left < 2 or bottom - top < 2:
+                why = "hidden"
+            elif flags & AD:
+                why = "ad"
+            elif (top + bottom) / 2 < 0:
+                why = "above-fold"
+            elif (top + bottom) / 2 >= inner_h or not 0 <= (left + right) / 2 < inner_w:
+                why = "below-fold"
+            elif len(out) >= limit:
+                why = "limit"
+            if why is None:
+                top, bottom = max(0.0, top), min(inner_h, bottom)
+                left, right = max(0.0, left), min(inner_w, right)
+                r = (round((ox + left) * dpr), round((oy + top) * dpr),
+                     round((ox + right) * dpr), round((oy + bottom) * dpr))
+                if not (wl <= r[0] and r[2] <= wr and wt <= r[1] and r[3] <= wb):
+                    why = "outside-window"
+                else:
+                    out.append(r)
+            if why is not None:
+                counts[why] += 1
+                counts["rejected"] += 1
+        if counts["outside-window"]:
+            counts["rejected"] += len(out)
+            out = []
+        counts["accepted"] = len(out)
+        return (out or None), counts
+    except Exception:
+        return None, counts
+
+
+# ============================================================
+# PAGE TO SCREEN RECT MAPPING
+# ============================================================
+
+def map_page_rects(info, window_rect, limit=4):
+    """The accepted screen rects of classify_page_rects, or None."""
+    return classify_page_rects(info, window_rect, limit)[0]
+
+
+# ============================================================
+# PAGE MARGIN SPOT
+# ============================================================
+
+def margin_spot(element, area, side, gap=8):
+    """(x, y) for a small orb beside ``element`` inside ``area`` (the page):
+    in the right margin when it has room, else the left, vertically centred
+    on the element; kept inside ``area``."""
+    el, et, er, eb = element
+    al, at, ar, ab = area
+    x = er + gap if ar - er >= side + 2 * gap else el - gap - side
+    y = (et + eb) // 2 - side // 2
+    return _clamp(x, al, ar - side), _clamp(y, at, ab - side)
+
+
+# ============================================================
+# SEARCH RESULT TOUR PLAN
+# ============================================================
+
+def tour_plan(start, goal, medium, hop_s=0.35):
+    """Segments for one tour hop: grow to ``medium`` in place, fly (a slight
+    bow) to ``goal``'s center, shrink to ``goal``'s side there."""
+    x0, y0, s0 = start
+    x1, y1, s1 = goal
+    big = resize_about_center(x0, y0, s0, medium)
+    land = resize_about_center(x1, y1, s1, medium)
+    segs = [] if big == start else [(start, big, RESIZE_S, 0.0)]
+    segs.append((big, land, hop_s, 0.15))
+    return segs + ([(land, goal, RESIZE_S, 0.0)] if land != goal else [])
+
+
+# ============================================================
+# ANSWER PANEL SPOT
+# ============================================================
+
+def answer_spot(panel, side, work, gap=12):
+    """(x, y) for the orb beside the answer panel: to its left, vertically
+    centred, else to its right when the left has no room; inside ``work``."""
+    pl, pt, pr, pb = panel
+    wl, wt, wr, wb = (int(v) for v in work)
+    x = pl - gap - side if pl - gap - side >= wl else pr + gap
+    y = (pt + pb) // 2 - side // 2
+    return _clamp(x, wl, wr - side), _clamp(y, wt, wb - side)
+
+
+# ============================================================
+# ORB MOTION
+# ============================================================
+
+# core/orb_motion.py — pure motion for the floating orb's flights: a 2-D damped
+# spring with a closed-form solution, so a flight's position is a function of
+# the time since take-off only (a dropped frame skips ahead, it never bends the
+# path), plus the frame-timing statistics. No Win32, no threads, no logging:
+# core/floating_orb.Tween samples it once per frame.
+#
+# Motion (config.orb_motion(), MISTAI_ORB_MOTION):
+#   lively  damping ratio 0.58 (short hops) .. 0.68 (long flights): a small
+#           overshoot that settles (soft-capped near OVERSHOOT_PX); omega is the larger of a snappy minimum and
+#           the value that brings the decay envelope under SETTLE_PX by
+#           LIVELY_SETTLE_S, so a long flight is never slow; flights longer than
+#           ANTICIPATION_MIN_PX first lean back ANTICIPATION_PX for
+#           ANTICIPATION_S.
+#   calm    critically damped (no overshoot), settled by CALM_SETTLE_S.
+# Both bow upward with a perpendicular offset that is zero (and flat) at both
+# ends. A flight can be retargeted mid-way: the new spring starts from the
+# rendered position and velocity at that moment, so there is no jump.
+
+# ============================================================
+# SPRING SETTINGS
+# ============================================================
+
+SETTLE_PX = 0.5            # closer than this ...
+SETTLE_SPEED = 30.0        # ... and slower than this (px/s): snap and finish
+MAX_FLIGHT_S = 1.5         # hard cap per (re)target, then snap
+LIVELY_SETTLE_S = 0.52     # + the anticipation: everything settled by ~0.6 s
+CALM_SETTLE_S = 0.6
+LIVELY_MIN_OMEGA = 18.0    # rad/s: short hops stay snappy
+CALM_MIN_OMEGA = 12.0
+MAX_OMEGA = 60.0
+ANTICIPATION_S = 0.06
+ANTICIPATION_PX = 8.0
+ANTICIPATION_MIN_PX = 200.0
+ARC_CAP_PX = 200.0
+OVERSHOOT_PX = 28.0        # overshoot past the target is soft-capped near this (tanh)
+_H = 1e-5                  # s, for the numeric velocity of the rendered path
+
+
+# ============================================================
+# CRITICAL DAMPING SETTLE POINT
+# ============================================================
+
+def _critical_x(amplitude):
+    """x = omega * t at which a critically damped spring released from rest
+    at ``amplitude`` is within SETTLE_PX: (1 + x) e^-x = SETTLE_PX / amplitude."""
+    goal = SETTLE_PX / amplitude
+    if goal >= 1.0:
+        return 0.0
+    x = max(1.0, math.log(1.0 / goal))
+    for _ in range(40):                      # Newton on g(x) = ln(1+x) - x - ln(goal)
+        g = math.log1p(x) - x - math.log(goal)
+        dg = 1.0 / (1.0 + x) - 1.0
+        step = g / dg
+        x -= step
+        if abs(step) < 1e-9:
+            break
+    return max(0.0, x)
+
+
+# ============================================================
+# SPRING PARAMETERS PER DISTANCE
+# ============================================================
+
+def spring_params(distance, motion="lively"):
+    """(damping ratio, natural frequency rad/s) for a flight of ``distance`` px."""
+    d = max(1.0, float(distance))
+    if motion == "calm":
+        return 1.0, min(MAX_OMEGA, max(CALM_MIN_OMEGA, _critical_x(d) / CALM_SETTLE_S))
+    share = min(1.0, max(0.0, (math.log10(d) - 2.0) / 1.2))
+    zeta = 0.58 + 0.10 * share
+    amplitude = d / math.sqrt(1.0 - zeta * zeta)          # the envelope from rest
+    need = math.log(max(1.0, amplitude / SETTLE_PX)) / (zeta * LIVELY_SETTLE_S)
+    return zeta, min(MAX_OMEGA, max(LIVELY_MIN_OMEGA, need))
+
+
+# ============================================================
+# DAMPED SPRING FORMULA
+# ============================================================
+
+def spring(e0, v0, zeta, omega, t):
+    """(offset, velocity) at ``t`` of a damped spring released at offset
+    ``e0`` with velocity ``v0`` (closed form; zeta <= 1)."""
+    if t <= 0:
+        return e0, v0
+    if zeta >= 1.0:
+        k = math.exp(-omega * t)
+        b = v0 + omega * e0
+        return (e0 + b * t) * k, (v0 - omega * b * t) * k
+    wd = omega * math.sqrt(1.0 - zeta * zeta)
+    k = math.exp(-zeta * omega * t)
+    c, s = math.cos(wd * t), math.sin(wd * t)
+    e = k * (e0 * c + (v0 + zeta * omega * e0) / wd * s)
+    v = k * (v0 * c - (omega * omega * e0 + zeta * omega * v0) / wd * s)
+    return e, v
+
+
+# ============================================================
+# RETARGETABLE SPRING FLIGHT
+# ============================================================
+
+class Flight:
+    """A retargetable spring flight of a point (the orb's top-left corner;
+    the size never changes in flight). ``at(t)`` -> (x, y, done)."""
+
+    def __init__(self, start, target, t0, motion="lively", bow=0.0):
+        self.motion = motion if motion in ("lively", "calm") else "lively"
+        self.bow = max(0.0, float(bow))
+        self._begin((float(start[0]), float(start[1])), (0.0, 0.0), target, t0, fresh=True)
+
+    def _begin(self, pos, vel, target, t0, fresh):
+        self.t0, self.p0, self.v0 = float(t0), pos, vel
+        self.target = (float(target[0]), float(target[1]))
+        dx, dy = self.target[0] - pos[0], self.target[1] - pos[1]
+        dist = math.hypot(dx, dy)
+        self.dist = dist
+        self.dir = (dx / dist, dy / dist) if dist > 0 else (0.0, 0.0)
+        self.zeta, self.omega = spring_params(dist, self.motion)
+        self.lead = (ANTICIPATION_S if fresh and self.motion == "lively"
+                     and dist > ANTICIPATION_MIN_PX else 0.0)
+        arc = 0.0
+        nx, ny = 0.0, 0.0
+        if dist > 0:
+            arc = min(ARC_CAP_PX, self.bow / 2.0 * dist) * abs(dx) / dist   # none when vertical
+            nx, ny = dy / dist, -dx / dist                                 # perpendicular ...
+            if ny > 0:
+                nx, ny = -nx, -ny                                          # ... pointing up
+        self.arc = (nx * arc, ny * arc)
+        self.settled = False
+
+    def _raw(self, t):
+        """(x, y, spring vx, spring vy) at ``t``, before settling."""
+        s = max(0.0, t - self.t0)
+        (px, py), (dx, dy) = self.p0, self.dir
+        if s < self.lead:                   # lean back, then hand over at rest
+            back = -ANTICIPATION_PX * math.sin(math.pi * s / self.lead) ** 2
+            return px + dx * back, py + dy * back, 0.0, 0.0
+        s -= self.lead
+        tx, ty = self.target
+        ex, vx = spring(px - tx, self.v0[0], self.zeta, self.omega, s)
+        ey, vy = spring(py - ty, self.v0[1], self.zeta, self.omega, s)
+        x, y = tx + ex, ty + ey
+        past = ex * dx + ey * dy                  # beyond the target along the flight
+        if past > 0:
+            cut = past - OVERSHOOT_PX * math.tanh(past / OVERSHOOT_PX)
+            x, y = x - dx * cut, y - dy * cut
+        if self.dist > 0 and self.arc != (0.0, 0.0):
+            p = ((x - px) * dx + (y - py) * dy) / self.dist
+            f = math.sin(math.pi * min(1.0, max(0.0, p))) ** 2
+            x, y = x + self.arc[0] * f, y + self.arc[1] * f
+        return x, y, vx, vy
+
+    def position(self, t):
+        x, y, _vx, _vy = self._raw(t)
+        return x, y
+
+    def velocity(self, t):
+        """The rendered path's velocity (px/s) at ``t`` (0 before take-off)."""
+        if self.settled:
+            return 0.0, 0.0
+        if t - _H < self.t0:
+            a, b = self._raw(t), self._raw(t + _H)
+            return (b[0] - a[0]) / _H, (b[1] - a[1]) / _H
+        a, b = self._raw(t - _H), self._raw(t + _H)
+        return (b[0] - a[0]) / (2 * _H), (b[1] - a[1]) / (2 * _H)
+
+    def at(self, t):
+        """(x, y, done): floats in flight, exactly the target once settled."""
+        if self.settled:
+            return self.target[0], self.target[1], True
+        x, y, vx, vy = self._raw(t)
+        s = t - self.t0
+        near = math.hypot(x - self.target[0], y - self.target[1]) < SETTLE_PX
+        if (s >= self.lead and near and math.hypot(vx, vy) < SETTLE_SPEED) or s >= MAX_FLIGHT_S:
+            self.settled = True
+            return self.target[0], self.target[1], True
+        return x, y, False
+
+    def retarget(self, t, target):
+        """Fly on to ``target`` from where the orb is at ``t``, with the
+        velocity it has there (no restart, no jump)."""
+        if self.settled:
+            pos, vel = self.target, (0.0, 0.0)
+        else:
+            pos, vel = self.position(t), self.velocity(t)
+        self._begin(pos, vel, target, t, fresh=False)
+
+
+# -- frame timing ------------------------------------------------------------------------
+
+
+# ============================================================
+# REFRESH RATE VALIDATION
+# ============================================================
+
+def valid_refresh(hz, default=60):
+    """A usable refresh rate (Hz): 24..500, else ``default`` (0 and 1 mean
+    "hardware default" to EnumDisplaySettings)."""
+    try:
+        hz = int(round(float(hz)))
+    except (TypeError, ValueError):
+        return default
+    return hz if 24 <= hz <= 500 else default
+
+
+# ============================================================
+# FRAME TIMING STATISTICS
+# ============================================================
+
+def frame_stats(times, refresh_hz=60):
+    """Numbers for one flight from its per-frame clock readings (seconds):
+    frames, duration_ms, mean_ms / p95_ms / max_ms of the intervals, slow
+    (intervals above 1.5 x the refresh interval) and the refresh used."""
+    hz = valid_refresh(refresh_hz)
+    times = [float(t) for t in times]
+    gaps = sorted(b - a for a, b in zip(times, times[1:]))
+    out = {"frames": len(times), "duration_ms": 0.0, "mean_ms": 0.0, "p95_ms": 0.0,
+           "max_ms": 0.0, "slow": 0, "refresh": hz}
+    if not gaps:
+        return out
+    limit = 1.5 / hz
+    rank = max(0, math.ceil(0.95 * len(gaps)) - 1)
+    out.update(duration_ms=round((times[-1] - times[0]) * 1000, 1),
+               mean_ms=round(sum(gaps) / len(gaps) * 1000, 1),
+               p95_ms=round(gaps[rank] * 1000, 1), max_ms=round(gaps[-1] * 1000, 1),
+               slow=sum(1 for g in gaps if g > limit))
+    return out
+
+
+# ============================================================
+# FRAME STATS LOG LINE
+# ============================================================
+
+def stats_line(stats, pacer, motion):
+    """The one log line (numbers and fixed labels only)."""
+    return (f"[FloatingOrb] frame stats frames {stats['frames']} duration "
+            f"{stats['duration_ms']:.0f} ms interval mean {stats['mean_ms']:.1f} p95 "
+            f"{stats['p95_ms']:.1f} max {stats['max_ms']:.1f} ms slow {stats['slow']} refresh "
+            f"{stats['refresh']} Hz pacer {pacer} motion {motion}")
+
+
+# ============================================================
+# ORB WINDOW SETTINGS
+# ============================================================
 
 ORB_MARGIN = 16           # logical px from the work area's right and bottom edges
 MIN_SIZE = (1, 1)         # pywebview's default min_size (200, 100) clamps every resize
@@ -97,6 +857,10 @@ TIMER_ALL_ACCESS = 0x1F0003
 FLIGHT_SWITCH_INTERVAL = 0.001     # s, sys.setswitchinterval during a flight
 
 
+# ============================================================
+# ORB STATE FROM PYTHON FACTS
+# ============================================================
+
 def orb_state(api):
     """The orb's state from Python's own facts, with the page's priority
     (ui/html.py orbState): the push-to-talk mic, then Mist's voice, then a
@@ -118,6 +882,10 @@ def orb_state(api):
         pass
     return "idle"
 
+
+# ============================================================
+# ORB PAGE BRIDGE
+# ============================================================
 
 class OrbBridge:
     """The orb page's js_api: the read-only state and talk(), nothing else,
@@ -151,6 +919,11 @@ class OrbBridge:
 
 # -- geometry (pure) ------------------------------------------------------------
 
+
+# ============================================================
+# HOME PLACEMENT ON THE PRIMARY MONITOR
+# ============================================================
+
 def place(work, scale, size=None, margin=ORB_MARGIN):
     """(x, y, side) in physical px: a square of ``size * scale`` with
     ``margin * scale`` to the right and bottom edges of ``work`` (l, t, r, b),
@@ -164,11 +937,19 @@ def place(work, scale, size=None, margin=ORB_MARGIN):
     return max(l, r - gap - side), max(t, b - gap - side), side
 
 
+# ============================================================
+# ROUND REGION BOX
+# ============================================================
+
 def ellipse_box(width, height):
     """CreateEllipticRgn's box for a window of this size: relative to the
     window's top-left, right/bottom exclusive (hence the +1)."""
     return 0, 0, int(width) + 1, int(height) + 1
 
+
+# ============================================================
+# ORB SIZE PER STATE
+# ============================================================
 
 def size_for(state, docked=False):
     """Logical side for a state: small while docked beside the task's window,
@@ -180,6 +961,11 @@ def size_for(state, docked=False):
 
 
 # -- Win32 (ctypes; tests pass a fake with the same methods) --------------------
+
+
+# ============================================================
+# WIN32 CALLS
+# ============================================================
 
 class Win32:
     """The few Win32 calls the orb needs, with last-error capture. pywin32's
@@ -388,6 +1174,10 @@ class Win32:
         self.gdi32.DeleteObject(handle)
 
 
+# ============================================================
+# MOVING AND RESIZING THE WINDOW
+# ============================================================
+
 def apply_square(win, hwnd, x, y, side, last_side=None):
     """Put the window on the square. Same side as ``last_side``: a plain
     move (SetWindowPos SWP_NOSIZE), no region work. A new side: resize, then
@@ -406,6 +1196,10 @@ def apply_square(win, hwnd, x, y, side, last_side=None):
     except Exception:
         return False
 
+
+# ============================================================
+# FRAME PACING
+# ============================================================
 
 class FramePacer:
     """Waits one display frame per wait(): DwmFlush() (returns after the next
@@ -506,6 +1300,10 @@ class FramePacer:
             pass
 
 
+# ============================================================
+# TEST FRAME PACER
+# ============================================================
+
 class _EventPacer:
     """For a Win32 stand-in without make_pacer (tests): Event.wait(FRAME_S)."""
 
@@ -522,9 +1320,17 @@ class _EventPacer:
         pass
 
 
+# ============================================================
+# TIMER RESOLUTION BOOST STATE
+# ============================================================
+
 _BOOST_LOCK = threading.Lock()
 _BOOST = {"n": 0, "interval": None}
 
+
+# ============================================================
+# TIMER RESOLUTION BOOST ON
+# ============================================================
 
 def _boost_enter(win):
     """Above-normal priority for this thread and a 1 ms GIL switch interval
@@ -543,6 +1349,10 @@ def _boost_enter(win):
     return prev
 
 
+# ============================================================
+# TIMER RESOLUTION BOOST OFF
+# ============================================================
+
 def _boost_exit(win, prev):
     try:
         if prev is not None and hasattr(win, "restore_thread"):
@@ -555,6 +1365,10 @@ def _boost_exit(win, prev):
             sys.setswitchinterval(_BOOST["interval"])
             _BOOST["interval"] = None
 
+
+# ============================================================
+# FLIGHT PLAYER
+# ============================================================
 
 class Tween:
     """Plays flight segments [(from, to, seconds, bow), ...] on a worker
@@ -710,6 +1524,11 @@ class Tween:
     def running(self):
         return self._thread is not None and self._thread.is_alive()
 
+
+# ============================================================
+# NO-ACTIVATE MOUSE ANSWER
+# ============================================================
+
 WM_MOUSEACTIVATE = 0x0021
 MA_NOACTIVATE = 3
 
@@ -722,6 +1541,10 @@ def mouse_activate_answer(msg):
 
 _SUBCLASS_PROCS = []      # keeps the ctypes callbacks alive
 
+
+# ============================================================
+# NO-ACTIVATE WINDOW SUBCLASS
+# ============================================================
 
 def guard_mouse_activate(hwnd, run_on_ui=None):
     """Subclass the window (comctl32 SetWindowSubclass) so a click answers
@@ -756,6 +1579,10 @@ def guard_mouse_activate(hwnd, run_on_ui=None):
         return False
 
 
+# ============================================================
+# TASKBAR HIDING
+# ============================================================
+
 def hide_from_taskbar(hwnd, win, tag):
     """WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE on, WS_EX_APPWINDOW off, then hide
     and re-show without activating: the taskbar and Alt-Tab only re-read a
@@ -776,6 +1603,10 @@ def hide_from_taskbar(hwnd, win, tag):
         return False
 
 
+# ============================================================
+# WIN32 FAILURE LOGGING
+# ============================================================
+
 def _fail(call, win):
     """Log a failed Win32 call by name and GetLastError() code only."""
     try:
@@ -784,6 +1615,10 @@ def _fail(call, win):
         code = -1
     print(f"[FloatingOrb] {call} failed (error {code})")
 
+
+# ============================================================
+# ORB WINDOW HARDENING
+# ============================================================
 
 def harden(hwnd, win=None):
     """Exclude ``hwnd`` from capture, make it non-activating and taskbar-free,
@@ -844,6 +1679,10 @@ def harden(hwnd, win=None):
     return out
 
 
+# ============================================================
+# CREATE-TIME CORNER POSITION
+# ============================================================
+
 def _corner_position(size=None, win=None):
     """Create-time (x, y) in LOGICAL px near the work area's bottom-right
     corner. pywebview multiplies create-time x/y by the display scale, so the
@@ -859,6 +1698,10 @@ def _corner_position(size=None, win=None):
     except Exception:
         return None, None
 
+
+# ============================================================
+# ORB CONTROLLER
+# ============================================================
 
 class FloatingOrb:
     """Creates the orb window on first show; hide() keeps it for the next show."""
@@ -1234,7 +2077,6 @@ class FloatingOrb:
                 self.panels.hide_all()
             return
         if self.panels is None:
-            from .orb_panels import OrbPanels
 
             self.panels = OrbPanels(self._api, self._win)
         if self._cur_target:                          # the target's monitor
@@ -1432,3 +2274,354 @@ class FloatingOrb:
         if not (self.visible and self.hwnd):
             return []
         return [self.hwnd] + (self.panels.handles() if self.panels is not None else [])
+
+
+# ============================================================
+# TASK PANELS
+# ============================================================
+
+# core/orb_panels.py — task panels beside the floating orb (Settings "Task
+# panels" / MISTAI_ORB_PANELS, default off; needs the floating orb shown).
+#
+# Three small frameless windows built like the orb (core/floating_orb.py):
+# excluded from capture, never activated (WS_EX_NOACTIVATE), untitled, in
+# MistAI's own process (so Open apps and process lookups skip them), listed in
+# the orb's handles() (so the OCR mask blacks them out and input is refused
+# while one is in front). Each page reads its content through its own
+# PanelBridge: panel_state() (read-only) and dismiss() (hides that panel only).
+#
+# - steps: each step as a human label from the tool's category (label_for:
+#   "Clicking", "Typing", "Reading the screen", ...), ticked as each one
+#   completes (the last one is the current step); answer: the final speech.
+#   They close ANSWER_S after the answer, and at once when the task fails, is
+#   paused or stopped, or the network sentence is spoken.
+#
+# Content comes from the event bus (events.AGENT_STEP, ACTION_EXECUTED/FAILED)
+# and is never logged; logs carry labels and numbers only.
+
+# ============================================================
+# TASK PANEL SETTINGS
+# ============================================================
+
+KINDS = ("steps", "answer")
+SIZES = {"steps": (240, 176), "answer": (280, 140)}   # logical px
+ANSWER_S = 8.0
+MAX_STEPS = 8
+CORNER = 12                  # logical px
+PANEL_BACKGROUND = "#161c26"  # = the page's panel colour, so nothing else shows
+
+# Tool categories (core/tools.py SPECS) -> labels, first match wins.
+CATEGORY_LABELS = (
+    ("perception", "Reading the screen"), ("click", "Clicking"), ("type", "Typing"),
+    ("browser", "Using the browser"), ("app", "Opening an app"),
+    ("window", "Arranging windows"), ("system", "Running a command"),
+    ("file", "Working with files"), ("messaging", "Sending a message"),
+    ("navigation", "Scrolling"), ("memory", "Remembering"), ("info", "Looking it up"),
+)
+
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_ROUND = 2
+DWMWA_SYSTEMBACKDROP_TYPE = 38
+DWMSBT_TRANSIENTWINDOW = 3   # acrylic
+
+
+# ============================================================
+# STEP LABELS
+# ============================================================
+
+def label_for(action, categories=()):
+    """A human label from the tool's categories ("click" -> "Clicking");
+    "Working" when none is known. Never the action id or its parameter."""
+    for cat, label in CATEGORY_LABELS:
+        if cat in tuple(categories or ()):
+            return label
+    return "Working"
+
+
+# ============================================================
+# TOOL CATEGORY LOOKUP
+# ============================================================
+
+def tool_categories(api, action):
+    try:
+        return tuple(api.tools.get(action).categories or ())
+    except Exception:
+        return ()
+
+
+# ============================================================
+# PANEL MODEL
+# ============================================================
+
+class PanelModel:
+    """What the panels show, fed by the bus (subscribers must be fast)."""
+
+    def __init__(self, clock=time.monotonic, categories=None):
+        self._lock = threading.Lock()
+        self._clock = clock
+        self._categories = categories or (lambda action: ())
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.steps = []           # [{"label", "action", "state": run|ok|fail}]
+            self.answer = ""
+            self.answer_at = None
+            self.spoken_until = None  # when Mist last spoke the answer
+            self.closed = set()
+            self.ended = False        # failed, paused, stopped: close all now
+
+    def on_event(self, ev):
+        try:
+            data = ev.data or {}
+            with self._lock:
+                if ev.name == events.AGENT_STEP:
+                    action = str(data.get("action", ""))
+                    if action == "failed":
+                        self.ended = True
+                    elif action == "done":
+                        self.answer = str(data.get("speech", ""))
+                        self.answer_at = self._clock()
+                    else:
+                        self.steps.append({"label": label_for(action, self._categories(action)),
+                                           "action": action, "state": "run"})
+                        del self.steps[:-MAX_STEPS]
+                elif ev.name in (events.TASK_FAILED, events.TASK_PAUSED):
+                    self.ended = True
+                elif ev.name in (events.ACTION_EXECUTED, events.ACTION_FAILED):
+                    action = str(data.get("action", ""))
+                    for step in reversed(self.steps):
+                        if step["state"] == "run" and step["action"] == action:
+                            step["state"] = "ok" if ev.name == events.ACTION_EXECUTED else "fail"
+                            break
+        except Exception:
+            pass
+
+    def mark_speaking(self, speaking):
+        """Panels close ANSWER_S after the answer's speech ENDS."""
+        if speaking and self.answer_at is not None:
+            self.spoken_until = self._clock()
+
+    def expired(self):
+        if self.answer_at is None:
+            return False
+        last = max(self.answer_at, self.spoken_until or self.answer_at)
+        return self._clock() - last > ANSWER_S
+
+    def visible(self, kind, busy):
+        """Should this panel be on screen now?"""
+        if self.ended or kind in self.closed or self.expired():
+            return False
+        if kind == "answer":
+            return bool(self.answer)
+        return bool(self.steps) and (busy or self.answer_at is not None)
+
+    def state(self, kind):
+        with self._lock:
+            if kind == "steps":
+                return {"kind": kind, "steps": [{"label": s["label"], "state": s["state"]}
+                                                for s in self.steps]}
+            return {"kind": kind, "text": self.answer}
+
+    def close(self, kind):
+        with self._lock:
+            self.closed.add(kind)
+
+
+# ============================================================
+# PANEL PAGE BRIDGE
+# ============================================================
+
+class PanelBridge:
+    """A panel page's js_api: its own content (read-only) and its own close."""
+
+    def __init__(self, panels, kind):
+        self._panels, self._kind = panels, kind
+
+    def panel_state(self):
+        st = self._panels.model.state(self._kind)
+        st["side"] = self._panels.side
+        return st
+
+    def dismiss(self):
+        self._panels.model.close(self._kind)
+        return {"ok": True}
+
+
+# ============================================================
+# PANEL WINDOW HARDENING
+# ============================================================
+
+def harden_panel(hwnd, win, w, h, scale, blur):
+    """Capture exclusion, no activation, rounded corners. Returns "blur" when
+    the DWM backdrop took (Windows 11), else "plain" (a rounded region)."""
+
+
+    try:
+        if not orb_debug_capture() and not win.set_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
+            win.set_affinity(hwnd, WDA_MONITOR)
+    except Exception as e:
+        print(f"[OrbPanels] hardening error ({type(e).__name__})")
+    hide_from_taskbar(hwnd, win, "OrbPanels")
+    if blur:
+        try:
+            if (win.dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW) == 0
+                    and win.dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND) == 0):
+                return "blur"
+        except Exception:
+            pass
+    harden_corners(hwnd, win, w, h, scale)
+    return "plain"
+
+
+# ============================================================
+# PANEL ROUNDED CORNERS
+# ============================================================
+
+def harden_corners(hwnd, win, w, h, scale):
+    """Cut rounded corners for a window of this actual size."""
+    try:
+        r = max(2, round(CORNER * 2 * scale))
+        region = win.create_round_rect((0, 0, int(w) + 1, int(h) + 1, r, r))
+        if region and not win.set_region(hwnd, region):
+            win.delete_object(region)
+    except Exception as e:
+        print(f"[OrbPanels] region error ({type(e).__name__})")
+
+
+# ============================================================
+# PANEL WINDOWS
+# ============================================================
+
+class OrbPanels:
+    """The three panel windows. update() is called from the orb's control
+    loop with the orb square, the target rect (or None) and the work area."""
+
+    def __init__(self, api, win, webview=None, html=None, clock=time.monotonic):
+        self._api, self._win = api, win
+        self._webview, self._html = webview, html
+        self.model = PanelModel(clock, lambda action: tool_categories(api, action))
+        self.windows = {}             # kind -> pywebview window
+        self.hwnds = {}               # kind -> hwnd once shown
+        self.shown = {}               # kind -> bool
+        self.side = "top-right"       # the anchor in use (the page slides in from above)
+        self.rects = {}               # kind -> (l, t, r, b) while shown
+        self.style = None
+        self.sizes = {}               # kind -> actual (w, h) the corners were cut for
+        self._was_busy = False
+        self._unsubs = []
+        try:
+            bus = api.bus
+            for name in (events.AGENT_STEP, events.ACTION_EXECUTED, events.ACTION_FAILED,
+                         events.TASK_FAILED, events.TASK_PAUSED):
+                self._unsubs.append(bus.subscribe(name, self.model.on_event))
+        except Exception:
+            pass
+
+    def handles(self):
+        return [h for k, h in self.hwnds.items() if h and self.shown.get(k)]
+
+    def _module(self):
+        if self._webview is None:
+            import webview
+
+            self._webview = webview
+        return self._webview
+
+    def _create(self, kind, x, y, w, h, scale):
+        html = self._html
+        if html is None:
+            from ui.html import PANEL_HTML as html
+        window = self._module().create_window(
+            "", html=html, js_api=PanelBridge(self, kind),
+            width=round(w / scale), height=round(h / scale),
+            x=round(x / scale), y=round(y / scale),
+            min_size=MIN_SIZE,
+            resizable=False, frameless=True, easy_drag=False, shadow=False,
+            focus=False, on_top=True, background_color=PANEL_BACKGROUND,
+        )
+        self.windows[kind] = window
+
+        def shown():
+            try:
+                hwnd = int(window.native.Handle.ToInt32()) or None
+            except Exception:
+                hwnd = None
+            if not hwnd:
+                return
+            self.hwnds[kind] = hwnd
+            self._win.move(hwnd, x, y, w, h)
+            aw, ah = self._actual(hwnd, w, h, kind)
+            style = harden_panel(hwnd, self._win, aw, ah, scale, panel_blur_enabled())
+            self.sizes[kind] = (aw, ah)
+            if self.style is None:
+                self.style = style
+                print(f"[OrbPanels] panel style: {style}")
+
+        window.events.shown += shown
+
+    def _actual(self, hwnd, w, h, kind):
+        """The window's real (w, h) after a move; logged next to the request."""
+        try:
+            l, t, r, b = self._win.window_rect(hwnd)
+            aw, ah = r - l, b - t
+        except Exception:
+            return w, h
+        if (aw, ah) != (w, h) or kind not in self.sizes:
+            print(f"[OrbPanels] {kind} requested {w},{h} actual {aw},{ah}")
+        return aw, ah
+
+    def update(self, orb, target_rect, work, scale, busy, maximized=False, ended=False,
+               speaking=False):
+        """Show, place or hide the panels for this tick: anchored to the top of
+        ``work`` (the target's monitor, else the primary), never over the orb.
+        Never raises."""
+        try:
+            if busy and not self._was_busy:
+                self.model.reset()
+            self._was_busy = busy
+            if ended:
+                self.model.ended = True
+            self.model.mark_speaking(speaking)
+            if self.model.expired() and not busy:
+                self.model.reset()
+            kinds = [k for k in KINDS if self.model.visible(k, busy)]
+            sizes = [tuple(round(v * scale) for v in SIZES[k]) for k in kinds]
+            spots, self.side = anchored_panels(sizes, work, panel_anchor(), scale,
+                                               target_rect, maximized, orb)
+            for kind, (x, y), (w, h) in zip(kinds, spots, sizes):
+                self.rects[kind] = (x, y, x + w, y + h)
+                hwnd = self.hwnds.get(kind)
+                if kind not in self.windows:
+                    self._create(kind, x, y, w, h, scale)
+                elif hwnd:
+                    if self.sizes.get(kind) == (w, h):
+                        self._win.move_only(hwnd, x, y)
+                    else:                     # new size (another monitor): recut corners
+                        self._win.move(hwnd, x, y, w, h)
+                        aw, ah = self._actual(hwnd, w, h, kind)
+                        harden_corners(hwnd, self._win, aw, ah, scale)
+                        self.sizes[kind] = (aw, ah)
+                    if not self.shown.get(kind):
+                        self._win.show(hwnd, True)
+                if not self.shown.get(kind):
+                    print(f"[OrbPanels] show {kind}")
+                self.shown[kind] = True
+            for kind in KINDS:
+                if kind not in kinds and self.shown.get(kind):
+                    if self.hwnds.get(kind):
+                        self._win.show(self.hwnds[kind], False)
+                    self.shown[kind] = False
+                    self.rects.pop(kind, None)
+                    print(f"[OrbPanels] hide {kind}")
+        except Exception as e:
+            print(f"[OrbPanels] update error ({type(e).__name__})")
+
+    def hide_all(self):
+        for kind in KINDS:
+            if self.shown.get(kind) and self.hwnds.get(kind):
+                try:
+                    self._win.show(self.hwnds[kind], False)
+                except Exception:
+                    pass
+            self.shown[kind] = False

@@ -1,22 +1,440 @@
-"""find_file search, result-limit audit, repeat-guard wording, exact process
-matching, timing output, and the TTS network cooldown."""
+# ============================================================
+# BROWSER AND SEARCH TESTS
+# ============================================================
+#
+# browser_search engines and fallback, search/process matching and timing.
+#
+# SECTION INDEX
+#   1. DUCKDUCKGO SEARCH
+#   2. DUCKDUCKGO SEARCH HELPERS
+#   3. DUCKDUCKGO SEARCH BROWSER
+#   4. DUCKDUCKGO SEARCH API
+#   5. DUCKDUCKGO SEARCH HELPERS (2)
+#   6. DUCKDUCKGO SEARCH TESTS
+#   7. BLOCK FALLBACK
+#   8. BLOCK FALLBACK HELPERS
+#   9. BLOCK FALLBACK BROWSER
+#   10. BLOCK FALLBACK API
+#   11. BLOCK FALLBACK HELPERS (2)
+#   12. BLOCK FALLBACK TESTS
+#   13. SEARCH, PROCESS AND TIMING
+#   14. SEARCH, PROCESS AND TIMING HELPERS
+#   15. SEARCH, PROCESS AND TIMING TESTS
+#   16. SEARCH, PROCESS AND TIMING FIND API
+#   17. SEARCH, PROCESS AND TIMING TESTS (2)
+#   18. SEARCH, PROCESS AND TIMING HELPERS (2)
+#   19. SEARCH, PROCESS AND TIMING TESTS (3)
+#   20. SEARCH, PROCESS AND TIMING GATED RUN
+#   21. SEARCH, PROCESS AND TIMING HELPERS (3)
+#   22. SEARCH, PROCESS AND TIMING TESTS (4)
+# ============================================================
 
+"""browser_search engines and fallback, search/process matching and timing."""
+
+import inspect
+import re
+from types import SimpleNamespace
 import json
 import os
 import threading
-from types import SimpleNamespace
 
 import pytest
 
-from core import file_search, planner
+from core import config, planner, workspace as file_search
 from core.agent import AgentLoop, Timings
 from core.api import Api
-from core.config import TRACKED_PROCESS_NAMES, normalize_process_name, process_matches
+from core.executor import Executor
 from core.tools import SPECS
+from core.config import (
+    SEARCH_ENGINES,
+    blocked_page_reason,
+    TRACKED_PROCESS_NAMES,
+    normalize_process_name,
+    process_matches,
+)
 
 
-# -- file_search ---------------------------------------------------------------
+# ============================================================
+# DUCKDUCKGO SEARCH
+# ============================================================
 
+# browser_search uses one engine, DuckDuckGo (MISTAI_SEARCH_ENGINE=google switches
+# back): its normal page, then its HTML endpoint on a block or empty page; a
+# blocked search is a clear failure that never escalates to a browser app, and the
+# agent prompt says to search with browser_search only. Stubbed browser.
+
+
+# ============================================================
+# DUCKDUCKGO SEARCH HELPERS
+# ============================================================
+
+DUCKDUCKGO_SEARCH_RESULTS = "Marblewood lighthouse opening hours 9am to 5pm daily " * 5
+DDG_ANOMALY_URL = ("https://duckduckgo.com/anomaly?q=x", "DuckDuckGo", "Please try again.")
+DDG_BOTS = ("https://duckduckgo.com/?q=x", "DuckDuckGo",
+            "Unfortunately, bots use DuckDuckGo too. Please complete the following challenge.")
+DDG_HTML_OK = ("https://html.duckduckgo.com/html/?q=x", "x at DuckDuckGo", DUCKDUCKGO_SEARCH_RESULTS)
+EMPTY = ("https://duckduckgo.com/?q=x", "DuckDuckGo", "   ")
+
+
+# ============================================================
+# DUCKDUCKGO SEARCH BROWSER
+# ============================================================
+
+class DuckduckgoSearchBrowser:
+    def __init__(self, pages):
+        self.pages, self.visited, self.current = list(pages), [], None
+
+    def navigate(self, url):
+        self.visited.append(url)
+        self.current = self.pages.pop(0)
+        return self.current[0], self.current[1]
+
+    def get_text(self, _selector=""):
+        return self.current[2]
+
+
+# ============================================================
+# DUCKDUCKGO SEARCH API
+# ============================================================
+
+def _duckduckgo_search_api(pages):
+    api = Api.__new__(Api)
+    api.browser = DuckduckgoSearchBrowser(pages)
+    api.spoken = []
+    api.speak = lambda text: api.spoken.append(text)
+    api.last_result_text = ""
+    return api
+
+
+# -- engine selection and URLs ------------------------------------------------------------
+
+
+# -- DuckDuckGo block pages ----------------------------------------------------------------
+
+
+# -- browser_search ------------------------------------------------------------------------
+
+
+# -- the prompt rule -----------------------------------------------------------------------
+
+
+# ============================================================
+# DUCKDUCKGO SEARCH HELPERS (2)
+# ============================================================
+
+def _system():
+    api = SimpleNamespace(workspace=SimpleNamespace(context_block=lambda: ""),
+                          _resolve_path_placeholders=lambda p: p)
+    return AgentLoop(api, None)._build_system("none", {"open_apps": []}, "screen", "", [])
+
+
+# ============================================================
+# DUCKDUCKGO SEARCH TESTS
+# ============================================================
+
+class TestDuckduckgoSearch:
+    @pytest.fixture(autouse=True)
+    def _default_engine(self, monkeypatch):
+        monkeypatch.delenv("MISTAI_SEARCH_ENGINE", raising=False)
+
+    @pytest.mark.parametrize("raw, engine", [
+        (None, "duckduckgo"), ("duckduckgo", "duckduckgo"), ("google", "google"),
+        (" Google ", "google"), ("bing", "duckduckgo"), ("", "duckduckgo"),
+    ])
+    def test_the_engine_is_duckduckgo_unless_set_to_google(self, monkeypatch, raw, engine):
+        if raw is not None:
+            monkeypatch.setenv("MISTAI_SEARCH_ENGINE", raw)
+        assert config.search_engine() == engine
+
+    def test_the_default_routes_never_leave_duckduckgo(self):
+        routes = config.search_routes()
+        assert [n for n, _ in routes] == ["DuckDuckGo", "DuckDuckGo HTML"]
+        assert all(u.startswith("https://") and "duckduckgo.com" in u for _, u in routes)
+
+    def test_the_env_switches_back_at_call_time(self, monkeypatch):
+        assert config.search_routes()[0][0] == "DuckDuckGo"
+        monkeypatch.setenv("MISTAI_SEARCH_ENGINE", "google")
+        assert config.search_routes()[0][0] == "Google"
+
+    @pytest.mark.parametrize("query, encoded", [
+        ("marblewood hours", "marblewood%20hours"),
+        ("a&b=c/d ?#", "a%26b%3Dc%2Fd%20%3F%23"),
+        ("café 5+5", "caf%C3%A9%205%2B5"),
+    ])
+    def test_the_query_is_fully_percent_encoded(self, query, encoded):
+        assert config.search_url("https://duckduckgo.com/?q=", query) == (
+            "https://duckduckgo.com/?q=" + encoded)
+
+    @pytest.mark.parametrize("page", [DDG_ANOMALY_URL, DDG_BOTS])
+    def test_duckduckgo_anomaly_pages_are_blocks(self, page):
+        assert config.blocked_page_reason(*page) == (
+            "the page reports an anomaly (DuckDuckGo's bot check)")
+
+    def test_a_normal_duckduckgo_results_page_is_not_a_block(self):
+        assert config.blocked_page_reason("https://duckduckgo.com/?q=x", "x at DuckDuckGo",
+                                          DUCKDUCKGO_SEARCH_RESULTS) is None
+
+    def test_the_normal_page_answers_first(self, capsys):
+        api = _duckduckgo_search_api([("https://duckduckgo.com/?q=x", "x at DuckDuckGo", DUCKDUCKGO_SEARCH_RESULTS)])
+        assert Api._act_browser_search(api, "marblewood hours") is True
+        assert api.browser.visited == ["https://duckduckgo.com/?q=marblewood%20hours"]
+        assert api.last_result_text.startswith("Searched DuckDuckGo for 'marblewood hours'.")
+
+    def test_a_blocked_normal_page_falls_back_to_the_html_endpoint(self, capsys):
+        api = _duckduckgo_search_api([DDG_BOTS, DDG_HTML_OK])
+        assert Api._act_browser_search(api, "marblewood hours") is True
+        assert api.browser.visited == ["https://duckduckgo.com/?q=marblewood%20hours",
+                                       "https://html.duckduckgo.com/html/?q=marblewood%20hours"]
+        assert api.last_result_text.startswith(
+            "Searched DuckDuckGo HTML for 'marblewood hours'. (DuckDuckGo showed a block page.)")
+        log = capsys.readouterr().out
+        assert "browser_search: DuckDuckGo showed a block page (the page reports an anomaly" in log
+        assert "marblewood" not in log and "bots use" not in log
+
+    def test_an_empty_results_page_counts_as_blocked(self):
+        api = _duckduckgo_search_api([EMPTY, DDG_HTML_OK])
+        assert Api._act_browser_search(api, "q") is True
+        assert len(api.browser.visited) == 2
+
+    def test_a_blocked_search_is_a_clear_failure_with_no_other_route(self):
+        api = _duckduckgo_search_api([DDG_BOTS, EMPTY])
+        assert Api._act_browser_search(api, "marblewood hours") is False
+        assert all("duckduckgo.com" in u for u in api.browser.visited)
+        assert len(api.browser.visited) == 2                     # no third route
+        text = api.last_result_text
+        assert text.startswith("BLOCKED: the search was blocked (DuckDuckGo: the page reports an "
+                               "anomaly (DuckDuckGo's bot check); DuckDuckGo HTML: the results "
+                               "page was empty).")
+        assert "no browser app, no address bar" in text and "tell the user" in text
+        assert "bots use" not in text and api.spoken == []
+
+    def test_a_failed_search_never_escalates_to_a_browser_app(self):
+        assert SPECS["browser_search"].fallback_tools == ()
+        # The Executor escalates ONLY through a tool's fallback_tools.
+        src = inspect.getsource(Executor.run)
+        assert "for fb in spec.fallback_tools:" in src
+        assert "open_app" not in src
+
+    def test_the_prompt_says_to_search_with_browser_search_only(self):
+        text = _system()
+        rule = next(l for l in text.splitlines() if l.startswith("- BROWSER:"))
+        assert "for any web search or lookup use browser_search" in rule
+        assert "browser_get_text" in rule
+        assert "never open the user's browser app or type into an address bar to search" in rule
+        assert "only when the user asks to open or use it" in rule
+        assert len(re.findall(r"^- BROWSER", text, re.M)) == 1          # merged, not a new section
+        assert "- browser_search <search query>: Web search (DuckDuckGo)" in text
+        assert "Google search" not in text
+
+
+# ============================================================
+# BLOCK FALLBACK
+# ============================================================
+
+# browser_search / browser_navigate: block and CAPTCHA pages (stubbed browser).
+
+
+# ============================================================
+# BLOCK FALLBACK HELPERS
+# ============================================================
+
+GOOGLE_ROUTES = SEARCH_ENGINES["google"]
+
+
+@pytest.fixture
+def google(monkeypatch):
+    """MISTAI_SEARCH_ENGINE=google: the old order (Google, then DuckDuckGo HTML)."""
+    monkeypatch.setenv("MISTAI_SEARCH_ENGINE", "google")
+
+BLOCK_FALLBACK_RESULTS = "Marblewood lighthouse opening hours 9am to 5pm daily " * 5
+GOOGLE_SORRY = ("https://www.google.com/sorry/index?continue=x", "https://www.google.com/",
+                "Our systems have detected unusual traffic from your computer network. "
+                "Quillfeather ref 12345")
+CF_BLOCK = ("https://html.duckduckgo.com/html/?q=x", "Just a moment...",
+            "Please verify you are human by completing the CAPTCHA below. Ray ID abc")
+ARTICLE = ("https://example.org/blog/captchas", "How CAPTCHA works",
+           "A CAPTCHA is a challenge that tries to tell people and bots apart. " * 60)
+
+
+# ============================================================
+# BLOCK FALLBACK BROWSER
+# ============================================================
+
+class BlockFallbackBrowser:
+    def __init__(self, pages):
+        self.pages = list(pages)   # (url, title, text) returned per navigate, in order
+        self.visited = []
+        self.current = None
+
+    def navigate(self, url):
+        self.visited.append(url)
+        self.current = self.pages.pop(0)
+        return self.current[0], self.current[1]
+
+    def get_text(self, _selector=""):
+        return self.current[2]
+
+
+# ============================================================
+# BLOCK FALLBACK API
+# ============================================================
+
+def _block_fallback_api(pages):
+    api = Api.__new__(Api)
+    api.browser = BlockFallbackBrowser(pages)
+    api.spoken = []
+    api.speak = lambda text: api.spoken.append(text)
+    api.last_result_text = ""
+    return api
+
+
+# ============================================================
+# BLOCK FALLBACK HELPERS (2)
+# ============================================================
+
+def _content_free(result):
+    for word in ("Quillfeather", "12345", "Ray ID", "Just a moment", "Our systems"):
+        assert word not in result
+
+
+# -- the detector -------------------------------------------------------------------
+
+
+# ============================================================
+# BLOCK FALLBACK TESTS
+# ============================================================
+
+@pytest.mark.parametrize("url, title, text, reason", [
+    (*GOOGLE_SORRY, "the site redirected to a /sorry/ block page"),
+    ("https://a.example/x", "Error", "Unusual traffic from your network.",
+     "the page reports unusual traffic"),
+    ("https://a.example/x", "Check", "Please confirm you're not a robot.",
+     "the page asks to prove you're not a robot"),
+    ("https://a.example/x", "Security check", "Solve the captcha to continue.",
+     "the page shows a CAPTCHA"),
+    ("https://a.example/x", "Verify you are human", "", "the page asks to verify you are human"),
+    ("https://a.example/x", "403", "Access Denied. Reference #18.2f", "the page says access denied"),
+])
+def test_block_pages_get_a_fixed_reason(url, title, text, reason):
+    assert blocked_page_reason(url, title, text) == reason
+
+
+@pytest.mark.parametrize("url, title, text", [
+    ARTICLE,                                                       # long article about captchas
+    ("https://a.example/sorryville/menu", "Sorry Ville", "Our menu"),   # 'sorry' not a path step
+    ("https://www.google.com/search?q=sorry", "sorry - Google Search", BLOCK_FALLBACK_RESULTS),
+    ("https://a.example/", "Weather", "Sunny, 18 degrees"),
+    ("", None, None),
+])
+def test_normal_pages_are_not_blocked(url, title, text):
+    assert blocked_page_reason(url, title, text) is None
+
+
+def test_the_reason_never_quotes_the_page():
+    reasons = {blocked_page_reason(*p) for p in (GOOGLE_SORRY, CF_BLOCK)}
+    assert reasons == {"the site redirected to a /sorry/ block page",
+                       "the page shows a CAPTCHA"}     # the first rule that matches wins
+
+
+def test_google_mode_routes_google_first_then_duckduckgo_html():
+    assert [n for n, _ in GOOGLE_ROUTES] == ["Google", "DuckDuckGo HTML"]
+    for routes in SEARCH_ENGINES.values():
+        assert all(u.startswith("https://") and u.endswith("q=") for _, u in routes)
+
+
+# -- browser_search -------------------------------------------------------------------
+
+
+def test_google_blocked_then_the_second_route_works(capsys, google):
+    api = _block_fallback_api([GOOGLE_SORRY, ("https://html.duckduckgo.com/html/?q=x", "results", BLOCK_FALLBACK_RESULTS)])
+    assert Api._act_browser_search(api, "marblewood hours") is True
+    assert api.browser.visited == [GOOGLE_ROUTES[0][1] + "marblewood%20hours",
+                                   GOOGLE_ROUTES[1][1] + "marblewood%20hours"]
+    result = api.last_result_text
+    assert result.startswith("Searched DuckDuckGo HTML for 'marblewood hours'. "
+                             "(Google showed a block page.) RESULTS PAGE TEXT (already read")
+    _content_free(result)
+    log = capsys.readouterr().out
+    assert "[Browser] browser_search: Google showed a block page (the site redirected" in log
+    assert "marblewood" not in log and "Quillfeather" not in log
+
+
+def test_both_routes_blocked_is_a_failure_with_no_page_content(google):
+    api = _block_fallback_api([GOOGLE_SORRY, CF_BLOCK])
+    assert Api._act_browser_search(api, "marblewood hours") is False
+    assert len(api.browser.visited) == 2                       # each route once
+    assert api.last_result_text == (
+        "BLOCKED: the search was blocked (Google: the site redirected to a /sorry/ block "
+        "page; DuckDuckGo HTML: the page shows a CAPTCHA). Do not try to solve it or search "
+        "another way (no browser app, no address bar); tell the user the web search was "
+        "blocked.")
+    assert "already read" not in api.last_result_text
+    _content_free(api.last_result_text)
+    assert api.spoken == []
+
+
+def test_a_normal_results_page_is_untouched(google):
+    api = _block_fallback_api([("https://www.google.com/search?q=x", "x - Google Search", BLOCK_FALLBACK_RESULTS)])
+    assert Api._act_browser_search(api, "marblewood hours") is True
+    assert len(api.browser.visited) == 1
+    excerpt = " ".join(BLOCK_FALLBACK_RESULTS.split())
+    assert api.last_result_text == (
+        "Searched Google for 'marblewood hours'. RESULTS PAGE TEXT (already read -- do NOT "
+        "search again; answer from this, or browser_click a result): " + excerpt)
+    assert api.spoken == ["Searching for marblewood hours"]
+
+
+def test_an_article_about_captchas_is_a_normal_result():
+    api = _block_fallback_api([ARTICLE])
+    assert Api._act_browser_search(api, "how do captchas work") is True
+    assert len(api.browser.visited) == 1 and "already read" in api.last_result_text
+
+
+def test_a_navigation_error_is_reported_as_before():
+    api = _block_fallback_api([])
+    api.browser.navigate = lambda url: (_ for _ in ()).throw(RuntimeError("net down"))
+    assert Api._act_browser_search(api, "q") is False
+    assert api.last_result_text == "browser_search failed: net down"
+
+
+# -- browser_navigate -------------------------------------------------------------------
+
+
+def test_navigate_marks_a_block_page_and_suggests_browser_search():
+    api = _block_fallback_api([CF_BLOCK])
+    assert Api._act_browser_navigate(api, "example.org/page") is False
+    assert api.last_result_text == (
+        "BLOCKED: the page shows a CAPTCHA. This is a block/CAPTCHA page, not "
+        "the content; do not try to solve it. Use browser_search for the information instead.")
+    _content_free(api.last_result_text)
+    assert api.spoken == []
+
+
+def test_navigate_to_a_normal_page_is_untouched():
+    api = _block_fallback_api([("https://example.org/", "Example", "Hello world")])
+    assert Api._act_browser_navigate(api, "example.org") is True
+    assert api.last_result_text == (
+        "Navigated to https://example.org/ (Example). PAGE TEXT (already read -- do NOT "
+        "navigate again; use browser_get_text with a selector only if you need more): "
+        "Hello world")
+    assert api.spoken == ["Navigating to https://example.org/"]
+
+
+def test_the_page_limit_is_a_config_constant():
+    assert config.BLOCK_PAGE_MAX_CHARS == 1500
+
+
+# ============================================================
+# SEARCH, PROCESS AND TIMING
+# ============================================================
+
+# find_file search, result-limit audit, repeat-guard wording, exact process
+# matching, timing output, and the TTS network cooldown.
+
+
+# ============================================================
+# SEARCH, PROCESS AND TIMING HELPERS
+# ============================================================
 
 def _tree(base, files):
     for rel in files:
@@ -24,6 +442,10 @@ def _tree(base, files):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x", encoding="utf-8")
 
+
+# ============================================================
+# SEARCH, PROCESS AND TIMING TESTS
+# ============================================================
 
 def test_search_skips_dependency_and_cache_trees_and_ranks_exact_first(tmp_path):
     _tree(
@@ -97,6 +519,10 @@ def test_ties_follow_root_order_and_home_sweep_skips_dot_folders(tmp_path):
     assert not any(".vscode" in p for p in paths)
 
 
+# ============================================================
+# SEARCH, PROCESS AND TIMING FIND API
+# ============================================================
+
 def _find_api(tmp_path, project_root=None):
     api = Api.__new__(Api)
     folders = {
@@ -117,6 +543,10 @@ def _find_api(tmp_path, project_root=None):
     api.last_result_text = ""
     return api
 
+
+# ============================================================
+# SEARCH, PROCESS AND TIMING TESTS (2)
+# ============================================================
 
 def test_find_file_searches_workspace_root_first_and_reports_roots(tmp_path, monkeypatch):
     monkeypatch.setattr("os.path.expanduser", lambda _p: str(tmp_path / "home"))
@@ -181,11 +611,19 @@ def test_data_returning_tools_have_result_limits():
 # -- Repeat-guard wording --------------------------------------------------------
 
 
+# ============================================================
+# SEARCH, PROCESS AND TIMING HELPERS (2)
+# ============================================================
+
 def _advice(action):
     return AgentLoop(SimpleNamespace(tools=SimpleNamespace(get=lambda n: SPECS[n])), None)._repeat_advice(
         action
     )
 
+
+# ============================================================
+# SEARCH, PROCESS AND TIMING TESTS (3)
+# ============================================================
 
 def test_repeat_advice_depends_on_the_tool_kind():
     for action in ("run_command", "find_file", "inspect_file"):
@@ -452,6 +890,10 @@ def test_built_in_apps_still_match_through_vendor_prefixes():
 # -- Vision gating -----------------------------------------------------------------
 
 
+# ============================================================
+# SEARCH, PROCESS AND TIMING GATED RUN
+# ============================================================
+
 def _gated_run(monkeypatch, script, gating, on_exec=None):
     """Run the loop over scripted actions; returns the number of screen reads."""
     monkeypatch.setenv("MISTAI_VISION_GATING", "1" if gating else "0")
@@ -499,8 +941,16 @@ def _gated_run(monkeypatch, script, gating, on_exec=None):
     return len(reads), loop
 
 
+# ============================================================
+# SEARCH, PROCESS AND TIMING HELPERS (3)
+# ============================================================
+
 NON_UI = [("run_command", "Get-Process"), ("find_file", "a.txt"), ("write_file", "x|||y")]
 
+
+# ============================================================
+# SEARCH, PROCESS AND TIMING TESTS (4)
+# ============================================================
 
 def test_gating_off_keeps_the_old_refresh_after_system_and_file_actions(monkeypatch, capsys):
     reads, _ = _gated_run(monkeypatch, NON_UI, gating=False)
