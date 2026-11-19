@@ -529,6 +529,816 @@
           "notepad"
         ]
       }
+    },
+    {
+      "name": "rt-biggest-file",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "whats the biggest file in {tmp}\\stuff",
+      "timeout": 120,
+      "setup": [
+        {
+          "write_file": {
+            "path": "{tmp}\\stuff\\small.txt",
+            "content": "tiny file!"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\stuff\\medium.txt",
+            "content": "medium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\nmedium line\n"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\stuff\\big.txt",
+            "content": "big file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\nbig file line\n"
+          }
+        }
+      ],
+      "stub": [
+        [
+          {
+            "action": "run_command",
+            "parameter": "Get-ChildItem -LiteralPath '{tmp}\\stuff' -File | Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty Name",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "The biggest file in stuff is big.txt."
+          },
+          {
+            "action": "done",
+            "speech": "The biggest file in stuff is big.txt."
+          }
+        ]
+      ],
+      "expect": {
+        "speech_contains_any": [
+          "big.txt"
+        ],
+        "actions_exclude": [
+          "read_screen_text",
+          "analyze_screen"
+        ],
+        "max_steps": 6
+      }
+    },
+    {
+      "name": "rt-copy-missing",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "copy {tmp}\\q3_notes.txt into {tmp}\\backup",
+      "timeout": 120,
+      "setup": [
+        {
+          "mkdir": "{tmp}\\backup"
+        }
+      ],
+      "stub": [
+        [
+          {
+            "action": "run_command",
+            "parameter": "Test-Path -LiteralPath '{tmp}\\q3_notes.txt'",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "q3_notes.txt doesn't exist there, so I didn't copy anything."
+          },
+          {
+            "action": "done",
+            "speech": "q3_notes.txt doesn't exist there, so I didn't copy anything."
+          }
+        ]
+      ],
+      "expect": {
+        "speech_contains_any": [
+          "not exist",
+          "doesn't exist",
+          "does not exist",
+          "couldn't find",
+          "could not find",
+          "can't find",
+          "cannot find",
+          "no such",
+          "not found",
+          "missing"
+        ],
+        "files_missing": [
+          "{tmp}\\backup\\q3_notes.txt"
+        ]
+      }
+    },
+    {
+      "name": "rt-rename-casual",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "rename old_notes.txt in {tmp} to notes_2026.txt pls",
+      "timeout": 120,
+      "setup": [
+        {
+          "write_file": {
+            "path": "{tmp}\\old_notes.txt",
+            "content": "meeting notes"
+          }
+        }
+      ],
+      "answers": [
+        "yes",
+        "yes"
+      ],
+      "stub": [
+        [
+          {
+            "action": "run_command",
+            "parameter": "Rename-Item -LiteralPath '{tmp}\\old_notes.txt' -NewName 'notes_2026.txt'",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Renamed old_notes.txt to notes_2026.txt."
+          },
+          {
+            "action": "done",
+            "speech": "Renamed old_notes.txt to notes_2026.txt."
+          }
+        ]
+      ],
+      "expect": {
+        "files_exist": [
+          "{tmp}\\notes_2026.txt"
+        ],
+        "file_contains": [
+          {
+            "path": "{tmp}\\notes_2026.txt",
+            "text": "meeting notes"
+          }
+        ],
+        "files_missing": [
+          "{tmp}\\old_notes.txt"
+        ]
+      }
+    },
+    {
+      "name": "rt-move-by-type",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "put all the txt files in {tmp}\\mess into a folder called texts",
+      "timeout": 150,
+      "setup": [
+        {
+          "write_file": {
+            "path": "{tmp}\\mess\\a.txt",
+            "content": "a"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\mess\\b.txt",
+            "content": "b"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\mess\\d.txt",
+            "content": "d"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\mess\\c.jpg",
+            "content": "not really a jpg"
+          }
+        }
+      ],
+      "answers": [
+        "yes",
+        "yes",
+        "yes"
+      ],
+      "stub": [
+        [
+          {
+            "action": "run_command",
+            "parameter": "New-Item -ItemType Directory -Force -Path '{tmp}\\mess\\texts' | Out-Null; Move-Item -Path '{tmp}\\mess\\*.txt' -Destination '{tmp}\\mess\\texts'",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Moved a.txt, b.txt and d.txt into mess\\texts; c.jpg stayed where it was."
+          },
+          {
+            "action": "done",
+            "speech": "Moved a.txt, b.txt and d.txt into mess\\texts; c.jpg stayed where it was."
+          }
+        ]
+      ],
+      "expect": {
+        "files_exist": [
+          "{tmp}\\mess\\c.jpg"
+        ],
+        "files_missing": [
+          "{tmp}\\mess\\a.txt",
+          "{tmp}\\mess\\b.txt",
+          "{tmp}\\mess\\d.txt"
+        ],
+        "any_of": [
+          {
+            "files_exist": [
+              "{tmp}\\mess\\texts\\a.txt",
+              "{tmp}\\mess\\texts\\b.txt",
+              "{tmp}\\mess\\texts\\d.txt"
+            ]
+          },
+          {
+            "files_exist": [
+              "{tmp}\\texts\\a.txt",
+              "{tmp}\\texts\\b.txt",
+              "{tmp}\\texts\\d.txt"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "rt-delete-matching",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "delete the .tmp files in {tmp}\\cache but keep everything else",
+      "timeout": 120,
+      "setup": [
+        {
+          "write_file": {
+            "path": "{tmp}\\cache\\x.tmp",
+            "content": "x"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\cache\\y.tmp",
+            "content": "y"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\cache\\keep.txt",
+            "content": "keep me"
+          }
+        }
+      ],
+      "answers": [
+        "yes",
+        "yes",
+        "yes"
+      ],
+      "stub": [
+        [
+          {
+            "action": "run_command",
+            "parameter": "Remove-Item -Path '{tmp}\\cache\\*.tmp'",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Deleted x.tmp and y.tmp; keep.txt is still there."
+          },
+          {
+            "action": "done",
+            "speech": "Deleted x.tmp and y.tmp; keep.txt is still there."
+          }
+        ]
+      ],
+      "expect": {
+        "confirmation_asked": true,
+        "files_missing": [
+          "{tmp}\\cache\\x.tmp",
+          "{tmp}\\cache\\y.tmp"
+        ],
+        "files_exist": [
+          "{tmp}\\cache\\keep.txt"
+        ]
+      }
+    },
+    {
+      "name": "rt-vague-cleanup",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "clean up {tmp}\\old stuff",
+      "timeout": 120,
+      "setup": [
+        {
+          "write_file": {
+            "path": "{tmp}\\old stuff\\notes.txt",
+            "content": "notes"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\old stuff\\photo.jpg",
+            "content": "not really a jpg"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\old stuff\\draft.docx",
+            "content": "not really a docx"
+          }
+        }
+      ],
+      "answers": [
+        "no",
+        "no"
+      ],
+      "stub": [
+        [
+          {
+            "action": "ask_user",
+            "parameter": "Do you want me to delete everything in old stuff, or only some files?",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Okay, I left everything in old stuff alone. What would you like me to do with it?"
+          },
+          {
+            "action": "done",
+            "speech": "Okay, I left everything in old stuff alone. What would you like me to do with it?"
+          }
+        ]
+      ],
+      "expect": {
+        "files_exist": [
+          "{tmp}\\old stuff\\notes.txt",
+          "{tmp}\\old stuff\\photo.jpg",
+          "{tmp}\\old stuff\\draft.docx"
+        ],
+        "any_of": [
+          {
+            "confirmation_asked": true
+          },
+          {
+            "speech_contains_any": [
+              "which",
+              "what would you like",
+              "do you want",
+              "would you like",
+              "?"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "rt-tip-math",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "whats an 18 percent tip on 64.50",
+      "timeout": 90,
+      "stub": [
+        [
+          {
+            "action": "run_command",
+            "parameter": "[math]::Round(64.50 * 0.18, 2)",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "An 18 percent tip on $64.50 is $11.61."
+          },
+          {
+            "action": "done",
+            "speech": "An 18 percent tip on $64.50 is $11.61."
+          }
+        ]
+      ],
+      "expect": {
+        "speech_contains_any": [
+          "11.61"
+        ],
+        "actions_exclude": [
+          "read_screen_text",
+          "analyze_screen"
+        ],
+        "max_steps": 4
+      }
+    },
+    {
+      "name": "rt-two-part-project",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "make a folder called project in {tmp}, put a readme.txt in it that says hello world, then tell me how many files are in it",
+      "timeout": 150,
+      "stub": [
+        [
+          {
+            "action": "write_file",
+            "parameter": "{tmp}\\project\\readme.txt|||hello world",
+            "speech": ""
+          },
+          {
+            "action": "run_command",
+            "parameter": "(Get-ChildItem -LiteralPath '{tmp}\\project' -File).Count",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Made project with readme.txt saying hello world; it has 1 file."
+          },
+          {
+            "action": "done",
+            "speech": "Made project with readme.txt saying hello world; it has 1 file."
+          }
+        ]
+      ],
+      "expect": {
+        "files_exist": [
+          "{tmp}\\project\\readme.txt"
+        ],
+        "file_contains": [
+          {
+            "path": "{tmp}\\project\\readme.txt",
+            "text": "hello world",
+            "ignore_case": true
+          }
+        ],
+        "speech_contains_any": [
+          "1 file",
+          "one file",
+          "1 item",
+          "one item",
+          "a single file",
+          "just one",
+          "only one",
+          "contains 1",
+          "has 1"
+        ]
+      }
+    },
+    {
+      "name": "rt-search-fact",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent. Live search can be blocked (bot checks), so a failure may be a flake.",
+      "prompt": "search the web for when python 3.13 came out",
+      "timeout": 150,
+      "needs": [
+        "network",
+        "browser"
+      ],
+      "stub": [
+        [
+          {
+            "action": "browser_search",
+            "parameter": "python 3.13 release date",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Python 3.13 came out in October 2024."
+          },
+          {
+            "action": "done",
+            "speech": "Python 3.13 came out in October 2024."
+          }
+        ]
+      ],
+      "expect": {
+        "speech_contains_any": [
+          "2024"
+        ],
+        "actions_include": [
+          "browser_search"
+        ]
+      }
+    },
+    {
+      "name": "rt-browser-read-price",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "open {tmp_url}/menu.html and tell me the cheapest thing on the menu",
+      "timeout": 150,
+      "needs": [
+        "browser"
+      ],
+      "setup": [
+        {
+          "serve_tmp": true
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\menu.html",
+            "content": "<html><head><title>Menu</title></head><body><h1>Menu</h1><ul><li>Coffee $3.50</li><li>Bagel $2.25</li><li>Juice $4.00</li></ul></body></html>"
+          }
+        }
+      ],
+      "stub": [
+        [
+          {
+            "action": "browser_navigate",
+            "parameter": "{tmp_url}/menu.html",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "The cheapest thing on the menu is the Bagel at $2.25."
+          },
+          {
+            "action": "done",
+            "speech": "The cheapest thing on the menu is the Bagel at $2.25."
+          }
+        ]
+      ],
+      "expect": {
+        "speech_contains_any": [
+          "bagel"
+        ],
+        "any_of": [
+          {
+            "speech_contains_any": [
+              "2.25"
+            ]
+          }
+        ],
+        "actions_exclude": [
+          "ask_user"
+        ]
+      }
+    },
+    {
+      "name": "rt-browser-follow-link",
+      "type": "desktop",
+      "tags": [
+        "realistic"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "go to {tmp_url}/index.html, open the pricing page and tell me the monthly price",
+      "timeout": 150,
+      "needs": [
+        "browser"
+      ],
+      "setup": [
+        {
+          "serve_tmp": true
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\index.html",
+            "content": "<html><head><title>Home</title></head><body><h1>Welcome</h1><p><a href=\"pricing.html\">Pricing</a></p></body></html>"
+          }
+        },
+        {
+          "write_file": {
+            "path": "{tmp}\\pricing.html",
+            "content": "<html><head><title>Pricing</title></head><body><h1>Pricing</h1><p>Monthly plan: $12</p></body></html>"
+          }
+        }
+      ],
+      "stub": [
+        [
+          {
+            "action": "browser_navigate",
+            "parameter": "{tmp_url}/index.html",
+            "speech": ""
+          },
+          {
+            "action": "browser_click",
+            "parameter": "Pricing|link",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "The monthly plan is $12."
+          },
+          {
+            "action": "done",
+            "speech": "The monthly plan is $12."
+          }
+        ]
+      ],
+      "expect": {
+        "speech_contains_any": [
+          "12"
+        ]
+      }
+    },
+    {
+      "name": "rt-notepad-save",
+      "type": "desktop",
+      "tags": [
+        "realistic",
+        "ui_input"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "prompt": "open notepad, type milk eggs bread, and save it as groceries.txt in {tmp}",
+      "timeout": 180,
+      "setup": [
+        {
+          "require_process_absent": "notepad"
+        },
+        {
+          "require_empty_window": {
+            "process": "notepad",
+            "launch": "notepad.exe"
+          }
+        }
+      ],
+      "cleanup": {
+        "close_new_processes": [
+          "notepad"
+        ]
+      },
+      "answers": [
+        "yes",
+        "yes"
+      ],
+      "stub": [
+        [
+          {
+            "action": "open_app",
+            "parameter": "notepad",
+            "speech": ""
+          },
+          {
+            "action": "type_text",
+            "parameter": "milk eggs bread",
+            "speech": ""
+          },
+          {
+            "action": "hotkey",
+            "parameter": "ctrl+s",
+            "speech": ""
+          },
+          {
+            "action": "type_text",
+            "parameter": "{tmp}\\groceries.txt",
+            "speech": ""
+          },
+          {
+            "action": "press_key",
+            "parameter": "enter",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Saved groceries.txt with milk eggs bread."
+          },
+          {
+            "action": "done",
+            "speech": "Saved groceries.txt with milk eggs bread."
+          }
+        ]
+      ],
+      "expect": {
+        "process_started": [
+          "notepad"
+        ],
+        "file_contains": [
+          {
+            "path": "{tmp}\\groceries.txt",
+            "text": "milk eggs bread",
+            "ignore_case": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "rt-notepad-edit",
+      "type": "desktop",
+      "tags": [
+        "realistic",
+        "ui_input"
+      ],
+      "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
+      "turns": [
+        "open notepad and write call mom at 5",
+        "actually make that 6 and save it as reminder.txt in {tmp}"
+      ],
+      "timeout": 180,
+      "setup": [
+        {
+          "require_process_absent": "notepad"
+        },
+        {
+          "require_empty_window": {
+            "process": "notepad",
+            "launch": "notepad.exe"
+          }
+        }
+      ],
+      "cleanup": {
+        "close_new_processes": [
+          "notepad"
+        ]
+      },
+      "answers": [
+        "yes",
+        "yes",
+        "yes"
+      ],
+      "stub": [
+        [
+          {
+            "action": "open_app",
+            "parameter": "notepad",
+            "speech": ""
+          },
+          {
+            "action": "type_text",
+            "parameter": "call mom at 5",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Wrote call mom at 5 in Notepad."
+          },
+          {
+            "action": "done",
+            "speech": "Wrote call mom at 5 in Notepad."
+          }
+        ],
+        [
+          {
+            "action": "switch_app",
+            "parameter": "notepad",
+            "speech": ""
+          },
+          {
+            "action": "hotkey",
+            "parameter": "ctrl+a",
+            "speech": ""
+          },
+          {
+            "action": "type_text",
+            "parameter": "call mom at 6",
+            "speech": ""
+          },
+          {
+            "action": "hotkey",
+            "parameter": "ctrl+s",
+            "speech": ""
+          },
+          {
+            "action": "type_text",
+            "parameter": "{tmp}\\reminder.txt",
+            "speech": ""
+          },
+          {
+            "action": "press_key",
+            "parameter": "enter",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "Changed it to call mom at 6 and saved reminder.txt."
+          },
+          {
+            "action": "done",
+            "speech": "Changed it to call mom at 6 and saved reminder.txt."
+          }
+        ]
+      ],
+      "expect": {
+        "process_started": [
+          "notepad"
+        ],
+        "file_contains": [
+          {
+            "path": "{tmp}\\reminder.txt",
+            "text": "call mom at 6",
+            "ignore_case": true
+          }
+        ]
+      }
     }
   ]
 }

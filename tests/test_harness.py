@@ -39,6 +39,7 @@
 #   32. CALCULATOR PROBE
 #   33. CALCULATOR PROBE TESTS
 #   34. BACKEND WARM-UP AND NEW LOG LINES
+#   35. SCENARIO HARNESS REALISTIC TIER
 # ============================================================
 
 """tools/live_checks.py, tools/run_scenarios.py and tools/probe_calculator.py."""
@@ -1457,3 +1458,216 @@ def test_new_timing_lines_reach_the_live_checks_summary():
         "[OpenApp] timing route=app-id calculator lookup 1s",      # content: never copied
     ])
     assert len(lc.allowlisted(log)) == 10
+
+
+# ============================================================
+# SCENARIO HARNESS REALISTIC TIER
+# ============================================================
+
+# --tag, the realistic tier, file_contains, the serve_tmp server and needs.
+
+ORIGINAL_ELEVEN_SHA256 = "885724159440fca97f2fae06f903a9353d4ff82c9e74093440ab426165a660ac"
+ORIGINAL_ELEVEN = ["edge-open", "latest-download", "env-withheld", "notepad-follow-up",
+                   "notepad-read-back", "calculator", "bare-app-name", "create-file",
+                   "delete-needs-confirmation", "plan-notifications", "plan-research-write"]
+
+
+class _EchoApi(_FakeApi):
+    """Answers every turn with success; fetches a {tmp_url} page named in the prompt."""
+
+    def ask_mistai(self, prompt, input_mode="text"):
+        import re
+        import urllib.request
+
+        self.calls.append((prompt, None))
+        url = re.search(r"http://127\.0\.0\.1:\d+/\S+", prompt)
+        speech = urllib.request.urlopen(url.group(0), timeout=5).read().decode() if url else "ok"
+        print("  Step 1: done('')")
+        return {"success": True, "command": {"speech": speech}}
+
+
+def _scen(tmp_path, scenarios):
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps({"scenarios": scenarios}))
+    return str(path)
+
+
+def _main(tmp_path, scen, *argv, api=None):
+    import shutil
+
+    api = api or _EchoApi()
+    code = rs.main(["--yes", "--scenarios", scen, "--log-root", str(tmp_path / "logs"), *argv],
+                   api_factory=lambda: api)
+    (log_dir,) = list((tmp_path / "logs").iterdir())
+    records = json.loads((log_dir / "summary.json").read_text())
+    shutil.rmtree(tmp_path / "logs")
+    return code, {r["name"]: r for r in records}, api
+
+
+def _refused(port):
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+
+
+def test_the_original_eleven_scenarios_are_unchanged():
+    import hashlib
+
+    with open(SCENARIOS, encoding="utf-8") as f:
+        first = json.load(f)["scenarios"][:11]
+    assert [s["name"] for s in first] == ORIGINAL_ELEVEN
+    canon = json.dumps(first, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert hashlib.sha256(canon.encode()).hexdigest() == ORIGINAL_ELEVEN_SHA256
+
+
+def test_a_plain_stub_compare_run_of_the_bundled_file_still_counts_17_of_21(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rs, "pids_named", lambda names: set())   # Edge may be open here
+    monkeypatch.setattr(rs, "app_window_handles", lambda name: [])
+    rs.main(["--stub", "--compare", "--yes", "--scenarios", SCENARIOS,
+             "--log-root", str(tmp_path / "logs")], api_factory=lambda: _FakeApi())
+    out = capsys.readouterr().out
+    (log_dir,) = list((tmp_path / "logs").iterdir())
+    records = json.loads((log_dir / "summary.json").read_text())
+    assert "[Harness] 11 scenario(s)" in out
+    assert len(records) == 21 and sum(r["status"] == "SKIP" for r in records) == 4
+    assert {r["name"] for r in records} == set(ORIGINAL_ELEVEN)
+
+
+def test_tag_filters_and_the_realistic_tier_stays_out_of_plain_runs(tmp_path):
+    scen = _scen(tmp_path, [
+        {"name": "q", "prompt": "plain"},
+        {"name": "r", "prompt": "real", "tags": ["realistic"]},
+        {"name": "u", "prompt": "typing", "tags": ["realistic", "ui_input"]},
+        {"name": "p", "type": "plan", "prompt": "check my notifications now please",
+         "stub_plan": {"nodes": [{"id": "a", "desc": "Check notifications"}]}},
+    ])
+    code, recs, api = _main(tmp_path, scen, "--stub")
+    assert code == 0 and set(recs) == {"q", "p"}          # no SKIP record for r or u
+    assert [p for p, _ in api.calls] == ["plain"]
+    _, recs, api = _main(tmp_path, scen, "--stub", "--tag", "realistic")
+    assert set(recs) == {"r", "u"} and recs["r"]["status"] == "PASS"
+    assert recs["u"]["status"] == "SKIP" and "--allow-ui-input" in recs["u"]["failures"][0]
+    _, recs, api = _main(tmp_path, scen, "--stub", "--tag", "realistic", "--allow-ui-input")
+    assert recs["u"]["status"] == "PASS" and [p for p, _ in api.calls] == ["real", "typing"]
+    _, recs, api = _main(tmp_path, scen, "--stub", "--only", "r")
+    assert set(recs) == {"r"} and recs["r"]["status"] == "PASS"
+    _, recs, _ = _main(tmp_path, scen, "--stub", "--tag", "nothing-has-this")
+    assert recs == {}
+
+
+def test_file_contains(tmp_path):
+    def check(want):
+        return rs.check_desktop({"file_contains": [want]}, _outcome())
+
+    (tmp_path / "a.txt").write_bytes(b"\xef\xbb\xbfMilk eggs\r\nbread")   # BOM + CRLF
+    path = str(tmp_path / "a.txt")
+    assert check({"path": path, "text": "Milk eggs"}) == []
+    assert check({"path": path, "text": "eggs\nbread"}) == []             # CRLF -> LF
+    assert check({"path": path, "text": "eggs\r\nbread"}) == []
+    assert check({"path": path, "text": "milk eggs"}) == [
+        f"file_contains: {path} does not contain 'milk eggs'"]
+    assert check({"path": path, "text": "MILK EGGS", "ignore_case": True}) == []
+    assert check({"path": path, "text": "﻿Milk"}) != []             # BOM is not content
+    assert check({"path": path, "text": "butter", "ignore_case": True})
+    missing = str(tmp_path / "gone.txt")
+    assert check({"path": missing, "text": "x"}) == [f"file_contains: missing file {missing}"]
+    # Inside any_of, like every other key.
+    assert rs.check_desktop({"any_of": [{"file_contains": [{"path": missing, "text": "x"}]},
+                                        {"file_contains": [{"path": path, "text": "bread"}]}]},
+                            _outcome()) == []
+
+
+def test_serve_dir_is_loopback_only_serves_only_its_folder_and_stops(tmp_path):
+    import http.client
+
+    served = tmp_path / "served"
+    served.mkdir()
+    (served / "menu.html").write_text("Bagel $2.25")
+    (tmp_path / "outside.txt").write_text("private")
+    server = rs.serve_dir(str(served))
+    port = server.server_port
+    try:
+        assert server.server_address[0] == "127.0.0.1" and port > 0
+        for path, status in (("/menu.html", 200), ("/../outside.txt", 404),
+                             ("/..%2Foutside.txt", 404), ("/%2e%2e/outside.txt", 404)):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            assert resp.status == status, path
+            assert b"private" not in body
+    finally:
+        rs.stop_server(server)
+    _refused(port)
+
+
+def test_serve_tmp_expands_tmp_url_and_stops_after_the_scenario(tmp_path, monkeypatch, capsys):
+    servers = []
+    real = rs.serve_dir
+    monkeypatch.setattr(rs, "serve_dir", lambda p: servers.append(real(p)) or servers[-1])
+    scen = _scen(tmp_path, [
+        {"name": "web", "prompt": "open {tmp_url}/menu.html", "tags": ["realistic"],
+         "setup": [{"serve_tmp": True},
+                   {"write_file": {"path": "{tmp}\\menu.html", "content": "Bagel $2.25"}}],
+         "expect": {"speech_contains_any": ["bagel $2.25"]}},
+        {"name": "plain", "prompt": "no server here"},
+    ])
+    code, recs, _ = _main(tmp_path, scen, "--stub", "--only", "web,plain")
+    assert code == 0 and recs["web"]["status"] == "PASS", recs
+    assert len(servers) == 1                       # only the scenario that asked for it
+    _refused(servers[0].server_port)
+    assert "GET /menu.html" not in capsys.readouterr().out   # request lines are not logged
+
+
+def test_serve_tmp_server_is_stopped_when_the_run_raises(tmp_path, monkeypatch):
+    servers = []
+    real = rs.serve_dir
+    monkeypatch.setattr(rs, "serve_dir", lambda p: servers.append(real(p)) or servers[-1])
+    monkeypatch.setattr(rs.Runner, "_run_desktop",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    runner = rs.Runner(SimpleNamespace(stub=False), str(tmp_path))
+    with pytest.raises(RuntimeError):
+        runner.run_desktop({"name": "web", "prompt": "x", "setup": [{"serve_tmp": True}]}, None)
+    _refused(servers[0].server_port)
+
+
+def test_needs_skip_with_a_reason_in_stub_and_run_for_real(tmp_path, monkeypatch):
+    scen = _scen(tmp_path, [
+        {"name": "search", "prompt": "search the web", "needs": ["network", "browser"],
+         "stub": [[{"action": "done", "speech": "2024"}]]},
+        {"name": "local", "prompt": "files"},
+    ])
+    code, recs, api = _main(tmp_path, scen, "--stub")
+    assert code == 0 and recs["search"]["status"] == "SKIP"
+    assert recs["search"]["failures"] == [
+        "needs network and browser; a stub run would pass on its script alone (run without --stub)"]
+    assert [p for p, _ in api.calls] == ["files"]
+    monkeypatch.setattr(rs, "warm_backend", lambda: None)
+    monkeypatch.setitem(sys.modules, "dotenv", SimpleNamespace(load_dotenv=lambda *_a: None))
+    _, recs, api = _main(tmp_path, scen, "--no-vision")
+    assert recs["search"]["status"] == "PASS" and len(api.calls) == 2
+    with pytest.raises(ValueError, match="needs"):
+        rs.load_scenarios(_scen(tmp_path, [{"name": "x", "prompt": "y", "needs": ["gpu"]}]))
+
+
+def test_bundled_realistic_tier_order_gates_and_stub_skips(tmp_path, monkeypatch):
+    real = rs.load_scenarios(SCENARIOS)[11:]
+    assert all("realistic" in s["tags"] and s.get("stub") for s in real)
+    kinds = ["notepad" if "ui_input" in s["tags"] else "browser" if s.get("needs") else "file"
+             for s in real]
+    assert kinds == ["file"] * 8 + ["browser"] * 3 + ["notepad"] * 2     # files, browser, Notepad
+    by = {s["name"]: s for s in real}
+    assert by["rt-search-fact"]["needs"] == ["network", "browser"]
+    assert all({"serve_tmp": True} in by[n]["setup"] and "{tmp_url}" in by[n]["prompt"]
+               for n in ("rt-browser-read-price", "rt-browser-follow-link"))
+    assert by["rt-delete-matching"]["answers"] == ["yes"] * 3
+    monkeypatch.setattr(rs, "pids_named", lambda names: set())
+    monkeypatch.setattr(rs, "app_window_handles", lambda name: [])
+    _, recs, _ = _main(tmp_path, SCENARIOS, "--stub", "--tag", "realistic", api=_FakeApi())
+    assert set(recs) == set(by)
+    for name, kind in zip(by, kinds):
+        if kind == "notepad":
+            assert recs[name]["failures"] == ["tagged ui_input; pass --allow-ui-input to run"]
+        elif kind == "browser":
+            assert recs[name]["status"] == "SKIP" and "run without --stub" in recs[name]["failures"][0]

@@ -13,7 +13,10 @@ Modes (--compare runs COMPARE_MODES; --mode picks any one; default = the app's o
     gating+lazy2  MISTAI_VISION_GATING=1  MISTAI_LAZY_VISION=2  (title + apps only)
 Options:
     --scenarios PATH     scenario file (default: tools/scenarios.json)
-    --only a,b           run only these scenario names
+    --only a,b           run only these scenario names (realistic ones too)
+    --tag NAME           run only scenarios tagged NAME. Scenarios tagged "realistic"
+                         (everyday requests) run only with --tag realistic or --only;
+                         plain runs leave them out entirely
     --repeat N           run every scenario (in every mode) N times, interleaving
                          modes per round; the summary adds min/median/max seconds.
                          Notepad scenarios may SKIP on later rounds: Win11 Notepad
@@ -31,6 +34,10 @@ Options:
 Scenario types (tools/scenarios.json):
     "desktop": calls Api.ask_mistai for each turn on the real desktop.
     "plan":    calls planner.make_plan only and asserts the node list. No desktop.
+Scenario keys beyond the obvious: "needs": ["network", "browser"] SKIPs in --stub
+(a script would pass without the real page); setup {"serve_tmp": true} serves the
+scenario's tmp folder on 127.0.0.1 at "{tmp_url}" (stopped after the scenario);
+expect "file_contains": [{"path", "text", "ignore_case"}] reads the file as UTF-8.
 
 Isolation: memory/tasks/tool stats go to a fresh throwaway SQLite file per
 scenario (MISTAI_DB_PATH), and the workspace and live state are reset before
@@ -42,6 +49,8 @@ before the scenario started. Confirmations are answered from the scenario's
 """
 
 import argparse
+import functools
+import http.server
 import json
 import os
 import re
@@ -70,6 +79,9 @@ MODES = {
 }
 COMPARE_MODES = ("baseline", "gating", "gating+lazy2")
 MODE_ENV_KEYS = ("MISTAI_VISION_GATING", "MISTAI_LAZY_VISION")
+# What a scenario may need that --stub cannot honestly give it (it SKIPs there).
+NEEDS = {"network", "browser"}
+REALISTIC_TAG = "realistic"  # only run with --tag realistic or --only <name>
 # Scenario logs carry content (typed text, steps' parameters) so expectations
 # such as executed_with_param can check it; each run's log says so up top.
 VERBOSE_ENV = "MISTAI_VERBOSE_LOGS"
@@ -98,6 +110,8 @@ def load_scenarios(path, only=None):
             raise ValueError(f"{sc['name']}: plan scenarios need a prompt")
         if "uia_after_read" in sc and not isinstance(sc["uia_after_read"], str):
             raise ValueError(f"{sc['name']}: uia_after_read must be a process name")
+        if not set(sc.get("needs", [])) <= NEEDS:
+            raise ValueError(f"{sc['name']}: needs may only list {sorted(NEEDS)}")
     if only:
         wanted = set(only)
         missing = wanted - names
@@ -107,15 +121,40 @@ def load_scenarios(path, only=None):
     return scenarios
 
 
-def expand(obj, tmp):
-    """Replace {tmp} in every string of a scenario (paths stay Windows-style)."""
+def expand(obj, tmp, tmp_url=""):
+    """Replace {tmp} (paths stay Windows-style) and {tmp_url} (the serve_tmp
+    server's http://127.0.0.1:PORT) in every string of a scenario."""
     if isinstance(obj, str):
-        return obj.replace("{tmp}", tmp)
+        return obj.replace("{tmp_url}", tmp_url).replace("{tmp}", tmp)
     if isinstance(obj, list):
-        return [expand(x, tmp) for x in obj]
+        return [expand(x, tmp, tmp_url) for x in obj]
     if isinstance(obj, dict):
-        return {k: expand(v, tmp) for k, v in obj.items()}
+        return {k: expand(v, tmp, tmp_url) for k, v in obj.items()}
     return obj
+
+
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *_args):  # request lines carry paths: content-free logs
+        pass
+
+
+def serve_dir(path):
+    """A static server over ``path`` only (SimpleHTTPRequestHandler drops '..'),
+    bound to loopback on a free port, on a daemon thread. Returns the server;
+    its URL is http://127.0.0.1:<server.server_port>. Stop with stop_server."""
+    handler = functools.partial(_QuietHandler, directory=path)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="ServeTmp").start()
+    return server
+
+
+def stop_server(server):
+    server.shutdown()
+    server.server_close()
+
+
+def wants_server(sc):
+    return any("serve_tmp" in step for step in sc.get("setup", []))
 
 
 def turns_of(sc):
@@ -284,6 +323,10 @@ def check_desktop(expect, outcome):
     for p in expect.get("files_missing", []):
         if os.path.exists(p):
             fails.append(f"file should not exist: {p}")
+    for want in expect.get("file_contains", []):
+        fail = _file_contains_failure(want)
+        if fail:
+            fails.append(fail)
     for s in expect.get("secret_never_logged", []):
         if s in outcome["log"] or s in str(outcome["speech"]):
             fails.append("SECRET LEAKED into the log or speech")
@@ -306,6 +349,24 @@ def check_desktop(expect, outcome):
         if all(alt_fails):
             fails.append("no alternative held: " + " | ".join("; ".join(f) for f in alt_fails))
     return fails
+
+
+def _file_contains_failure(want):
+    """file_contains entry {path, text, ignore_case?}: the file is read as
+    UTF-8 (a BOM is tolerated, CRLF counts as LF). A message, or None."""
+    path, text = want["path"], want["text"].replace("\r\n", "\n")
+    try:
+        with open(path, encoding="utf-8-sig") as f:  # text mode: \r\n -> \n
+            content = f.read()
+    except FileNotFoundError:
+        return f"file_contains: missing file {path}"
+    except (OSError, UnicodeDecodeError) as e:
+        return f"file_contains: could not read {path} ({type(e).__name__})"
+    if want.get("ignore_case"):
+        content, text = content.casefold(), text.casefold()
+    if text not in content:
+        return f"file_contains: {path} does not contain {want['text']!r}"
+    return None
 
 
 def _expect_parts(expect):
@@ -527,6 +588,8 @@ def run_setup(steps):
                 f.write(spec.get("content", ""))
         elif "mkdir" in step:
             os.makedirs(step["mkdir"], exist_ok=True)
+        elif "serve_tmp" in step:
+            pass  # started by Runner.run_desktop before {tmp_url} is expanded
         elif "require_empty_window" in step:
             spec = step["require_empty_window"]
             reason = probe_restored_session(spec["process"], spec["launch"])
@@ -831,10 +894,18 @@ class Runner:
         return box["result"], None, False
 
     def run_desktop(self, sc, mode, rep=None):
+        tmp = make_scenario_dir()
+        server = serve_dir(tmp) if wants_server(sc) else None
+        try:
+            tmp_url = f"http://127.0.0.1:{server.server_port}" if server else ""
+            return self._run_desktop(expand(sc, tmp, tmp_url), mode, rep, tmp)
+        finally:
+            if server:  # always, also when the run raised
+                stop_server(server)
+
+    def _run_desktop(self, sc, mode, rep, tmp):
         name = (sc["name"] + (f"--{mode.replace('+', '-')}" if mode else "")
                 + (f"--r{rep}" if rep else ""))
-        tmp = make_scenario_dir()
-        sc = expand(sc, tmp)
         record = {"name": sc["name"], "type": "desktop", "mode": mode, "status": "PASS",
                   "failures": [], "log": os.path.join(self.log_dir, f"{name}.log")}
         if rep:
@@ -1111,6 +1182,7 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Run MistAI scenarios unattended.")
     ap.add_argument("--scenarios", default=DEFAULT_SCENARIOS)
     ap.add_argument("--only", default="")
+    ap.add_argument("--tag", default="")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--stub", action="store_true")
     ap.add_argument("--no-vision", action="store_true")
@@ -1151,6 +1223,10 @@ def main(argv=None, api_factory=None):
     args = parse_args(argv)
     only = [s.strip() for s in args.only.split(",") if s.strip()]
     scenarios = load_scenarios(args.scenarios, only)
+    if args.tag:
+        scenarios = [s for s in scenarios if args.tag in s.get("tags", [])]
+    elif not only:  # the realistic tier never runs (or counts) in a plain run
+        scenarios = [s for s in scenarios if REALISTIC_TAG not in s.get("tags", [])]
 
     log_dir = os.path.join(args.log_root, f"scenarios-{datetime.now():%Y%m%d-%H%M%S}")
     os.makedirs(log_dir, exist_ok=True)
@@ -1178,6 +1254,9 @@ def main(argv=None, api_factory=None):
     desktop = [s for s in scenarios if s["type"] == "desktop"]
     skipped_ui = [s for s in desktop if "ui_input" in s.get("tags", []) and not args.allow_ui_input]
     desktop = [s for s in desktop if s not in skipped_ui]
+    # A scripted model cannot honestly answer from a live web page or search.
+    skipped_needs = [s for s in desktop if args.stub and s.get("needs")]
+    desktop = [s for s in desktop if s not in skipped_needs]
     print(f"[Harness] {len(scenarios)} scenario(s); logs -> {log_dir}")
     if running_elevated():
         print("[Harness] WARNING: running elevated (Administrator). Typed input can land in "
@@ -1199,6 +1278,10 @@ def main(argv=None, api_factory=None):
     for sc in skipped_ui:
         records.append({"name": sc["name"], "type": "desktop", "mode": None, "status": "SKIP",
                         "failures": ["tagged ui_input; pass --allow-ui-input to run"]})
+    for sc in skipped_needs:
+        records.append({"name": sc["name"], "type": "desktop", "mode": None, "status": "SKIP",
+                        "failures": [f"needs {' and '.join(sc['needs'])}; a stub run would pass "
+                                     "on its script alone (run without --stub)"]})
     try:
         if args.compare:
             modes = COMPARE_MODES
