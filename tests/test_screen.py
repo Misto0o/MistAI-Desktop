@@ -56,6 +56,7 @@
 
 """Screen reads (UIA first, vision modes, frame freshness), vision coordinates and clicking."""
 
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -790,6 +791,48 @@ def test_the_image_sent_is_the_size_the_prompt_states():
     v = CohereVision.__new__(CohereVision)
     png = base64.b64decode(v._b64(Image.new("RGB", WIDE)))
     assert Image.open(io.BytesIO(png)).size == (1920, 1080)
+
+
+def _vision_client(reply):
+    """A CohereVision whose client returns ``reply`` (or raises it)."""
+    v = CohereVision.__new__(CohereVision)
+    v._lock, v._cache, v._cache_time, v._cache_ttl = threading.Lock(), "", 0, 3.0
+
+    def chat(**_k):
+        if isinstance(reply, Exception):
+            raise reply
+        return SimpleNamespace(message=SimpleNamespace(content=[SimpleNamespace(text=reply)]))
+
+    v._client = SimpleNamespace(chat=chat)
+    return v
+
+
+def test_a_vision_call_logs_size_kb_and_times_only(capsys):
+    v = _vision_client("A secret dialog with the words hunter2")
+    assert v._call("describe hunter2", Image.new("RGB", WIDE)).startswith("A secret")
+    out = capsys.readouterr().out.strip()
+    assert re.fullmatch(r"\[Vision\] sent 1920x1080 png \d+ KB encode \d+ms call \d+ms", out)
+
+
+def test_a_failed_vision_call_still_logs_its_timing(capsys):
+    v = _vision_client(RuntimeError("boom"))
+    assert v._call("q", Image.new("RGB", (800, 600))) == ""
+    assert "[Vision] sent 800x600 png" in capsys.readouterr().out
+
+
+def test_a_text_only_call_logs_no_image_line(capsys):
+    _vision_client("ok")._call("q")
+    assert "[Vision] sent" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("reply, line", [
+    ("The Calculator app is open with buttons", "Screen understood (39 chars, attempts 1)"),
+    ("", "no usable answer, attempts 2"),
+])
+def test_understand_screen_logs_attempts(monkeypatch, capsys, reply, line):
+    monkeypatch.setattr(vision_mod.time, "sleep", lambda _s: None)
+    _vision_client(reply).understand_screen(Image.new("RGB", (8, 8)), use_cache=False)
+    assert f"[Vision] {line}" in capsys.readouterr().out
 
 
 def test_wide_screen_answer_is_scaled_back(monkeypatch):

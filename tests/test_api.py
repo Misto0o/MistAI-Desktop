@@ -1134,6 +1134,17 @@ def test_tray_only_app_is_verification_failure_not_an_open_app_success(monkeypat
     assert bus.calls[0][0] == "ActionFailed"
 
 
+def test_executor_logs_handler_settle_verify_split(monkeypatch, capsys):
+    spec = ToolSpec(name="open_app", settle=0, verifier="app_visible")
+    api, *_ = _execution_api({"open_app": spec}, {"open_app": True})
+    api.app_window_state = lambda _name: ("hidden", "")
+    monkeypatch.setattr("core.executor.time.sleep", lambda _seconds: None)
+    Executor(api).run("open_app", "SecretApp")
+    lines = [l for l in capsys.readouterr().out.splitlines() if "exec split" in l]
+    assert len(lines) == 1
+    assert re.fullmatch(r"\[Timing\] exec split: handler=[\d.]+s settle=[\d.]+s verify=[\d.]+s", lines[0])
+
+
 def test_executor_records_every_attempt_and_returns_primary_final_failure(monkeypatch):
     """A failed fallback must not hide the original failed attempt or result."""
     specs = {
@@ -1440,6 +1451,66 @@ def test_app_lookup_uses_literal_matching_and_rejects_empty_targets(monkeypatch)
     assert "Editor*[test]''" in commands[0]
     assert Api._resolve_app_id(api, "") is None
     assert Api.is_app_running(api, "") is False
+
+
+def _open_app_api(monkeypatch, ids, windows):
+    """A bare Api for _act_open_app: Store-app route, Get-StartApps answers
+    from ``ids`` (in order), each window wait from ``windows``."""
+    api = Api.__new__(Api)
+    ids, windows = list(ids), list(windows)
+    api.lookups, api.launched = [], []
+    monkeypatch.setattr("core.api.subprocess.run", lambda args, **_k: (
+        api.lookups.append(1) or SimpleNamespace(stdout=ids.pop(0) if ids else "")))
+    monkeypatch.setattr("core.api.subprocess.Popen", lambda args, **_k: api.launched.append(args[-1]))
+    monkeypatch.setattr("core.api.time.sleep", lambda _s: None)
+    monkeypatch.setattr("core.api.pyautogui.hotkey", lambda *_k: None)
+    api.app_window_state = lambda _a: ("none", "")
+    api._resolve_app_exe = lambda _p: None
+    api._wait_for_app_window = lambda _a, timeout=0: windows.pop(0) if windows else False
+    api.switch_to_app = lambda _a: True
+    api.is_app_running = lambda _a: False
+    return api
+
+
+def test_store_app_ids_are_looked_up_once_per_session(monkeypatch, capsys):
+    api = _open_app_api(monkeypatch, ["Microsoft.Calc!App"], [True, True])
+    assert Api._act_open_app(api, "calculator") is True
+    assert Api._act_open_app(api, "Calculator") is True      # same app, cached
+    assert len(api.lookups) == 1 and len(api.launched) == 2
+    out = capsys.readouterr().out
+    assert "[OpenApp] timing route=app-id lookup" in out
+    assert "[OpenApp] timing route=app-id cached lookup" in out
+
+
+def test_a_cached_id_that_brings_no_window_is_looked_up_again(monkeypatch, capsys):
+    api = _open_app_api(monkeypatch, ["Old.Id!App", "New.Id!App"], [True, False, True])
+    assert Api._act_open_app(api, "calculator") is True
+    assert Api._act_open_app(api, "calculator") is True
+    assert api.launched == ["shell:AppsFolder\\Old.Id!App"] * 2 + ["shell:AppsFolder\\New.Id!App"]
+    assert api._app_id_cache == {"calculator": "New.Id!App"}
+    assert "route=app-id refreshed" in capsys.readouterr().out
+
+
+def test_a_fresh_lookup_with_the_same_id_does_not_relaunch(monkeypatch):
+    api = _open_app_api(monkeypatch, ["Same!App", "Same!App"], [True, False])
+    Api._act_open_app(api, "calculator")
+    assert Api._act_open_app(api, "calculator") is False
+    assert len(api.launched) == 2 and len(api.lookups) == 2
+
+
+def test_misses_are_not_cached(monkeypatch):
+    api = _open_app_api(monkeypatch, ["", "Late.Id!App"], [])
+    assert Api._resolve_app_id(api, "calculator") is None
+    assert Api._resolve_app_id(api, "calculator") == "Late.Id!App"
+    assert len(api.lookups) == 2
+
+
+def test_open_app_timing_line_has_numbers_and_labels_only(monkeypatch, capsys):
+    api = _open_app_api(monkeypatch, ["Secret.Name!App"], [False])
+    Api._act_open_app(api, "secretapp")
+    line = [l for l in capsys.readouterr().out.splitlines() if "timing route=" in l][0]
+    assert re.fullmatch(r"\[OpenApp\] timing route=app-id lookup [\d.]+s launch [\d.]+s "
+                        r"window [\d.]+s focus [\d.]+s no window", line)
 
 
 def test_is_app_running_ignores_mistai_own_processes(monkeypatch):

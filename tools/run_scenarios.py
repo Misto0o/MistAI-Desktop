@@ -1127,6 +1127,26 @@ def parse_args(argv=None):
     return args
 
 
+def warm_backend(get=None):
+    """One background GET to the backend's /status before the first scenario,
+    so the first scenario does not pay the cold start. Real runs only; never
+    raises; logs the status code and seconds only. Returns the thread."""
+    import requests
+    from core.config import STATUS_URL
+
+    def _go():
+        t0 = time.monotonic()
+        try:
+            code = (get or requests.get)(STATUS_URL, timeout=10).status_code
+            print(f"[Harness] warm-up status {code} in {time.monotonic() - t0:.2f}s")
+        except Exception as e:
+            print(f"[Harness] warm-up failed ({type(e).__name__}) after {time.monotonic() - t0:.2f}s")
+
+    t = threading.Thread(target=_go, daemon=True, name="Warmup")
+    t.start()
+    return t
+
+
 def main(argv=None, api_factory=None):
     args = parse_args(argv)
     only = [s.strip() for s in args.only.split(",") if s.strip()]
@@ -1146,6 +1166,7 @@ def main(argv=None, api_factory=None):
             load_dotenv(os.path.join(REPO, ".env"))
         except ImportError:
             pass
+        warm_backend()
     runner = Runner(args, log_dir, api_factory=api_factory)
     runner.run_tmp = run_tmp
     undo = []

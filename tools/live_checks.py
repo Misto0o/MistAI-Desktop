@@ -100,6 +100,19 @@ ALLOWED_LOG_LINES = [re.compile(p) for p in (
     r"\[Reply\] shape=(object|steps|text|text with a steps list|array of \d+)",
     r"\[AgentLoop\] System prompt: \d+ chars",
     r"\[Model\] Set to [a-z]+ \(applies from the next request\)",
+    r"\[Timing\] (Router|Planning) LLM: [\d.]+s mode=(message|agent)",
+    r"\[Timing\] exec split: handler=[\d.]+s settle=[\d.]+s verify=[\d.]+s",
+    r"\[Vision\] sent \d+x\d+ png \d+ KB encode \d+ms call \d+ms",
+    r"\[Vision\] (Screen understood \(\d+ chars, attempts \d+\)|no usable answer, attempts \d+)",
+    r"\[Screen\] verified-read skip not taken \((gating off|setting off|already used|failed"
+    r"|unverified|low confidence|not in front|batch)\)",
+    r"\[OpenApp\] timing route=(path|app-id|app-id cached|app-id refreshed|start-menu)"
+    r"( \w+ [\d.]+s)+ (window|no window)",
+    r"\[Browser\] (start phases: seed [\d.]+s driver [\d.]+s launch [\d.]+s page [\d.]+s"
+    r"|start timed out after [\d.]+s|start finished after the timeout"
+    r"|previous start failed -- starting again)",
+    r"\[TypeText\] clipboard (busy|denied) holder=(self|other|unknown)( code=\d+)?",
+    r"\[TypeText\] clipboard breaker (open|closed)",
 )]
 
 

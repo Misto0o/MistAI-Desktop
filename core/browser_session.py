@@ -231,8 +231,12 @@ class BrowserSession:
 
     def ensure_started(self):
         """Lazy start -- an app with no browser task pays zero cost."""
+        if self._thread is not None and self._start_error and PLAYWRIGHT_AVAILABLE:
+            self._retry_failed_start()
         if self._thread is not None:
             return
+        t_start = time.perf_counter()
+        self._seed_s = 0.0
         if not PLAYWRIGHT_AVAILABLE:
             self._start_error = "Playwright not installed (`pip install playwright` + `playwright install firefox`)"
             self._ready.set()
@@ -258,6 +262,7 @@ class BrowserSession:
                     f"[Browser] Could not auto-seed from daily Firefox "
                     f"({e}) -- starting with a fresh profile instead"
                 )
+        self._seed_s = time.perf_counter() - t_start
 
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="BrowserSession"
@@ -265,11 +270,28 @@ class BrowserSession:
         self._thread.start()
         if not self._ready.wait(timeout=START_TIMEOUT):
             self._start_error = f"Browser did not start within {START_TIMEOUT}s"
+            print(f"[Browser] start timed out after {time.perf_counter() - t_start:.2f}s")
+
+    def _retry_failed_start(self):
+        """A failed start never sticks: a start that timed out but is still
+        running gets one more wait; a crashed one is cleared so this call
+        starts the browser again."""
+        if self._thread.is_alive():
+            if self._ready.wait(timeout=START_TIMEOUT) and self._page is not None:
+                self._start_error = ""
+                print("[Browser] start finished after the timeout")
+            return
+        self._thread = None
+        self._ready = threading.Event()
+        self._start_error = ""
+        print("[Browser] previous start failed -- starting again")
 
     def _run(self):
         try:
+            t0 = time.perf_counter()
             os.makedirs(self.profile_dir, exist_ok=True)
             with sync_playwright() as p:
+                t1 = time.perf_counter()
                 self._context = p.firefox.launch_persistent_context(
                     self.profile_dir,
                     headless=False,  # visible -- this is the whole point
@@ -298,6 +320,7 @@ class BrowserSession:
                         "useAutomationExtension": False,
                     },
                 )
+                t2 = time.perf_counter()
                 self._page = (
                     self._context.pages[0]
                     if self._context.pages
@@ -306,6 +329,10 @@ class BrowserSession:
                 self._ready.set()
                 print("[Browser] Firefox started" + (f" (profile: {self.profile_dir})"
                                                      if verbose_logs() else ""))
+                # Numbers only: seed copy, Playwright driver, Firefox launch, first page.
+                print(f"[Browser] start phases: seed {getattr(self, '_seed_s', 0.0):.2f}s "
+                      f"driver {t1 - t0:.2f}s launch {t2 - t1:.2f}s "
+                      f"page {time.perf_counter() - t2:.2f}s")
 
                 while True:
                     item = self._req_q.get()
@@ -591,5 +618,6 @@ class BrowserSession:
             pass
         self._thread = None
         self._ready = threading.Event()
+        self._start_error = ""
         self._page = None
         self._context = None

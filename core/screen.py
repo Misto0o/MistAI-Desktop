@@ -232,19 +232,29 @@ class CohereVision:
         if not self.ready:
             return ""
         try:
+            t0 = time.perf_counter()
+            image = self._b64(frame) if frame else ""
+            t1 = time.perf_counter()
             content = (
                 [
-                    {"type": "image", "image": f"data:image/png;base64,{self._b64(frame)}"},
+                    {"type": "image", "image": f"data:image/png;base64,{image}"},
                     {"type": "text", "text": prompt},
                 ]
                 if frame
                 else prompt
             )
-            resp = self._client.chat(
-                model=self.MODEL,
-                messages=[{"role": "user", "content": content}],
-                max_tokens=600,
-            )
+            try:
+                resp = self._client.chat(
+                    model=self.MODEL,
+                    messages=[{"role": "user", "content": content}],
+                    max_tokens=600,
+                )
+            finally:
+                if frame:
+                    # Numbers only: sent size, base64 KB, encode and call (upload + reply) ms.
+                    w, h = self._sent_size(frame) or (0, 0)
+                    print(f"[Vision] sent {w}x{h} png {len(image) // 1024} KB "
+                          f"encode {(t1 - t0) * 1000:.0f}ms call {(time.perf_counter() - t1) * 1000:.0f}ms")
             return resp.message.content[0].text.strip()
         except Exception as e:
             print(f"[Vision] call error: {e}")
@@ -282,12 +292,13 @@ class CohereVision:
                     with self._lock:
                         self._cache = r
                         self._cache_time = now
-                    print(f"[Vision] Screen understood ({len(r)} chars)")
+                    print(f"[Vision] Screen understood ({len(r)} chars, attempts {attempt + 1})")
                     return r
             except Exception as e:
                 print(f"[Vision] Attempt {attempt + 1} failed: {e}")
                 time.sleep(0.5)
 
+        print(f"[Vision] no usable answer, attempts {max_attempts}")
         return "Screen captured but Vision unavailable. Recommend using OCR or UIA fallback."
 
     def find_element_coords(self, description, frame=None):

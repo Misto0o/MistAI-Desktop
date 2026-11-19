@@ -404,6 +404,7 @@ class Executor:
 
         spec = reg.get(action)
         t0 = time.time()
+        t_start = time.perf_counter()
         try:
             ok = bool(api._exec_sync(action, param))
         except Exception as e:
@@ -412,10 +413,12 @@ class Executor:
 
         detail = getattr(api, "last_result_text", "") or ""
         api.last_result_text = ""
+        t_handler = time.perf_counter()
 
         # Settle from tool metadata (replaces AgentLoop._smart_settle) --
         # the UI must catch up BEFORE verification looks at ground truth.
         time.sleep(reg.settle(action))
+        t_settle = time.perf_counter()
         # Anything but a read may have changed the screen: later vision reads
         # must use a frame captured after this point.
         if not set(spec.categories) & {"perception", "info"}:
@@ -429,6 +432,8 @@ class Executor:
                                          spec.verifier_arg)
             if vnote:
                 detail = f"{detail} [{vnote}]" if detail else f"[{vnote}]"
+        print(f"[Timing] exec split: handler={t_handler - t_start:.2f}s "
+              f"settle={t_settle - t_handler:.2f}s verify={time.perf_counter() - t_settle:.2f}s")
 
         # Verification contradicting a claimed success wins.
         if ok and verified is False:

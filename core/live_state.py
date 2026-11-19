@@ -19,22 +19,23 @@
 #   10. CLIPBOARD TEXT DECODING
 #   11. CLIPBOARD READ
 #   12. CLIPBOARD WRITE
-#   13. CLIPBOARD PEEK
-#   14. UNICODE KEYSTROKE LIMITS
-#   15. SENDINPUT KEYBOARD STRUCT
-#   16. SENDINPUT MOUSE STRUCT
-#   17. SENDINPUT INPUT STRUCT
-#   18. UNICODE KEYSTROKE TYPING
-#   19. OPEN APPS DESCRIPTION
-#   20. WINDOW OWNERSHIP
-#   21. UWP FRAME APPS
-#   22. VISIBLE WINDOW PROCESSES
-#   23. LIVE STATE TRACKER
-#   24. WATCHERS
-#   25. OPTIONAL FILE WATCHING LIBRARY
-#   26. STATE WATCHER
-#   27. FILE EVENT HANDLER
-#   28. FILE WATCHER
+#   13. CLIPBOARD CIRCUIT BREAKER
+#   14. CLIPBOARD PEEK
+#   15. UNICODE KEYSTROKE LIMITS
+#   16. SENDINPUT KEYBOARD STRUCT
+#   17. SENDINPUT MOUSE STRUCT
+#   18. SENDINPUT INPUT STRUCT
+#   19. UNICODE KEYSTROKE TYPING
+#   20. OPEN APPS DESCRIPTION
+#   21. WINDOW OWNERSHIP
+#   22. UWP FRAME APPS
+#   23. VISIBLE WINDOW PROCESSES
+#   24. LIVE STATE TRACKER
+#   25. WATCHERS
+#   26. OPTIONAL FILE WATCHING LIBRARY
+#   27. STATE WATCHER
+#   28. FILE EVENT HANDLER
+#   29. FILE WATCHER
 # ============================================================
 
 """
@@ -360,18 +361,60 @@ def set_text(text):
     logs `[TypeText] clipboard busy holder=...` on failure."""
     global _cache, _cache_seq
 
+    opened = []
+
     def _set(w):
+        opened.append(True)
         w.EmptyClipboard()
         w.SetClipboardData(w.CF_UNICODETEXT, text)
 
     try:
         _open_and(_set)
-    except Exception:
-        print(f"[TypeText] clipboard busy holder={holder()}")
+    except Exception as e:
+        # busy = it could not be opened (another holder); denied = opened but
+        # the write was refused (e.g. a policy). Labels and the Win32 code only.
+        code = getattr(e, "winerror", None)
+        print(f"[TypeText] clipboard {'denied' if opened else 'busy'} holder={holder()}"
+              + (f" code={code}" if isinstance(code, int) else ""))
         return False
     # Our own write must not make the watcher reopen the clipboard mid-paste.
     _cache, _cache_seq = (text or "")[:300], _seq()
     return True
+
+
+# ============================================================
+# CLIPBOARD CIRCUIT BREAKER
+# ============================================================
+
+class Breaker:
+    """After ``fails`` consecutive type_text staging failures within
+    ``window`` s, short text goes straight to key events for ``hold`` s.
+    A successful staging closes it. Logs `[TypeText] clipboard breaker
+    open|closed` once per change."""
+
+    def __init__(self, fails=2, window=60.0, hold=60.0):
+        self.fails, self.window, self.hold = fails, window, hold
+        self._failed = []
+        self._until = 0.0
+
+    def is_open(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self._until and now >= self._until:
+            self._until = 0.0
+            print("[TypeText] clipboard breaker closed")
+        return bool(self._until)
+
+    def record(self, ok, now=None):
+        now = time.monotonic() if now is None else now
+        if ok:
+            if self._until:
+                print("[TypeText] clipboard breaker closed")
+            self._failed, self._until = [], 0.0
+            return
+        self._failed = [t for t in self._failed if now - t < self.window] + [now]
+        if len(self._failed) >= self.fails and not self.is_open(now):
+            self._failed, self._until = [], now + self.hold
+            print("[TypeText] clipboard breaker open")
 
 
 # ============================================================

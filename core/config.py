@@ -543,6 +543,13 @@ def single_shot_enabled():
     return env_flag("MISTAI_SINGLE_SHOT", False)
 
 
+def router_via_agent():
+    """MISTAI_ROUTER_VIA_AGENT (default off): router and planner calls go in
+    the agent request form ("mode": "agent", "system", "messages") instead of
+    the plain message form. Same prompts and schemas; failures fail closed."""
+    return env_flag("MISTAI_ROUTER_VIA_AGENT", False)
+
+
 def batch_steps_enabled():
     """MISTAI_BATCH_STEPS (default on): accept a reply's "steps" list
     (BATCHABLE_ACTIONS, at most BATCH_MAX_STEPS). 0 = one action per reply."""

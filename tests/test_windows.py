@@ -1140,6 +1140,87 @@ def test_busy_log_has_only_the_holder_label(monkeypatch, capsys, holder):
     assert "private" not in out and "SECRET" not in out
 
 
+def test_a_refused_write_after_open_is_logged_as_denied_with_its_code(monkeypatch, capsys):
+    _fake_win32(monkeypatch)
+    err = OSError("SECRET policy text")
+    err.winerror = 5
+
+    def refuse(*_a):
+        raise err
+    sys.modules["win32clipboard"].SetClipboardData = refuse
+    monkeypatch.setattr(clip, "holder", lambda: "unknown")
+    assert clip.set_text("my private text") is False
+    out = capsys.readouterr().out
+    assert out.strip() == "[TypeText] clipboard denied holder=unknown code=5"
+    assert "private" not in out and "SECRET" not in out
+
+
+def test_breaker_opens_after_two_failures_within_the_window(capsys):
+    b = clip.Breaker()
+    b.record(False, now=0)
+    assert not b.is_open(now=1)
+    b.record(False, now=30)
+    assert b.is_open(now=31) and b.is_open(now=89)
+    assert not b.is_open(now=90)                     # 60 s later it closes by itself
+    assert capsys.readouterr().out.splitlines() == [
+        "[TypeText] clipboard breaker open", "[TypeText] clipboard breaker closed"]
+
+
+def test_breaker_needs_consecutive_failures_inside_60_s():
+    b = clip.Breaker()
+    b.record(False, now=0)
+    b.record(False, now=61)                          # the first one is too old
+    assert not b.is_open(now=62)
+    b.record(True, now=63)
+    b.record(False, now=64)                          # a success reset the count
+    assert not b.is_open(now=65)
+
+
+def test_a_successful_write_closes_the_breaker(capsys):
+    b = clip.Breaker()
+    b.record(False, now=0)
+    b.record(False, now=1)
+    b.record(True, now=2)
+    assert not b.is_open(now=3)
+    assert capsys.readouterr().out.splitlines()[-1] == "[TypeText] clipboard breaker closed"
+
+
+def test_open_breaker_sends_short_text_as_keys_without_touching_the_clipboard(monkeypatch, keys):
+    api, events = _input_api(monkeypatch, "notepad", 20)
+    _busy(api, [])
+    assert Api._act_type_text(api, "one") is True
+    assert Api._act_type_text(api, "two") is True    # second exhausted call opens it
+    tries = len(api.sets)
+    assert Api._act_type_text(api, "three") is True
+    assert len(api.sets) == tries                    # no clipboard attempt at all
+    assert keys == ["one", "two", "three"]
+    assert "keyboard events" in api.last_result_text
+
+
+def test_open_breaker_keeps_the_guards(monkeypatch, keys):
+    api, events = _input_api(monkeypatch, "notepad", 20)
+    _busy(api, [])
+    Api._act_type_text(api, "one")
+    Api._act_type_text(api, "two")
+    events.clear()
+    keys.clear()
+    # Long text still tries the clipboard and fails closed with the field untouched.
+    assert Api._act_type_text(api, "x" * 201) is False
+    assert keys == [] and events == [] and "left unchanged" in api.last_result_text
+    # The input-target guard still refuses when the target is not in front.
+    api2, events2 = _input_api(monkeypatch, "notepad", 21)
+    api2._clip_breaker = api._clip_breaker
+    _busy(api2, [])
+    assert Api._act_type_text(api2, "hi") is False and keys == []
+    assert "NOT SENT" in api2.last_result_text
+
+
+def test_breaker_is_per_session_and_closed_at_start(monkeypatch, keys):
+    api, _ = _input_api(monkeypatch, "notepad", 20)
+    _busy(api, [True, True])
+    assert Api._act_type_text(api, "hello") is True and keys == []
+
+
 def test_holder_is_self_while_we_have_it_open(monkeypatch):
     seen = []
     fake = _fake_win32(monkeypatch)

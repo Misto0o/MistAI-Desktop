@@ -2789,10 +2789,17 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         """Quote one value for a PowerShell single-quoted string literal."""
         return str(value or "").replace("'", "''")
 
-    def _resolve_app_id(self, name):
+    def _resolve_app_id(self, name, fresh=False):
+        """Start-apps AppID for ``name`` (Get-StartApps, ~2 s). Hits are cached
+        for this session; ``fresh`` skips and replaces the cached entry."""
         normalized_name = self._normalize_app_name(name)
         if len(normalized_name) < 2:
             return None
+        cache = self.__dict__.setdefault("_app_id_cache", {})
+        key = str(name).strip().lower()
+        if not fresh and key in cache:
+            return cache[key]
+        cache.pop(key, None)
         try:
             quoted_name = self._ps_single_quote(name)
             ps_cmd = (
@@ -2808,6 +2815,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 timeout=10,
             )
             app_id = result.stdout.strip()
+            if app_id:
+                cache[key] = app_id
             return app_id or None
         except Exception as e:
             print(f"[ResolveApp] Get-StartApps lookup failed for '{name}': "
@@ -3152,23 +3161,34 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         if state == "hidden":
             print(f"[OpenApp] '{param}' running with no window -- relaunching to restore it")
 
+        # Numbers-only timing: path/app-id lookup, launch, window wait, focus.
+        times = {"lookup": 0.0, "launch": 0.0, "window": 0.0, "focus": 0.0}
+        t = time.perf_counter()
         exe_path = self._resolve_app_exe(param)
+        times["lookup"] += time.perf_counter() - t
         if exe_path:
+            t = time.perf_counter()
             try:
                 subprocess.Popen(exe_path)
             except Exception as e:
                 print(f"[OpenApp] Path launch failed: {e}")
                 exe_path = None
+            times["launch"] += time.perf_counter() - t
 
         app_id = None
+        cached = False
         if not exe_path:
+            cached = str(param).strip().lower() in self.__dict__.get("_app_id_cache", {})
+            t = time.perf_counter()
             app_id = self._resolve_app_id(param)
+            times["lookup"] += time.perf_counter() - t
             if app_id:
-                try:
-                    subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
-                except Exception as e:
-                    print(f"[OpenApp] Start-Apps launch failed: {e}")
+                t = time.perf_counter()
+                if not self._launch_app_id(app_id):
                     app_id = None
+                times["launch"] += time.perf_counter() - t
+        route = ("path" if exe_path else "app-id cached" if app_id and cached
+                 else "app-id" if app_id else "start-menu")
 
         # Start-menu typing is the last resort: only when there was nothing
         # to launch by path or Start-apps ID and no window has appeared.
@@ -3184,17 +3204,35 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
 
         # A Store app launched by its AUMID shows its frame within ~1-2s;
         # waiting longer only delays the honest failure.
-        if self._wait_for_app_window(app_lower, timeout=5.0 if app_id else 6.0):
+        t = time.perf_counter()
+        found = self._wait_for_app_window(app_lower, timeout=5.0 if app_id else 6.0)
+        times["window"] += time.perf_counter() - t
+        if not found and cached:
+            # A cached AppID brought no window: look it up again once, and
+            # relaunch only when the fresh lookup gives a different ID.
+            t = time.perf_counter()
+            fresh_id = self._resolve_app_id(param, fresh=True)
+            times["lookup"] += time.perf_counter() - t
+            if fresh_id and fresh_id != app_id and self._launch_app_id(fresh_id):
+                app_id, route = fresh_id, "app-id refreshed"
+                t = time.perf_counter()
+                found = self._wait_for_app_window(app_lower, timeout=5.0)
+                times["window"] += time.perf_counter() - t
+        if found:
+            t = time.perf_counter()
             self.switch_to_app(app_lower)
             time.sleep(0.4)
             try:
                 pyautogui.hotkey("win", "up")
             except Exception:
                 pass
+            times["focus"] += time.perf_counter() - t
             self._last_opened_app = app_lower
             state, title = self.app_window_state(app_lower)
             self.last_result_text = f"Launched '{param}' (window '{title[:40]}', {state})"
+            self._log_open_timing(route, times, True)
             return True
+        self._log_open_timing(route, times, False)
 
         # Distinguish "never started" from "started but stayed in the tray"
         # so the model doesn't retry the same launch.
@@ -3212,6 +3250,23 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             self.last_result_text = f"'{param}' did not start"
         print(f"[OpenApp] {self.last_result_text}")
         return False
+
+    @staticmethod
+    def _launch_app_id(app_id):
+        """Start a Start-apps AppID through the shell; False if that failed."""
+        try:
+            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+            return True
+        except Exception as e:
+            print(f"[OpenApp] Start-Apps launch failed: {e}")
+            return False
+
+    @staticmethod
+    def _log_open_timing(route, times, ok):
+        """One numbers-only line per launch (fixed route label, seconds)."""
+        print(f"[OpenApp] timing route={route} "
+              + " ".join(f"{k} {v:.2f}s" for k, v in times.items())
+              + f" {'window' if ok else 'no window'}")
 
     def _wait_for_app_running(self, app_lower, timeout=4.0):
         deadline = time.time() + timeout
@@ -3474,24 +3529,32 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         clipboard_staged = False
         # One lock across read, stage, paste and restore: MistAI's own watcher
         # and tools never touch the clipboard in the middle of a paste.
+        breaker = self.__dict__.setdefault("_clip_breaker", clip.Breaker())
         clip.lock.acquire()
         try:
-            # Stage text on the clipboard BEFORE changing the target field.
-            # The old order cleared a draft with Ctrl+A/Delete and only then
-            # discovered that another app had locked the clipboard.
-            prev_clipboard = self._clipboard_text_full()
-            if prev_clipboard is None:
-                prev_clipboard = self.get_clipboard()
-                if prev_clipboard == "Clipboard is empty":
-                    prev_clipboard = ""
-            # Another app may hold the clipboard for a moment: retry after
-            # short jittered waits (1.5 s at most).
-            staged = self.set_clipboard(param)
-            for d in clip.retry_delays(self.CLIPBOARD_BUDGET_S):
-                if staged:
-                    break
-                time.sleep(d)
+            # Breaker open (the clipboard failed twice within a minute): short
+            # one-line text goes straight to key events, with the same guards
+            # (input target above, can_send_as_keys); nothing is staged.
+            skip_clipboard = clip.can_send_as_keys(param) and breaker.is_open()
+            staged = False
+            if not skip_clipboard:
+                # Stage text on the clipboard BEFORE changing the target field.
+                # The old order cleared a draft with Ctrl+A/Delete and only then
+                # discovered that another app had locked the clipboard.
+                prev_clipboard = self._clipboard_text_full()
+                if prev_clipboard is None:
+                    prev_clipboard = self.get_clipboard()
+                    if prev_clipboard == "Clipboard is empty":
+                        prev_clipboard = ""
+                # Another app may hold the clipboard for a moment: retry after
+                # short jittered waits (1.5 s at most).
                 staged = self.set_clipboard(param)
+                for d in clip.retry_delays(self.CLIPBOARD_BUDGET_S):
+                    if staged:
+                        break
+                    time.sleep(d)
+                    staged = self.set_clipboard(param)
+                breaker.record(staged)
             by_keys = False
             if not staged:
                 if not clip.can_send_as_keys(param):

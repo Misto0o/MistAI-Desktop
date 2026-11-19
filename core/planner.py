@@ -71,6 +71,7 @@ from .config import (
     confirmation_answer,
     log_text,
     single_shot_enabled,
+    router_via_agent,
     verbose_logs,
     DEFAULT_MODEL,
     chat_timeout,
@@ -212,8 +213,25 @@ class Plan:
 # PLANNER AND ROUTER MODEL CALL
 # ============================================================
 
-def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback=True):
+def call_mode():
+    """"agent" or "message": the request form _llm uses (MISTAI_ROUTER_VIA_AGENT)."""
+    return "agent" if router_via_agent() else "message"
+
+
+# MISTAI_ROUTER_VIA_AGENT: the system prompts sent in agent mode. The task
+# prompt itself (and so its JSON schema) is the same in both modes.
+ROUTER_SYSTEM = ("You are Mist, a voice desktop assistant. Chat replies are spoken aloud: "
+                 "short plain sentences. Reply with JSON only, as the message asks.")
+PLANNER_SYSTEM = "Reply with JSON only, as the message asks."
+
+
+def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback=True,
+         system=PLANNER_SYSTEM):
     headers = api.api_manager.get_headers()
+    payload = {"message": prompt, "model": model}
+    if call_mode() == "agent":
+        payload.update({"mode": "agent", "system": system,
+                        "messages": [{"role": "user", "content": prompt}]})
     urls = tuple(
         dict.fromkeys(
             u
@@ -228,7 +246,7 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback
         try:
             r = requests.post(
                 url,
-                json={"message": prompt, "model": model},
+                json=payload,
                 headers=headers,
                 timeout=timeout,
             )
@@ -412,7 +430,7 @@ def make_plan(api, goal, model):
         model,
     )
     plan_secs = time.monotonic() - t0
-    print(f"[Timing] Planning LLM: {plan_secs:.2f}s")
+    print(f"[Timing] Planning LLM: {plan_secs:.2f}s mode={call_mode()}")
     agent = getattr(api, "agent", None)
     if agent is not None and hasattr(agent, "record_time"):
         agent.record_time("plan", plan_secs)
@@ -1028,6 +1046,7 @@ def try_chat(api, message, gender="none", model=None):
             history = ""
         title = "sir" if gender == "male" else "ma'am" if gender == "female" else ""
         now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+        t_call = time.perf_counter()
         raw = planner._llm(
             api,
             build_prompt(message, now, history, title, single=single),
@@ -1035,7 +1054,10 @@ def try_chat(api, message, gender="none", model=None):
             timeout=timeout,
             label="Conversation",
             fallback=False,
+            # The router's voice line; only in agent mode (flag off = the same call as before).
+            **({"system": ROUTER_SYSTEM} if call_mode() == "agent" else {}),
         )
+        print(f"[Timing] Router LLM: {time.perf_counter() - t_call:.2f}s mode={call_mode()}")
         reply = parse_route(raw)
         reason = route_reason(raw)
         if single and reply is None:

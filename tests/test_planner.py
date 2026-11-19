@@ -29,11 +29,13 @@
 #   22. CONVERSATION ROUTER TESTS (7)
 #   23. CONVERSATION ROUTER HOTKEY MODELS
 #   24. CONVERSATION ROUTER TESTS (8)
+#   25. ROUTER VIA AGENT MODE
 # ============================================================
 
 """The planner, the tool registry and the conversation router."""
 
 import json
+import re
 import threading
 from types import SimpleNamespace
 
@@ -1023,3 +1025,65 @@ def test_chat_timeout_reads_the_environment(monkeypatch, env, want):
                         lambda api, p, m, timeout, label, fallback: calls.append(timeout) or "")
     conversation.try_chat(_api(), "hello there", "none")
     assert calls == [want]
+
+
+# ============================================================
+# ROUTER VIA AGENT MODE
+# ============================================================
+
+def _posting_api(monkeypatch, reply='{"route": "task", "reply": ""}', ok=True):
+    sent = []
+    monkeypatch.setattr(planner.requests, "post", lambda url, json=None, **_k: (
+        sent.append(json), _Resp(200 if ok else 500, {"response": reply} if ok else {"error": "x"}))[1])
+    api = _api()
+    api.api_manager = SimpleNamespace(get_headers=lambda: {}, get_api_url=lambda: "https://p.invalid",
+                                      get_fallback_url=lambda: "https://f.invalid")
+    return api, sent
+
+
+def test_flag_off_sends_the_plain_message_form(monkeypatch, capsys):
+    monkeypatch.delenv("MISTAI_ROUTER_VIA_AGENT", raising=False)
+    api, sent = _posting_api(monkeypatch)
+    conversation.try_chat(api, "open notepad", "none")
+    assert set(sent[0]) == {"message", "model"}
+    assert re.search(r"\[Timing\] Router LLM: [\d.]+s mode=message", capsys.readouterr().out)
+
+
+def test_flag_on_sends_router_in_agent_form_with_the_voice_line(monkeypatch, capsys):
+    monkeypatch.setenv("MISTAI_ROUTER_VIA_AGENT", "1")
+    api, sent = _posting_api(monkeypatch, '{"route": "chat", "reply": "Hello."}')
+    assert conversation.try_chat(api, "hi there", "none") == "Hello."
+    body = sent[0]
+    assert body["mode"] == "agent" and body["system"] == planner.ROUTER_SYSTEM
+    assert "spoken aloud" in body["system"]
+    assert body["messages"] == [{"role": "user", "content": body["message"]}]
+    assert '"route": "chat" or "task"' in body["message"]          # same schema prompt
+    assert re.search(r"\[Timing\] Router LLM: [\d.]+s mode=agent", capsys.readouterr().out)
+
+
+def test_flag_on_sends_planning_in_agent_form(monkeypatch, capsys):
+    monkeypatch.setenv("MISTAI_ROUTER_VIA_AGENT", "1")
+    api, sent = _posting_api(monkeypatch, '{"task_name": "T", "nodes": [{"id": "a", "desc": "x"}]}')
+    api.workspace = SimpleNamespace(context_block=lambda: "(none)")
+    planner.make_plan(api, "build a site with three pages then deploy it", "m")
+    assert sent[0]["mode"] == "agent" and sent[0]["system"] == planner.PLANNER_SYSTEM
+    assert "PHASES" in sent[0]["message"]
+    assert re.search(r"\[Timing\] Planning LLM: [\d.]+s mode=agent", capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("reply, ok", [("", True), ("not json", True), ("", False)])
+def test_flag_on_fails_closed(monkeypatch, reply, ok):
+    monkeypatch.setenv("MISTAI_ROUTER_VIA_AGENT", "1")
+    api, _ = _posting_api(monkeypatch, reply, ok)
+    assert conversation.try_chat(api, "hi there", "none") is None
+    api.workspace = SimpleNamespace(context_block=lambda: "(none)")
+    plan, _name = planner.make_plan(api, "build a site with three pages then deploy it", "m")
+    assert len(plan.order) == 1                       # one phase, as without the flag
+
+
+def test_router_flag_is_read_at_call_time(monkeypatch):
+    from core.config import router_via_agent
+    monkeypatch.delenv("MISTAI_ROUTER_VIA_AGENT", raising=False)
+    assert router_via_agent() is False and planner.call_mode() == "message"
+    monkeypatch.setenv("MISTAI_ROUTER_VIA_AGENT", "1")
+    assert router_via_agent() is True and planner.call_mode() == "agent"

@@ -27,6 +27,7 @@
 #   20. SEARCH, PROCESS AND TIMING GATED RUN
 #   21. SEARCH, PROCESS AND TIMING HELPERS (3)
 #   22. SEARCH, PROCESS AND TIMING TESTS (4)
+#   23. BROWSER START RETRY
 # ============================================================
 
 """browser_search engines and fallback, search/process matching and timing."""
@@ -987,3 +988,80 @@ def test_gating_on_rereads_after_the_cache_expires(monkeypatch):
     monkeypatch.setattr(AgentLoop, "GATED_CACHE_SECONDS", -1.0)
     reads, _ = _gated_run(monkeypatch, NON_UI, gating=True)
     assert reads == 1 + len(NON_UI)
+
+
+# ============================================================
+# BROWSER START RETRY
+# ============================================================
+
+def _session(tmp_path, monkeypatch, alive, ready, page):
+    """A BrowserSession left with a failed start: a worker thread that is
+    (not) alive, a ready flag and maybe a page."""
+    import core.browser_session as bs
+    monkeypatch.setattr(bs, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(bs, "START_TIMEOUT", 0.01)
+    s = bs.BrowserSession(profile_dir=str(tmp_path))
+    s._thread = SimpleNamespace(is_alive=lambda: alive)
+    s._start_error = "Browser did not start within 30s"
+    if ready:
+        s._ready.set()
+    s._page = page
+    s.started = []
+    monkeypatch.setattr(bs.threading, "Thread", lambda **k: SimpleNamespace(
+        start=lambda: s.started.append(1) or (s._ready.set(), setattr(s, "_page", "page")),
+        is_alive=lambda: True))
+    return s
+
+
+def test_a_crashed_start_is_cleared_and_the_next_call_starts_again(tmp_path, monkeypatch, capsys):
+    s = _session(tmp_path, monkeypatch, alive=False, ready=True, page=None)
+    s._req_q.put = lambda item: item[1].put(("ok", 42))
+    assert s._call(lambda: 0) == 42
+    assert s.started == [1] and s._start_error == ""
+    assert "[Browser] previous start failed -- starting again" in capsys.readouterr().out
+
+
+def test_a_slow_start_that_finished_later_is_used(tmp_path, monkeypatch, capsys):
+    s = _session(tmp_path, monkeypatch, alive=True, ready=True, page="page")
+    s._req_q.put = lambda item: item[1].put(("ok", "done"))
+    assert s._call(lambda: 0) == "done"
+    assert s.started == [] and s._start_error == ""
+    assert "[Browser] start finished after the timeout" in capsys.readouterr().out
+
+
+def test_a_start_still_hanging_keeps_failing_without_a_second_browser(tmp_path, monkeypatch):
+    s = _session(tmp_path, monkeypatch, alive=True, ready=False, page=None)
+    with pytest.raises(RuntimeError, match="did not start"):
+        s._call(lambda: 0)
+    assert s.started == []
+
+
+def test_close_clears_a_start_error(tmp_path, monkeypatch):
+    s = _session(tmp_path, monkeypatch, alive=False, ready=True, page=None)
+    s._thread = SimpleNamespace(join=lambda timeout=0: None)
+    s.close()
+    assert s._start_error == "" and s._thread is None
+
+
+def test_missing_playwright_is_never_retried(tmp_path, monkeypatch):
+    s = _session(tmp_path, monkeypatch, alive=False, ready=True, page=None)
+    import core.browser_session as bs
+    monkeypatch.setattr(bs, "PLAYWRIGHT_AVAILABLE", False)
+    with pytest.raises(RuntimeError):
+        s._call(lambda: 0)
+    assert s.started == []
+
+
+def test_start_phase_line_is_numbers_only(tmp_path, monkeypatch, capsys):
+    import contextlib
+    import core.browser_session as bs
+    ctx = SimpleNamespace(pages=["page"], close=lambda: None)
+    fake = SimpleNamespace(firefox=SimpleNamespace(launch_persistent_context=lambda *a, **k: ctx))
+    monkeypatch.setattr(bs, "sync_playwright", lambda: contextlib.nullcontext(fake), raising=False)
+    monkeypatch.delenv("MISTAI_VERBOSE_LOGS", raising=False)
+    s = bs.BrowserSession(profile_dir=str(tmp_path / "secretprofile"))
+    s._req_q.put(None)                                 # stop right after the start
+    s._run()
+    lines = [l for l in capsys.readouterr().out.splitlines() if "start phases" in l]
+    assert len(lines) == 1 and re.fullmatch(
+        r"\[Browser\] start phases: seed [\d.]+s driver [\d.]+s launch [\d.]+s page [\d.]+s", lines[0])

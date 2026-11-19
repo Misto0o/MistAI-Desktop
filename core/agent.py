@@ -523,6 +523,16 @@ class AgentLoop:
         except Exception:
             return False
 
+    def _launch_skip_reason(self, param, res):
+        """Fixed label for why _verified_launch did not hold."""
+        if not getattr(res, "success", False):
+            return "failed"
+        if getattr(res, "verified", None) is not True:
+            return "unverified"
+        if getattr(res, "confidence", 0) < 0.93:
+            return "low confidence"
+        return "not in front"
+
     def _enter_safe(self, action, param):
         """press_key Enter/Return only: may it skip confirmation? Asks the
         Api (target this phase opened, in front, not a risky app category)."""
@@ -1123,6 +1133,8 @@ class AgentLoop:
             else:
                 cmd = queued
                 # The read after a verified launch was skipped by the batch.
+                if verified_read_skip:
+                    print("  [Screen] verified-read skip not taken (batch)")
                 verified_read_skip = False
                 print("  [Batch] next step, no model call")
 
@@ -1571,7 +1583,14 @@ class AgentLoop:
                 if (not verified_skip_used and skip_verified_read_enabled()
                         and self._verified_launch(executed_action, executed_param, res)):
                     verified_read_skip = verified_skip_used = True
-            else:
+            if executed_action in ("open_app", "switch_app") and not verified_read_skip:
+                # Fixed label: which skip condition did not hold.
+                why = ("gating off" if not gating
+                       else "setting off" if not skip_verified_read_enabled()
+                       else "already used" if verified_skip_used
+                       else self._launch_skip_reason(executed_param, res))
+                print(f"  [Screen] verified-read skip not taken ({why})")
+            if not gating:
                 refresh_screen_next_step = bool(
                     (categories & stateful_categories)
                     and not (categories & {"perception", "info"})

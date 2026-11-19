@@ -38,6 +38,7 @@
 #   31. SCENARIO HARNESS TESTS (7)
 #   32. CALCULATOR PROBE
 #   33. CALCULATOR PROBE TESTS
+#   34. BACKEND WARM-UP AND NEW LOG LINES
 # ============================================================
 
 """tools/live_checks.py, tools/run_scenarios.py and tools/probe_calculator.py."""
@@ -1394,3 +1395,65 @@ def test_variant_aborts_without_input_when_calculator_is_not_in_front(monkeypatc
     reports, aborted = probe.run_variant(api, [("type_text", "37*23")])
     assert ran == [] and reports == []
     assert "not in front" in aborted and "no input sent" in aborted
+
+
+# ============================================================
+# BACKEND WARM-UP AND NEW LOG LINES
+# ============================================================
+
+class _Sentinel(Exception):
+    pass
+
+
+def _main_until_runner(monkeypatch, tmp_path, argv):
+    """Run rs.main up to building the Runner; returns the warm-up calls."""
+    warmed = []
+    monkeypatch.setattr(rs, "warm_backend", lambda: warmed.append(1))
+    monkeypatch.setattr(rs, "Runner", lambda *a, **k: (_ for _ in ()).throw(_Sentinel()))
+    monkeypatch.setattr(rs, "make_scenario_dir", lambda: str(tmp_path))
+    monkeypatch.setitem(sys.modules, "dotenv", SimpleNamespace(load_dotenv=lambda *_a: None))
+    for key in ("MISTAI_DB_PATH", rs.VERBOSE_ENV) + rs.MODE_ENV_KEYS:
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+    with pytest.raises(_Sentinel):
+        rs.main(argv + ["--log-root", str(tmp_path)])
+    return warmed
+
+
+def test_real_runs_warm_the_backend_once_and_stub_runs_never(monkeypatch, tmp_path):
+    assert _main_until_runner(monkeypatch, tmp_path, ["--yes"]) == [1]
+    assert _main_until_runner(monkeypatch, tmp_path, ["--stub", "--yes"]) == []
+
+
+def test_warm_up_runs_in_the_background_and_logs_numbers_only(monkeypatch, capsys):
+    from core.config import STATUS_URL
+    seen = []
+    t = rs.warm_backend(get=lambda url, timeout: seen.append(url) or SimpleNamespace(status_code=200))
+    t.join(2)
+    assert t.daemon and seen == [STATUS_URL]
+    out = capsys.readouterr().out.strip()
+    assert out.startswith("[Harness] warm-up status 200 in ") and "http" not in out
+
+
+def test_a_failed_warm_up_never_raises(capsys):
+    def boom(url, timeout):
+        raise ConnectionError("https://secret.invalid/refused")
+    rs.warm_backend(get=boom).join(2)
+    out = capsys.readouterr().out
+    assert "[Harness] warm-up failed (ConnectionError)" in out and "secret" not in out
+
+
+def test_new_timing_lines_reach_the_live_checks_summary():
+    log = "\n".join([
+        "[Timing] Router LLM: 1.20s mode=message",
+        "[Timing] Planning LLM: 2.50s mode=agent",
+        "[Timing] exec split: handler=1.10s settle=1.50s verify=0.02s",
+        "[Vision] sent 1920x1080 png 812 KB encode 140ms call 3900ms",
+        "[Vision] Screen understood (240 chars, attempts 1)",
+        "[Screen] verified-read skip not taken (not in front)",
+        "[OpenApp] timing route=app-id cached lookup 0.00s launch 0.01s window 1.20s focus 0.45s window",
+        "[Browser] start phases: seed 0.00s driver 0.80s launch 9.10s page 0.20s",
+        "[TypeText] clipboard denied holder=unknown code=5",
+        "[TypeText] clipboard breaker open",
+        "[OpenApp] timing route=app-id calculator lookup 1s",      # content: never copied
+    ])
+    assert len(lc.allowlisted(log)) == 10

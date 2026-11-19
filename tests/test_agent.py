@@ -2421,3 +2421,31 @@ class TestSkipVerifiedRead:
         # Without gating the read cadence is the old one; the skip never applies.
         reads = _skip_verified_read_run(monkeypatch, [("open_app", "notepad"), ("type_text", "hi")], gating=False)
         assert 2 not in reads
+
+    @pytest.mark.parametrize("results, in_front, gating, label", [
+        ({"open_app": {"success": False}}, True, True, "failed"),
+        ({"open_app": {"verified": None}}, True, True, "unverified"),
+        ({"open_app": {"confidence": 0.92}}, True, True, "low confidence"),
+        ({}, False, True, "not in front"),
+        ({}, True, False, "gating off"),
+    ])
+    def test_a_missed_skip_logs_one_fixed_reason(self, monkeypatch, capsys, results, in_front, gating, label):
+        _skip_verified_read_run(monkeypatch, [("open_app", "notepad")], results, in_front, gating)
+        out = capsys.readouterr().out
+        assert f"[Screen] verified-read skip not taken ({label})" in out
+        assert out.count("verified-read skip not taken") == 1
+
+    def test_a_second_launch_logs_already_used(self, monkeypatch, capsys):
+        _skip_verified_read_run(monkeypatch, [("open_app", "notepad"), ("switch_app", "calculator")])
+        out = capsys.readouterr().out
+        assert "verified-read skip not taken (already used)" in out
+        assert not [l for l in out.splitlines() if "[Screen]" in l and "notepad" in l]
+
+    def test_a_taken_skip_logs_no_reason(self, monkeypatch, capsys):
+        _skip_verified_read_run(monkeypatch, [("open_app", "notepad")])
+        assert "skip not taken" not in capsys.readouterr().out
+
+    def test_setting_off_is_the_reason(self, monkeypatch, capsys):
+        monkeypatch.setenv("MISTAI_SKIP_VERIFIED_READ", "0")
+        _skip_verified_read_run(monkeypatch, [("open_app", "notepad")])
+        assert "verified-read skip not taken (setting off)" in capsys.readouterr().out
