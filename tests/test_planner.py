@@ -317,6 +317,144 @@ def test_phase_hints_match_only_the_phase_goal_not_the_framed_prompt():
     assert hint_text == ""
 
 
+class _FinalSpeechBus:
+    """Synchronous bus: delivers every publish to its subscribers at once."""
+
+    def __init__(self):
+        self.subs = []
+        self.names = []
+
+    def publish(self, name, data=None, source=""):
+        from core.live_state import Event
+
+        self.names.append(name)
+        for want, fn in list(self.subs):
+            if want in (None, name):
+                fn(Event(name, data or {}, source))
+
+    def subscribe(self, name, fn):
+        entry = (name, fn)
+        self.subs.append(entry)
+        return lambda: self.subs.remove(entry) if entry in self.subs else None
+
+
+def _final_speech_api():
+    api = SimpleNamespace(
+        _stop_requested=threading.Event(),
+        bus=_FinalSpeechBus(),
+        task_store=SimpleNamespace(save=lambda _record: None,
+                                   create=lambda name, goal, plan: TaskRecord(
+                                       "t1", name, goal, plan)),
+        workspace=SimpleNamespace(
+            context_block=lambda: "",
+            record_task_output=lambda *_args: None,
+            phase_evidence=lambda _since: "",
+        ),
+        caption_window=None,
+        captions_enabled=False,
+        spoken=[],
+    )
+    api.speak = lambda text: api.spoken.append(text)
+    return api
+
+
+class _PhaseAgent:
+    """Stands in for AgentLoop._loop: per phase, (success, done speech). A
+    non-empty done speech is published and spoken exactly as _loop does."""
+
+    def __init__(self, api, outcomes):
+        self.api, self.outcomes, self.calls = api, list(outcomes), 0
+
+    def _loop(self, *_args, **_kwargs):
+        from core.live_state import AGENT_STEP
+
+        ok, speech = self.outcomes[self.calls]
+        self.calls += 1
+        if not ok:
+            return {"success": False, "error": "phase failed", "steps": 1}
+        if speech:
+            self.api.bus.publish(AGENT_STEP, {"action": "done", "speech": speech}, "AgentLoop")
+            self.api.speak(speech)
+        return {"success": True, "speech": speech, "steps": 2}
+
+
+def _two_phase_run(outcomes, confirm=False):
+    api = _final_speech_api()
+    plan = planner.Plan([
+        planner.PlanNode("setup", "create the files"),
+        planner.PlanNode("count", "say how many files there are", ["setup"]),
+    ])
+    record = TaskRecord("t1", "ProjectSetup", "goal", plan.to_dict())
+    runner = planner.PlanRunner(api, _PhaseAgent(api, outcomes))
+    runner._confirm = lambda *_args: confirm
+    return api, record, runner._drive(record, plan, "model", "none", "text", None)
+
+
+def test_all_phases_done_the_final_speech_is_the_last_phase_answer():
+    api, record, result = _two_phase_run([(True, "Created both files."),
+                                          (True, "There are 3 files in the folder.")])
+    assert result["success"] is True
+    assert result["speech"] == "There are 3 files in the folder."
+    # Spoken once by its own phase, never followed by the generic line.
+    assert api.spoken == ["Created both files.", "There are 3 files in the folder."]
+    assert not any("Completed all" in s for s in api.spoken)
+    assert record.status == "completed"
+
+
+def test_an_empty_last_phase_answer_falls_back_to_the_generic_line():
+    api, _record, result = _two_phase_run([(True, "Created both files."), (True, "")])
+    assert result["success"] is True
+    assert result["speech"] == "Completed all 2 phases of ProjectSetup."
+    assert api.spoken[-1] == "Completed all 2 phases of ProjectSetup."
+
+
+def test_a_failed_phase_keeps_the_partial_failure_message():
+    api, record, result = _two_phase_run([(True, "Created both files."), (False, "")])
+    expected = ("Finished 1 of 2 phases -- 1 failed. "
+                "Say 'resume ProjectSetup' to retry the rest.")
+    assert result["success"] is False
+    assert result["speech"] == expected
+    assert api.spoken[-1] == expected
+    assert record.status == "partial"
+
+
+def test_a_failed_first_phase_keeps_the_failure_message_and_resume_hint():
+    api, record, result = _two_phase_run([(False, "")])
+    expected = ("Finished 0 of 2 phases -- 1 failed, 1 blocked. "
+                "Say 'resume ProjectSetup' to retry the rest.")
+    assert result["speech"] == expected and api.spoken == [expected]
+    assert record.status == "failed"
+
+
+def test_a_single_phase_plan_returns_the_loop_result_unchanged(monkeypatch):
+    api = _final_speech_api()
+    agent = _PhaseAgent(api, [(True, "Calculator is open.")])
+    monkeypatch.setattr(planner, "make_plan",
+                        lambda *_a, **_k: (planner.Plan([planner.PlanNode("main", "g")]), "N"))
+    result = planner.PlanRunner(api, agent).run_goal("open calculator", "m", "none", "text", None)
+    assert result == {"success": True, "speech": "Calculator is open.", "steps": 2}
+    assert api.spoken == ["Calculator is open."]
+    assert planner.events.TASK_COMPLETED not in api.bus.names
+
+
+def test_the_answer_panel_shows_the_final_speech():
+    from core.floating_orb import PanelModel
+
+    api = _final_speech_api()
+    panels = PanelModel()
+    api.bus.subscribe(None, panels.on_event)
+    plan = planner.Plan([
+        planner.PlanNode("setup", "create the files"),
+        planner.PlanNode("count", "say how many files there are", ["setup"]),
+    ])
+    record = TaskRecord("t1", "ProjectSetup", "goal", plan.to_dict())
+    agent = _PhaseAgent(api, [(True, "Created both files."),
+                              (True, "There are 3 files in the folder.")])
+    result = planner.PlanRunner(api, agent)._drive(record, plan, "m", "none", "text", None)
+    assert panels.state("answer")["text"] == result["speech"]
+    assert panels.visible("answer", busy=False)
+
+
 # ============================================================
 # CONVERSATION ROUTER
 # ============================================================

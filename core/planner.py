@@ -661,6 +661,7 @@ class PlanRunner:
 
         unsub = api.bus.subscribe(events.FILE_CREATED, _collect)
         total_steps = 0
+        last_speech = ""   # done speech of the most recent successful phase
         try:
             while True:
                 if api._stop_requested.is_set():
@@ -694,6 +695,7 @@ class PlanRunner:
                 err = result.get("error", "")
 
                 if result.get("success"):
+                    last_speech = str(result.get("speech") or "")
                     evidence = api.workspace.phase_evidence(phase_started)
                     summary = (
                         f"Verified phase actions: {evidence}"
@@ -744,7 +746,7 @@ class PlanRunner:
                 else:
                     break
 
-            return self._finish(record, plan, total_steps)
+            return self._finish(record, plan, total_steps, last_speech)
         finally:
             unsub()
             record.files_created = sorted(set(record.files_created + created_files))[
@@ -854,7 +856,11 @@ class PlanRunner:
             "paused": True,
         }
 
-    def _finish(self, record, plan, steps):
+    def _finish(self, record, plan, steps, last_speech=""):
+        """``last_speech``: the last successful phase's done speech. When every
+        phase succeeded it IS the task's answer: returned as the result speech
+        and not spoken again (its own loop already spoke it and showed it in
+        the answer panel). Empty -> the generic line; failures unchanged."""
         total = len(plan.nodes)
         done, failed, blocked = (
             plan.count(DONE),
@@ -877,7 +883,10 @@ class PlanRunner:
             + (f", {blocked} blocked" if blocked else "")
             + f". Say 'resume {record.name}' to retry the rest."
         )
-        self.api.speak(speech)
+        if success and last_speech.strip():
+            speech = last_speech
+        else:
+            self.api.speak(speech)
         error = ""
         if not success:
             error = f"{failed} phase(s) failed, {blocked} blocked, {done} completed"

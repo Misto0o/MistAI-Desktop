@@ -601,6 +601,9 @@
           "mkdir": "{tmp}\\backup"
         }
       ],
+      "answers": [
+        "yes"
+      ],
       "stub": [
         [
           {
