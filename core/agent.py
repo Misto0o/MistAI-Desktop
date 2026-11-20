@@ -43,7 +43,7 @@ from .config import (
 from .executor import Executor
 from .live_state import describe_open_apps
 from .tools import (CLICK_FAMILY, READ_RESULT_CHARS, SPECS, action_entry, action_menu,
-                    arg_problem)
+                    arg_problem, command_is_mutating)
 from .screen import text_is_sufficient
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
@@ -57,6 +57,11 @@ NOT_VISIBLE_ON_SCREEN = "NOT VISIBLE ON SCREEN"
 # that creates or changes something can end with no speech.
 EMPTY_ANSWER_READS = frozenset(
     {"read_screen_text", "analyze_screen", "browser_get_text", "inspect_file", "find_file"})
+# A run_command the confirmation gate's own classifier (command_is_mutating)
+# calls state-changing stays unobserved until one of these runs successfully
+# (a run_command that the same classifier calls read-only); a done before that
+# gets the done-time reminder.
+OBSERVE_ACTIONS = frozenset({"run_command", "inspect_file", "find_file"})
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
 # The agent call failed at the network level (error and speech of the result).
@@ -595,12 +600,18 @@ class AgentLoop:
                 if n.replace(",", "") not in have]
 
     def _done_reminder(self, route_notes, last_read, unseen=(), unsubmitted=False,
-                       empty_answer=False, is_question=True):
+                       empty_answer=False, is_question=True, unobserved_command=False):
         """The one observation shown at the first 'done' of a phase whose
         draft speech states values its last read does not show, whose last
         read followed unsubmitted typing, whose route did not go as asked,
-        or whose speech is empty although the user asked a question."""
+        whose speech is empty although the user asked a question, or whose
+        last state-changing command no read-only action has observed."""
         parts = ["Before finishing, check your final speech against what actually happened."]
+        if unobserved_command:
+            parts.append("A command that changes state ran and nothing since has checked its "
+                         "effect: check it with a read-only command (for files, list the source "
+                         "and destination) and state only what that shows; if it contradicts "
+                         "what you meant to do, say so and fix it.")
         if empty_answer and is_question:
             parts.append("Your speech is empty but the user asked a question: answer it "
                          "from what you read, or say you couldn't find it.")
@@ -905,6 +916,7 @@ class AgentLoop:
         route_notes = []  # off-target input, cross-category fallbacks (for the done check)
         last_read = None  # result of the phase's last read_screen_text
         unconfirmed_click = None  # a vision-resolved click no screen read followed yet
+        unobserved_command = False  # a mutating run_command no later listing observed
         last_executed = None  # the action the Executor really ran last this phase
         unsubmitted = False  # type_text ran and no key/click submitted it yet
         read_after_unsubmitted = False  # the last read happened in that state
@@ -1395,21 +1407,22 @@ class AgentLoop:
             if (
                 action == "done"
                 and not done_reminded
-                and (done_notes or unseen or empty_answer
+                and (done_notes or unseen or empty_answer or unobserved_command
                      or (last_read is not None and read_after_unsubmitted))
                 and steps_taken < self.MAX_STEPS
             ):
                 done_reminded = True
                 reminder = self._done_reminder(done_notes, last_read, unseen,
                                                read_after_unsubmitted, empty_answer,
-                                               is_question)
+                                               is_question, unobserved_command)
                 if verbose_logs():
                     print(f"  [DoneCheck] {reminder}")
                 else:  # the reminder quotes the read and the draft speech
                     fired = [name for name, hit in (
                         ("route notes", done_notes), ("unseen numbers", unseen),
                         ("unsubmitted read", last_read is not None and read_after_unsubmitted),
-                        ("empty answer", empty_answer)) if hit]
+                        ("empty answer", empty_answer),
+                        ("unobserved command", unobserved_command)) if hit]
                     print(f"  [DoneCheck] reminder sent ({', '.join(fired)})")
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append({"role": "user", "content": f"[OBSERVATION] {reminder}"})
@@ -1713,6 +1726,12 @@ class AgentLoop:
                 and getattr(res, "confidence", 1.0) < Executor.CONFIDENCE_THRESHOLD
             ):
                 unconfirmed_click = executed_action
+            # Its effect (even a failed one's partial effect) is unknown until a
+            # read-only command or file read runs after it.
+            if executed_action == "run_command" and command_is_mutating(executed_param):
+                unobserved_command = True
+            elif success and executed_action in OBSERVE_ACTIONS:
+                unobserved_command = False
 
             # Repetition guard: without this the model re-ran clicks it had
             # already landed (each 'maybe it didn't work' costs a step and, on
@@ -2029,7 +2048,7 @@ OPERATING RULES:
 - minimize_all hides your target app too: only when the user asks to clear the desktop, never to focus an app. If switch_app fails, the app isn't running: use open_app, never force window activation via PowerShell.
 - BROWSER: for any web search or lookup use browser_search, then browser_get_text or browser_click/browser_navigate on a result; never open the user's browser app or type into an address bar to search (open one only when the user asks to open or use it, or for a specific signed-in site). For a known website use browser_navigate with its URL (e.g. "youtube.com"), not a search; get to content by URL, never by clicking through pages.
 - The browser_* actions control ONLY MistAI's own Playwright browser, a SEPARATE window from the user's everyday Firefox, even when that one is in front. If the user explicitly asks to use their REAL/daily browser, use open_url to open a link there and click_on_text/read_screen_text (OCR/Vision) to work in it.
-- PATHS: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables; real ones like $env:USERPROFILE and $env:TEMP are fine.
+- PATHS AND FILES: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables ($env:USERPROFILE and $env:TEMP are real). Before writing, moving or copying into a folder, make sure it exists (create it first); never add overwrite flags such as -Force to a move or copy unless the user asked to overwrite. After a command that changes files or folders, list the source and destination with a separate read-only command and report only what that listing shows; if it contradicts what you meant to do, say so and fix it.
 - "done" is the ONLY way to end a task (there is no "none" action). Its speech is the only thing the user hears or sees: when the task asked for information it must contain the answer; leave it empty only for a pure action.
 
 DO NOT SECOND-GUESS COMPLETED ACTIONS:

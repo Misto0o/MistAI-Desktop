@@ -419,6 +419,67 @@ def test_a_create_file_command_ending_with_an_empty_done_stays_silent(monkeypatc
     assert not any("Before finishing" in o for o in obs)
 
 
+MOVE_TXT = "Move-Item -Path 'C:\\t\\mess\\*.txt' -Destination 'C:\\t\\mess\\texts'"
+MOVED_DONE = {"action": "done", "speech": "Moved all the txt files into texts."}
+
+
+@pytest.mark.parametrize("move_ok", [True, False])
+def test_a_move_with_no_listing_after_it_gets_one_reminder(monkeypatch, capsys, move_ok):
+    """The rt-move-by-type failure: Move-Item into a folder that did not exist
+    (or with -Force) returned ok and the agent said everything was moved. A
+    state-changing command (the confirmation gate's own classifier) that no
+    read-only action observed gets the existing one-time reminder; a failed one
+    too, since it may have done part of its work."""
+    out, _, calls, obs, spoken = _input_repeat_and_done_check_run(monkeypatch, [
+        {"action": "run_command", "parameter": MOVE_TXT},
+        MOVED_DONE,
+        {"action": "run_command", "parameter": "Get-ChildItem 'C:\\t\\mess' -Recurse"},
+        {"action": "done", "speech": "Only a.txt is in texts; b.txt and d.txt are missing."},
+    ], results={"run_command": lambda p: _result(
+        "run_command", "", success=move_ok or not p.startswith("Move-Item"))},
+        task="put all the txt files in C:\\t\\mess into a folder called texts")
+    check = next(o for o in obs if "Before finishing" in o)
+    assert sum("Before finishing" in o for o in obs) == 1
+    assert ("A command that changes state ran and nothing since has checked its effect: "
+            "check it with a read-only command (for files, list the source and destination) "
+            "and state only what that shows; if it contradicts what you meant to do, say so "
+            "and fix it.") in check
+    assert [c[0] for c in calls] == ["run_command", "run_command"]
+    assert spoken == ["Only a.txt is in texts; b.txt and d.txt are missing."]
+    log = capsys.readouterr().out
+    assert "[DoneCheck] reminder sent (unobserved command)" in log
+    assert "texts" not in log and "Move-Item" not in log           # content-free
+
+
+@pytest.mark.parametrize("observe", [
+    {"action": "run_command", "parameter": "Get-ChildItem 'C:\\t\\mess' -Recurse"},
+    {"action": "inspect_file", "parameter": "C:\\t\\mess\\texts\\a.txt"},
+    {"action": "find_file", "parameter": "texts\\*.txt"},
+])
+def test_a_move_followed_by_a_read_only_check_costs_no_extra_call(monkeypatch, observe):
+    out, _, _, obs, spoken = _input_repeat_and_done_check_run(monkeypatch, [
+        {"action": "run_command", "parameter": MOVE_TXT},
+        observe,
+        MOVED_DONE,
+    ], task="put all the txt files in C:\\t\\mess into a folder called texts")
+    assert out["success"] and spoken == [MOVED_DONE["speech"]]
+    assert not any("Before finishing" in o for o in obs)
+
+
+def test_only_a_successful_check_after_the_last_change_counts(monkeypatch):
+    listing = {"action": "run_command", "parameter": "Get-ChildItem 'C:\\t\\mess'"}
+    # A listing before the change does not observe it.
+    _, _, _, obs, _ = _input_repeat_and_done_check_run(monkeypatch, [
+        listing, {"action": "run_command", "parameter": MOVE_TXT}, MOVED_DONE, MOVED_DONE])
+    assert sum("Before finishing" in o for o in obs) == 1
+    # A failed listing observes nothing.
+    _, _, _, obs, _ = _input_repeat_and_done_check_run(monkeypatch, [
+        {"action": "run_command", "parameter": MOVE_TXT}, listing, MOVED_DONE, MOVED_DONE,
+    ], results={"run_command": lambda p: _result(
+        "run_command", "", success=p.startswith("Move-Item"))})
+    assert sum("Before finishing" in o for o in obs) == 1
+
+
 def test_run_command_counts_when_the_goal_is_a_question(monkeypatch):
     out, _, _, obs, spoken = _input_repeat_and_done_check_run(monkeypatch, [
         {"action": "run_command", "parameter": "Get-Process notepad"},
@@ -1661,6 +1722,23 @@ def test_plan_prompt_plans_only_what_remains_and_only_what_was_asked():
     planner._PLAN_PROMPT.format(goal="g", max_nodes=4, workspace="w")
 
 
+def test_file_changes_rule_is_merged_into_paths_once():
+    """Destination first, no overwrite flags unless asked, and a separate listing
+    after a file-changing command: each said once, inside the one PATHS AND FILES
+    rule (no extra rule line, no per-task phrase list)."""
+    system = _grounding_rules_system()
+    phrases = ("make sure it exists (create it first)",
+               "never add overwrite flags such as -Force to a move or copy unless the user "
+               "asked to overwrite",
+               "list the source and destination with a separate read-only command and "
+               "report only what that listing shows",
+               "if it contradicts what you meant to do, say so and fix it")
+    (rule,) = [l for l in system.split("\n") if l.startswith("- PATHS AND FILES:")]
+    for phrase in phrases:
+        assert system.count(phrase) == 1 and phrase in rule
+    assert "- PATHS:" not in system
+
+
 # ============================================================
 # GROUNDING RULES HELPERS
 # ============================================================
@@ -1940,14 +2018,16 @@ STATES = {
 # for the action menu generated from core/tools.py (per-action text moved there),
 # then for the compact menu (one line per action; details via describe_action),
 # then for the rules merged without dropping one (toggles, UIA inputs, browser),
-# then for one short thinking sentence in RESPONSE FORMAT.
+# then for one short thinking sentence in RESPONSE FORMAT, then for the PATHS rule
+# merged into PATHS AND FILES (destination folder first, no overwrite flags unless
+# asked, a separate read-only listing after a file-changing command).
 PROMPT_HASHES = {
-    "plain": "653ddd2fe110da29b1abd10ad4c2c780efe4e1821f71f2b0078063a55a4bdf10",
-    "project": "40e68057a35ccff2329fbf6acf91bad9cdf5d9b18ed523af8026bf80342ab87c",
-    "long-screen": "b38042578c376094c431f08c0ecd1b78541e76defe9dee1a6fb314e2fdd54a2c",
-    "hints-and-conversation": "9fe72f4cb61f99c157997d1ee0cd160c2fb57430262dfdd3f4a4db1d2a619f5d",
+    "plain": "01ad0415755bfba3dba63ac7da8ae8b7b5bdcea4c37c8464db0eb3ef0a47ebb7",
+    "project": "75ee0383f926562b3887b6eb7e3dabba5f357491f0986a2f63caf1677c0ae2a5",
+    "long-screen": "f3b4ba01cb704db9d79a1bf12bb2f323d1b04b6f22ac3556dc6775d3b638aec6",
+    "hints-and-conversation": "c01aad8b92a5be10319b10d034f851d9d2b0acb2019b8dfec0885b8c5131c8cd",
 }
-PLAIN_LENGTH = 13532            # 13,417 before the thinking cap; 21,056 originally
+PLAIN_LENGTH = 13924            # 13,532 before PATHS AND FILES; 21,056 originally
 
 
 # ============================================================

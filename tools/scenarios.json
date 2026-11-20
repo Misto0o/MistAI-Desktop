@@ -705,19 +705,19 @@
         {
           "write_file": {
             "path": "{tmp}\\mess\\a.txt",
-            "content": "a"
+            "content": "content a"
           }
         },
         {
           "write_file": {
             "path": "{tmp}\\mess\\b.txt",
-            "content": "b"
+            "content": "content b"
           }
         },
         {
           "write_file": {
             "path": "{tmp}\\mess\\d.txt",
-            "content": "d"
+            "content": "content d"
           }
         },
         {
@@ -728,6 +728,9 @@
         }
       ],
       "answers": [
+        "yes",
+        "yes",
+        "yes",
         "yes",
         "yes",
         "yes"
@@ -764,6 +767,20 @@
               "{tmp}\\mess\\texts\\a.txt",
               "{tmp}\\mess\\texts\\b.txt",
               "{tmp}\\mess\\texts\\d.txt"
+            ],
+            "file_contains": [
+              {
+                "path": "{tmp}\\mess\\texts\\a.txt",
+                "text": "content a"
+              },
+              {
+                "path": "{tmp}\\mess\\texts\\b.txt",
+                "text": "content b"
+              },
+              {
+                "path": "{tmp}\\mess\\texts\\d.txt",
+                "text": "content d"
+              }
             ]
           },
           {
@@ -771,6 +788,20 @@
               "{tmp}\\texts\\a.txt",
               "{tmp}\\texts\\b.txt",
               "{tmp}\\texts\\d.txt"
+            ],
+            "file_contains": [
+              {
+                "path": "{tmp}\\texts\\a.txt",
+                "text": "content a"
+              },
+              {
+                "path": "{tmp}\\texts\\b.txt",
+                "text": "content b"
+              },
+              {
+                "path": "{tmp}\\texts\\d.txt",
+                "text": "content d"
+              }
             ]
           }
         ]

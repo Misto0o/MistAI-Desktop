@@ -1725,6 +1725,54 @@ def test_bundled_realistic_tier_order_gates_and_stub_skips(tmp_path, monkeypatch
             assert recs[name]["status"] == "SKIP" and "run without --stub" in recs[name]["failures"][0]
 
 
+def test_move_by_type_fails_when_a_file_is_lost_or_overwritten(tmp_path):
+    """rt-move-by-type passed when Move-Item -Force collapsed the files into one,
+    or when the first file became a FILE named texts. Each moved file must hold
+    its own setup content, in whichever of the two accepted folders."""
+    import shutil
+
+    sc = rs.expand({s["name"]: s for s in rs.load_scenarios(SCENARIOS)}["rt-move-by-type"],
+                   str(tmp_path))
+    assert sc["answers"] == ["yes"] * 6                     # a long recovery is not cut off
+    contents = {os.path.basename(st["write_file"]["path"]): st["write_file"]["content"]
+                for st in sc["setup"]}
+    assert contents == {"a.txt": "content a", "b.txt": "content b", "d.txt": "content d",
+                        "c.jpg": "not really a jpg"}
+    for alt in sc["expect"]["any_of"]:
+        assert [(os.path.basename(w["path"]), w["text"]) for w in alt["file_contains"]] == [
+            ("a.txt", "content a"), ("b.txt", "content b"), ("d.txt", "content d")]
+
+    mess = tmp_path / "mess"
+
+    def ends_with(moves):
+        """Fresh setup, then each (source, destination) move; the check's failures."""
+        shutil.rmtree(mess, ignore_errors=True)
+        shutil.rmtree(tmp_path / "texts", ignore_errors=True)
+        assert rs.run_setup(sc["setup"]) is None
+        for src, dst in moves:
+            os.makedirs(os.path.dirname(tmp_path / dst), exist_ok=True)
+            os.replace(mess / src, tmp_path / dst)
+        return rs.check_desktop(sc["expect"], _outcome())
+
+    good = [(n, f"mess/texts/{n}") for n in ("a.txt", "b.txt", "d.txt")]
+    assert ends_with(good) == []
+    assert ends_with([(n, f"texts/{n}") for n in ("a.txt", "b.txt", "d.txt")]) == []
+    # -Force over one destination name: the last file's content wins everywhere.
+    overwrite = [("a.txt", "mess/texts/a.txt"), ("b.txt", "mess/texts/b.txt"),
+                 ("d.txt", "mess/texts/a.txt")]
+    (tmp_path / "mess" / "texts").mkdir(parents=True, exist_ok=True)
+    assert ends_with(overwrite) != []
+    # All three names present, one with another file's content: only file_contains sees it.
+    assert ends_with(good) == []
+    (mess / "texts" / "a.txt").write_text("content d", encoding="utf-8")
+    assert rs.check_desktop(sc["expect"], _outcome()) != []
+    without = {k: v for k, v in sc["expect"].items() if k != "any_of"}
+    without["any_of"] = [{"files_exist": a["files_exist"]} for a in sc["expect"]["any_of"]]
+    assert rs.check_desktop(without, _outcome()) == []
+    # Missing destination folder: the first file became a FILE named texts.
+    assert ends_with([("a.txt", "mess/texts")]) != []
+
+
 def test_tightened_realistic_scenarios(tmp_path):
     by = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)[11:]}
     assert by["rt-two-part-project"]["answers"] == ["yes", "yes"]
