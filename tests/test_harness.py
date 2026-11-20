@@ -1734,6 +1734,11 @@ def test_move_by_type_fails_when_a_file_is_lost_or_overwritten(tmp_path):
     sc = rs.expand({s["name"]: s for s in rs.load_scenarios(SCENARIOS)}["rt-move-by-type"],
                    str(tmp_path))
     assert sc["answers"] == ["yes"] * 6                     # a long recovery is not cut off
+    assert sc["stub"] == [[                                 # the stub moves with move_files
+        {"action": "move_files", "parameter": f"{tmp_path}\\mess\\*.txt|||{tmp_path}\\mess\\texts",
+         "speech": ""},
+        {"action": "done",
+         "speech": "Moved a.txt, b.txt and d.txt into mess\\texts; c.jpg stayed where it was."}]]
     contents = {os.path.basename(st["write_file"]["path"]): st["write_file"]["content"]
                 for st in sc["setup"]}
     assert contents == {"a.txt": "content a", "b.txt": "content b", "d.txt": "content d",

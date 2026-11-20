@@ -2733,6 +2733,10 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 return self._act_run_command(param)
             elif action == "write_file":
                 return self._act_write_file(param)
+            elif action == "move_files":
+                return self._act_move_files(param)
+            elif action == "copy_files":
+                return self._act_copy_files(param)
             elif action == "inspect_file":
                 return self._act_inspect_file(param)
             elif action == "patch_json":
@@ -3508,6 +3512,130 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         except Exception as e:
             self.last_result_text = f"write_file failed: {e}"
             return False
+
+    # Destination entries a move_files / copy_files result lists by name.
+    TRANSFER_LIST_MAX = 60
+
+    def _act_move_files(self, param):
+        return self._transfer_files(param, copy=False)
+
+    def _act_copy_files(self, param):
+        return self._transfer_files(param, copy=True)
+
+    def _transfer_path(self, raw):
+        """A move/copy path: quotes dropped, placeholders and %VARS%/~ expanded."""
+        path = str(raw or "").strip().strip("\"'").strip()
+        if not path:
+            return ""
+        path = os.path.expandvars(os.path.expanduser(self._resolve_path_placeholders(path)))
+        return os.path.normpath(path)
+
+    def _folder_listing(self, folder):
+        """'N item(s): name (size bytes), sub\\ (folder), ...': names and sizes only,
+        never content (secret-pattern files included), capped at TRANSFER_LIST_MAX."""
+        try:
+            names = sorted(os.listdir(folder), key=str.lower)
+        except OSError as e:
+            return f"(could not be listed: {type(e).__name__})"
+        shown = []
+        for n in names[:self.TRANSFER_LIST_MAX]:
+            full = os.path.join(folder, n)
+            try:
+                shown.append(f"{n}\\ (folder)" if os.path.isdir(full)
+                             else f"{n} ({os.path.getsize(full)} bytes)")
+            except OSError:
+                shown.append(n)
+        more = len(names) - len(shown)
+        return (f"{len(names)} item(s): " + (", ".join(shown) or "nothing")
+                + (f", and {more} more" if more > 0 else ""))
+
+    def _transfer_files(self, param, copy):
+        """move_files / copy_files: ``source|||destination``. The source is a file,
+        a folder or a glob; the destination is always a folder, created if missing
+        and refused if it exists as a file. Never overwrites: if any name already
+        exists in the destination (or two sources share a name) nothing changes and
+        the clashes are listed. The result lists what moved or copied and the
+        destination's contents (names and sizes only)."""
+        import glob
+
+        name, verb, done_verb = (("copy_files", "copied", "Copied") if copy
+                                 else ("move_files", "moved", "Moved"))
+        if "|||" not in str(param or ""):
+            self.last_result_text = f"{name} needs format: source|||destination folder"
+            return False
+        raw_src, raw_dst = str(param).split("|||", 1)
+        src, dst = self._transfer_path(raw_src), self._transfer_path(raw_dst)
+        if not (src and dst and os.path.isabs(src) and os.path.isabs(dst)):
+            self.last_result_text = (
+                f"{name} needs a full path (or a {{desktop}}-style placeholder) for both the "
+                "source and the destination folder; nothing was changed.")
+            return False
+        if os.path.isfile(dst):
+            self.last_result_text = (
+                f"REFUSED: {dst} exists as a FILE, not a folder; nothing was {verb}. Choose "
+                "another destination folder or ask the user what to do with that file.")
+            return False
+        found = sorted(glob.glob(src)) if any(c in src for c in "*?[") else (
+            [src] if os.path.lexists(src) else [])
+        dst_key = os.path.normcase(dst)
+        # A glob such as mess\* can match the destination folder itself.
+        sources = [s for s in found if os.path.normcase(os.path.normpath(s)) != dst_key]
+        if not sources:
+            self.last_result_text = f"Nothing matches {src}; nothing was {verb}."
+            return False
+        for s in sources:
+            key = os.path.normcase(os.path.normpath(s))
+            if os.path.isdir(s) and dst_key.startswith(key + os.sep):
+                self.last_result_text = (
+                    f"REFUSED: {dst} is inside {s}; a folder cannot go into itself. "
+                    f"Nothing was {verb}.")
+                return False
+        try:
+            existing = {os.path.normcase(n) for n in os.listdir(dst)} if os.path.isdir(dst) else set()
+        except OSError as e:
+            self.last_result_text = f"{name} could not list {dst} ({type(e).__name__}); nothing was {verb}."
+            return False
+        seen, clashes = set(), []
+        for s in sources:
+            key = os.path.normcase(os.path.basename(s))
+            if key in existing or key in seen:
+                clashes.append(os.path.basename(s))
+            seen.add(key)
+        if clashes:
+            self.last_result_text = (
+                f"REFUSED: nothing was {verb}, because these names already exist in {dst} "
+                f"(or two sources share a name): {', '.join(clashes)}. Nothing is ever "
+                "overwritten: ask the user whether to rename, skip or replace them. "
+                f"{dst} contains {self._folder_listing(dst)}")
+            return False
+        try:
+            os.makedirs(dst, exist_ok=True)
+        except OSError as e:
+            self.last_result_text = (f"{name} could not create the folder {dst} "
+                                     f"({type(e).__name__}); nothing was {verb}.")
+            return False
+        done, failed = [], []
+        for s in sources:
+            base = os.path.basename(s)
+            target = os.path.join(dst, base)
+            try:
+                if os.path.lexists(target):       # appeared since the check: never overwrite
+                    raise FileExistsError(target)
+                if not copy:
+                    shutil.move(s, target)
+                elif os.path.isdir(s):
+                    shutil.copytree(s, target)
+                else:
+                    shutil.copy2(s, target)
+                done.append(base)
+            except Exception as e:
+                failed.append(f"{base} ({type(e).__name__})")
+        text = (f"{done_verb} {len(done)} of {len(sources)} item(s) into {dst}: "
+                f"{', '.join(done) or 'none'}.")
+        if failed:
+            text += f" NOT {verb.upper()}: {', '.join(failed)}."
+        self.last_result_text = f"{text} {dst} now contains {self._folder_listing(dst)}"
+        return not failed
 
     def _act_type_text(self, param):
         """Type into whatever app was last opened via open_app. Focuses it

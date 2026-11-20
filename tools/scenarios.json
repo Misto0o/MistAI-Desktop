@@ -738,13 +738,9 @@
       "stub": [
         [
           {
-            "action": "run_command",
-            "parameter": "New-Item -ItemType Directory -Force -Path '{tmp}\\mess\\texts' | Out-Null; Move-Item -Path '{tmp}\\mess\\*.txt' -Destination '{tmp}\\mess\\texts'",
+            "action": "move_files",
+            "parameter": "{tmp}\\mess\\*.txt|||{tmp}\\mess\\texts",
             "speech": ""
-          },
-          {
-            "action": "done",
-            "speech": "Moved a.txt, b.txt and d.txt into mess\\texts; c.jpg stayed where it was."
           },
           {
             "action": "done",

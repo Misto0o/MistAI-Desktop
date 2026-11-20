@@ -1723,15 +1723,17 @@ def test_plan_prompt_plans_only_what_remains_and_only_what_was_asked():
 
 
 def test_file_changes_rule_is_merged_into_paths_once():
-    """Destination first, no overwrite flags unless asked, and a separate listing
-    after a file-changing command: each said once, inside the one PATHS AND FILES
-    rule (no extra rule line, no per-task phrase list)."""
+    """Moves and copies go to move_files / copy_files; destination first, no
+    overwrite flags unless asked, and a separate listing after any other
+    file-changing command: each said once, inside the one PATHS AND FILES rule
+    (no extra rule line, no per-task phrase list)."""
     system = _grounding_rules_system()
-    phrases = ("make sure it exists (create it first)",
-               "never add overwrite flags such as -Force to a move or copy unless the user "
-               "asked to overwrite",
-               "list the source and destination with a separate read-only command and "
-               "report only what that listing shows",
+    phrases = ("Move or copy files and folders with move_files / copy_files, not run_command",
+               "make sure it exists (create it first)",
+               "never add overwrite flags such as -Force unless the user asked to overwrite",
+               "After any other command that changes files or folders, list the source and "
+               "destination with a separate read-only command and report only what that "
+               "listing shows",
                "if it contradicts what you meant to do, say so and fix it")
     (rule,) = [l for l in system.split("\n") if l.startswith("- PATHS AND FILES:")]
     for phrase in phrases:
@@ -2020,14 +2022,16 @@ STATES = {
 # then for the rules merged without dropping one (toggles, UIA inputs, browser),
 # then for one short thinking sentence in RESPONSE FORMAT, then for the PATHS rule
 # merged into PATHS AND FILES (destination folder first, no overwrite flags unless
-# asked, a separate read-only listing after a file-changing command).
+# asked, a separate read-only listing after a file-changing command), then for the
+# move_files / copy_files menu lines, then for PATHS AND FILES sending moves and
+# copies to them (the listing advice kept for other file changes).
 PROMPT_HASHES = {
-    "plain": "01ad0415755bfba3dba63ac7da8ae8b7b5bdcea4c37c8464db0eb3ef0a47ebb7",
-    "project": "75ee0383f926562b3887b6eb7e3dabba5f357491f0986a2f63caf1677c0ae2a5",
-    "long-screen": "f3b4ba01cb704db9d79a1bf12bb2f323d1b04b6f22ac3556dc6775d3b638aec6",
-    "hints-and-conversation": "c01aad8b92a5be10319b10d034f851d9d2b0acb2019b8dfec0885b8c5131c8cd",
+    "plain": "d93de971844b5c4ec9fc89f4a8c5ea89097a2ef651968749e0cf39f18882dd0b",
+    "project": "78e68d936366ebbc56cdfbcad5cbaab4f13922af7205ec17cfb730711e7278b2",
+    "long-screen": "1d1d7344422163e7f3ba88f0de2bc5abe1e53a4dbaa69323d50db2e83e00318d",
+    "hints-and-conversation": "29547afceb69eeb9399640b27e21e66e89642c7ec0e8f8c26f226cda41d7aa18",
 }
-PLAIN_LENGTH = 13924            # 13,532 before PATHS AND FILES; 21,056 originally
+PLAIN_LENGTH = 14362            # 14,251 with the menu lines only; 13,924 before move/copy_files; 21,056 originally
 
 
 # ============================================================
@@ -2163,6 +2167,8 @@ def test_the_only_registered_actions_not_dispatched_are_the_meta_ones():
     ("write_file", "path|||complete content"),
     ("patch_json", "path|||json object"),
     ("patch_file", "path|||exact existing text|||replacement text"),
+    ("move_files", "source|||destination folder"),
+    ("copy_files", "source|||destination folder"),
     ("quick_message", "app|recipient|message"),
     ("remind_me", "text|due_time"),
     ("schedule_reminder", "seconds|text"),
@@ -2209,6 +2215,8 @@ def test_safety_meaning_stays_in_the_always_visible_lines():
     assert "does NOT submit" in menu and "only appends" in menu
     assert "LAST RESORT ONLY" in menu
     assert "ONLY when the user explicitly asks" in menu
+    assert "never overwrites (any name clash moves nothing)" in menu
+    assert "never overwrites (any name clash copies nothing)" in menu
 
 
 def test_describe_action_is_a_registered_read_only_action():
@@ -2246,6 +2254,8 @@ def test_unknown_action_note_names_the_closest_actions_and_the_entry():
 @pytest.mark.parametrize("name, good, bad", [
     ("write_file", "{desktop}\\a.txt|||hi", "{desktop}\\a.txt"),
     ("patch_file", "a.txt|||old|||new", "a.txt|||old"),
+    ("move_files", "{desktop}\\*.txt|||{desktop}\\texts", "{desktop}\\*.txt"),
+    ("copy_files", "{desktop}\\a.txt|||{desktop}\\b", "{desktop}\\a.txt|||"),
     ("quick_message", "discord|Alex|hi", "discord|Alex"),
     ("click_coords", "10, 20", "the button"),
     ("brightness_set", "70", "bright"),

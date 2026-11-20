@@ -401,6 +401,31 @@ SPECS = dict(
             categories=("file", "info"),
             result_chars=READ_RESULT_CHARS,
         ),
+        # Moves and copies that never overwrite; the result lists the destination.
+        _T(
+            "move_files",
+            destructive=True,
+            reversible=False,
+            requires_confirmation=True,
+            expected_runtime=1.0,
+            settle=0.0,
+            base_confidence=0.96,
+            base_reliability=0.95,
+            categories=("file",),
+            result_chars=READ_RESULT_CHARS,
+        ),
+        _T(
+            "copy_files",
+            destructive=True,
+            reversible=False,
+            requires_confirmation=True,
+            expected_runtime=1.0,
+            settle=0.0,
+            base_confidence=0.96,
+            base_reliability=0.95,
+            categories=("file",),
+            result_chars=READ_RESULT_CHARS,
+        ),
         _T(
             "organize_desktop",
             destructive=True,
@@ -621,6 +646,21 @@ _PLAYBOOK = {
         'filename, wildcard like "*.pdf", or "folder\\name"',
         "Searches the workspace root, Desktop, Documents, Downloads, home (skips "
         "node_modules/.git/build/cache)."),
+    "move_files": (
+        "Move a file, folder or glob (*.txt) into a folder, created if missing; never "
+        "overwrites (any name clash moves nothing)",
+        "source|||destination folder",
+        "The destination is always a folder; if it exists as a FILE the move is refused. "
+        "Any name that already exists there means nothing moves and the clashes are "
+        "listed. The result lists what moved and the destination's contents (name and "
+        "size). Use full paths or the {desktop}-style placeholders.",
+        "{downloads}\\*.pdf|||{documents}\\PDFs"),
+    "copy_files": (
+        "Copy a file, folder or glob (*.txt) into a folder, created if missing; never "
+        "overwrites (any name clash copies nothing)",
+        "source|||destination folder",
+        "Same rules as move_files; the source stays where it is.",
+        "{desktop}\\report.docx|||{documents}\\Backup"),
     "organize_desktop": ("Move loose desktop files into categorized folders", ""),
     "screenshot": ("Take a screenshot", "filename"),
     "mss_screenshot": ("Fast full-screen capture (MSS)", ""),
@@ -698,6 +738,8 @@ _ARG_RX = {
     "write_file": r"[^|]*\S[^|]*\|\|\|",
     "patch_json": r"[^|]*\S[^|]*\|\|\|",
     "patch_file": r"[^|]*\S[^|]*\|\|\|.+?\|\|\|",
+    "move_files": r"[^|]*\S[^|]*\|\|\|\s*\S",
+    "copy_files": r"[^|]*\S[^|]*\|\|\|\s*\S",
     "quick_message": r"[^|]*\S[^|]*\|[^|]*\S[^|]*\|\s*\S",
     "browser_fill": r"[^|]*\S[^|]*\|",
     "click_nth": r"\s*\d+\s*\|\s*\S",

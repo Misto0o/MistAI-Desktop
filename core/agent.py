@@ -666,7 +666,7 @@ class AgentLoop:
             return False
         # Opening an *already trusted* project is not a file mutation.  Its
         # own handler validates the existing folder and trust evidence.
-        if action in {"write_file", "patch_json", "patch_file"}:
+        if action in {"write_file", "patch_json", "patch_file", "move_files", "copy_files"}:
             return True
         return action == "run_command" and bool(
             self._PROJECT_MUTATING_COMMAND_RX.search(str(parameter or ""))
@@ -2048,7 +2048,7 @@ OPERATING RULES:
 - minimize_all hides your target app too: only when the user asks to clear the desktop, never to focus an app. If switch_app fails, the app isn't running: use open_app, never force window activation via PowerShell.
 - BROWSER: for any web search or lookup use browser_search, then browser_get_text or browser_click/browser_navigate on a result; never open the user's browser app or type into an address bar to search (open one only when the user asks to open or use it, or for a specific signed-in site). For a known website use browser_navigate with its URL (e.g. "youtube.com"), not a search; get to content by URL, never by clicking through pages.
 - The browser_* actions control ONLY MistAI's own Playwright browser, a SEPARATE window from the user's everyday Firefox, even when that one is in front. If the user explicitly asks to use their REAL/daily browser, use open_url to open a link there and click_on_text/read_screen_text (OCR/Vision) to work in it.
-- PATHS AND FILES: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables ($env:USERPROFILE and $env:TEMP are real). Before writing, moving or copying into a folder, make sure it exists (create it first); never add overwrite flags such as -Force to a move or copy unless the user asked to overwrite. After a command that changes files or folders, list the source and destination with a separate read-only command and report only what that listing shows; if it contradicts what you meant to do, say so and fix it.
+- PATHS AND FILES: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables ($env:USERPROFILE and $env:TEMP are real). Move or copy files and folders with move_files / copy_files, not run_command (they create the folder, never overwrite and list the result). Before writing into a folder, make sure it exists (create it first); never add overwrite flags such as -Force unless the user asked to overwrite. After any other command that changes files or folders, list the source and destination with a separate read-only command and report only what that listing shows; if it contradicts what you meant to do, say so and fix it.
 - "done" is the ONLY way to end a task (there is no "none" action). Its speech is the only thing the user hears or sees: when the task asked for information it must contain the answer; leave it empty only for a pure action.
 
 DO NOT SECOND-GUESS COMPLETED ACTIONS:

@@ -1387,3 +1387,155 @@ def test_executor_records_no_results_as_ok(monkeypatch, tmp_path):
     _fake_run(monkeypatch, 7)
     res = Executor(api).run("run_command", "failing-command")
     assert not res.success and res.confidence <= 0.2
+
+
+# -- move_files / copy_files (real temp folders) ----------------------------------------
+
+
+def _mess(tmp_path):
+    """mess\\a.txt, b.txt, d.txt ("content <x>") and c.jpg, like rt-move-by-type."""
+    mess = tmp_path / "mess"
+    mess.mkdir()
+    for n in "abd":
+        (mess / f"{n}.txt").write_text(f"content {n}", encoding="utf-8")
+    (mess / "c.jpg").write_text("not really a jpg", encoding="utf-8")
+    return mess
+
+
+def _transfer(api, action, source, dest):
+    return Api._exec_sync(api, action, f"{source}|||{dest}")
+
+
+def _tree(folder):
+    return sorted(str(p.relative_to(folder)) for p in folder.rglob("*"))
+
+
+def test_move_files_glob_creates_the_destination_and_lists_it(tmp_path):
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    texts = mess / "texts"
+    assert _transfer(api, "move_files", mess / "*.txt", texts)
+    assert {p.name: p.read_text(encoding="utf-8") for p in texts.iterdir()} == {
+        "a.txt": "content a", "b.txt": "content b", "d.txt": "content d"}
+    assert sorted(p.name for p in mess.iterdir()) == ["c.jpg", "texts"]
+    text = api.last_result_text
+    assert text.startswith(f"Moved 3 of 3 item(s) into {texts}: a.txt, b.txt, d.txt.")
+    assert text.endswith(f"{texts} now contains 3 item(s): a.txt (9 bytes), b.txt (9 bytes), "
+                         "d.txt (9 bytes)")
+    # A glob that also matches the destination folder never moves it into itself.
+    assert _transfer(api, "move_files", mess / "*", texts)
+    assert sorted(p.name for p in mess.iterdir()) == ["texts"]
+    assert "Moved 1 of 1 item(s)" in api.last_result_text and "c.jpg (16 bytes)" in api.last_result_text
+
+
+def test_move_files_moves_a_folder_with_its_contents(tmp_path):
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    archive = tmp_path / "archive" / "2026"
+    assert _transfer(api, "move_files", mess, archive)
+    assert not mess.exists()
+    assert _tree(archive) == ["mess", r"mess\a.txt", r"mess\b.txt", r"mess\c.jpg", r"mess\d.txt"]
+    assert api.last_result_text.endswith("now contains 1 item(s): mess\\ (folder)")
+    # A folder never goes into itself.
+    inner = archive / "mess" / "inner"
+    assert not _transfer(api, "move_files", archive / "mess", inner)
+    assert "cannot go into itself" in api.last_result_text and not inner.exists()
+
+
+def test_a_destination_that_is_a_file_is_refused_and_nothing_changes(tmp_path):
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    # What Move-Item left behind: the first file became a FILE named texts.
+    (mess / "texts").write_text("content a", encoding="utf-8")
+    before = {p.name: p.read_text(encoding="utf-8") for p in mess.iterdir()}
+    for action in ("move_files", "copy_files"):
+        assert not _transfer(api, action, mess / "*.txt", mess / "texts")
+        assert api.last_result_text.startswith(f"REFUSED: {mess / 'texts'} exists as a FILE, "
+                                               "not a folder")
+        assert {p.name: p.read_text(encoding="utf-8") for p in mess.iterdir()} == before
+
+
+@pytest.mark.parametrize("action", ["move_files", "copy_files"])
+def test_any_name_clash_moves_or_copies_nothing(tmp_path, action):
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    texts = mess / "texts"
+    texts.mkdir()
+    (texts / "B.TXT").write_text("older b", encoding="utf-8")       # case-insensitive clash
+    assert not _transfer(api, action, mess / "*.txt", texts)
+    assert sorted(p.name for p in mess.glob("*.txt")) == ["a.txt", "b.txt", "d.txt"]
+    assert [p.name for p in texts.iterdir()] == ["B.TXT"]
+    assert (texts / "B.TXT").read_text(encoding="utf-8") == "older b"
+    text = api.last_result_text
+    assert text.startswith("REFUSED: nothing was") and ": b.txt. Nothing is ever overwritten" in text
+    assert text.endswith("contains 1 item(s): B.TXT (7 bytes)")
+    # Two sources with one name (a glob over two folders) clash with each other too.
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "a.txt").write_text("other a", encoding="utf-8")
+    out = tmp_path / "out"
+    assert not _transfer(api, action, tmp_path / "*" / "a.txt", out)
+    assert "(or two sources share a name): a.txt" in api.last_result_text
+    assert not out.exists()                                       # not even the folder
+
+
+def test_copy_files_copies_files_and_folders_and_leaves_the_source(tmp_path):
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    backup = tmp_path / "backup"
+    assert _transfer(api, "copy_files", mess / "a.txt", backup)
+    assert (backup / "a.txt").read_text(encoding="utf-8") == "content a"
+    assert (mess / "a.txt").read_text(encoding="utf-8") == "content a"
+    assert api.last_result_text.startswith(f"Copied 1 of 1 item(s) into {backup}: a.txt.")
+    assert _transfer(api, "copy_files", mess, backup)
+    assert _tree(backup) == ["a.txt", "mess", r"mess\a.txt", r"mess\b.txt", r"mess\c.jpg",
+                             r"mess\d.txt"]
+    assert _tree(mess) == ["a.txt", "b.txt", "c.jpg", "d.txt"]
+    assert api.last_result_text.endswith("now contains 2 item(s): a.txt (9 bytes), mess\\ (folder)")
+
+
+def test_move_and_copy_refuse_bad_input_without_changing_anything(tmp_path):
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    cases = [
+        (f"{mess}\\*.txt", "needs format: source|||destination folder"),        # no |||
+        (f"mess\\*.txt|||texts", "needs a full path"),                           # relative
+        (f"{mess}\\*.pdf|||{mess}\\pdfs", "Nothing matches"),
+        (f"{mess}\\missing.txt|||{mess}\\pdfs", "Nothing matches"),
+    ]
+    for param, why in cases:
+        for action in ("move_files", "copy_files"):
+            assert not Api._exec_sync(api, action, param)
+            assert why in api.last_result_text, (action, param)
+    assert _tree(mess) == ["a.txt", "b.txt", "c.jpg", "d.txt"]
+
+
+def test_secret_files_move_by_name_and_size_only(tmp_path):
+    api = _api_with_workspace(tmp_path)
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "keys" / ".env").write_text("API_KEY=sk-live-123", encoding="utf-8")
+    assert _transfer(api, "move_files", tmp_path / "keys" / ".env", tmp_path / "vault")
+    assert ".env (19 bytes)" in api.last_result_text
+    assert "sk-live" not in api.last_result_text and "API_KEY" not in api.last_result_text
+
+
+@pytest.mark.parametrize("action", ["move_files", "copy_files"])
+def test_move_and_copy_always_ask_and_obey_the_workspace_guard(tmp_path, action):
+    registry = ToolRegistry(db_path=str(tmp_path / "stats.db"))
+    try:
+        spec = registry.get(action)
+        assert spec.requires_confirmation and spec.destructive and not spec.reversible
+        assert registry.requires_confirmation(action, f"{tmp_path}\\new.txt|||{tmp_path}\\x")
+    finally:
+        if registry._conn:
+            registry._conn.close()
+    api = _api_with_workspace(tmp_path)
+    api._workspace_required_for_task = True        # a project task with no root yet
+    assert AgentLoop(api, None)._workspace_mutation_is_blocked(action, "a|||b")
+    question = AgentLoop(api, None)._confirmation_question(action, "a|||b")
+    assert question == f"This will run: {action}(a|||b) -- this can't easily be undone. Proceed?"
+
+
+def test_move_and_copy_log_no_names_or_paths(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("MISTAI_VERBOSE_LOGS", raising=False)
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    assert _transfer(api, "move_files", mess / "*.txt", mess / "texts")
+    assert not _transfer(api, "copy_files", mess / "texts" / "*", mess / "texts")
+    assert _transfer(api, "copy_files", mess / "c.jpg", tmp_path / "pics")
+    log = capsys.readouterr().out
+    assert log.count("[Exec] move_files(<") == 1 and log.count("[Exec] copy_files(<") == 2
+    for word in ("mess", "texts", "a.txt", "c.jpg", "pics", "content", str(tmp_path)):
+        assert word not in log, word
