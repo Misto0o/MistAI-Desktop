@@ -37,7 +37,8 @@ Scenario types (tools/scenarios.json):
 Scenario keys beyond the obvious: "needs": ["network", "browser"] SKIPs in --stub
 (a script would pass without the real page); setup {"serve_tmp": true} serves the
 scenario's tmp folder on 127.0.0.1 at "{tmp_url}" (stopped after the scenario);
-expect "file_contains": [{"path", "text", "ignore_case"}] reads the file as UTF-8.
+expect "file_contains" / "file_not_contains": [{"path", "text", "ignore_case"}] read
+the file as UTF-8 (BOM and CRLF tolerated); both fail when the file is missing.
 
 Isolation: memory/tasks/tool stats go to a fresh throwaway SQLite file per
 scenario (MISTAI_DB_PATH), and the workspace and live state are reset before
@@ -323,10 +324,11 @@ def check_desktop(expect, outcome):
     for p in expect.get("files_missing", []):
         if os.path.exists(p):
             fails.append(f"file should not exist: {p}")
-    for want in expect.get("file_contains", []):
-        fail = _file_contains_failure(want)
-        if fail:
-            fails.append(fail)
+    for key in ("file_contains", "file_not_contains"):
+        for want in expect.get(key, []):
+            fail = _file_text_failure(want, key)
+            if fail:
+                fails.append(fail)
     for s in expect.get("secret_never_logged", []):
         if s in outcome["log"] or s in str(outcome["speech"]):
             fails.append("SECRET LEAKED into the log or speech")
@@ -351,21 +353,25 @@ def check_desktop(expect, outcome):
     return fails
 
 
-def _file_contains_failure(want):
-    """file_contains entry {path, text, ignore_case?}: the file is read as
-    UTF-8 (a BOM is tolerated, CRLF counts as LF). A message, or None."""
+def _file_text_failure(want, key="file_contains"):
+    """file_contains / file_not_contains entry {path, text, ignore_case?}: the
+    file is read as UTF-8 (a BOM is tolerated, CRLF counts as LF). Both fail
+    on a missing or unreadable file. A message, or None."""
     path, text = want["path"], want["text"].replace("\r\n", "\n")
     try:
         with open(path, encoding="utf-8-sig") as f:  # text mode: \r\n -> \n
             content = f.read()
     except FileNotFoundError:
-        return f"file_contains: missing file {path}"
+        return f"{key}: missing file {path}"
     except (OSError, UnicodeDecodeError) as e:
-        return f"file_contains: could not read {path} ({type(e).__name__})"
+        return f"{key}: could not read {path} ({type(e).__name__})"
     if want.get("ignore_case"):
         content, text = content.casefold(), text.casefold()
-    if text not in content:
+    present = text in content
+    if key == "file_contains" and not present:
         return f"file_contains: {path} does not contain {want['text']!r}"
+    if key == "file_not_contains" and present:
+        return f"file_not_contains: {path} still contains {want['text']!r}"
     return None
 
 

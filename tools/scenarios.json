@@ -953,6 +953,10 @@
       "comment": "The stub proves the harness plumbing (setup, real file operations, checks), not the agent.",
       "prompt": "make a folder called project in {tmp}, put a readme.txt in it that says hello world, then tell me how many files are in it",
       "timeout": 150,
+      "answers": [
+        "yes",
+        "yes"
+      ],
       "stub": [
         [
           {
@@ -1113,13 +1117,13 @@
         {
           "write_file": {
             "path": "{tmp}\\index.html",
-            "content": "<html><head><title>Home</title></head><body><h1>Welcome</h1><p><a href=\"pricing.html\">Pricing</a></p></body></html>"
+            "content": "<html><head><title>Home</title></head><body><h1>Welcome</h1><p><a href=\"p-7f3a.html\">Pricing</a></p></body></html>"
           }
         },
         {
           "write_file": {
-            "path": "{tmp}\\pricing.html",
-            "content": "<html><head><title>Pricing</title></head><body><h1>Pricing</h1><p>Monthly plan: $12</p></body></html>"
+            "path": "{tmp}\\p-7f3a.html",
+            "content": "<html><head><title>Pricing</title></head><body><h1>Pricing</h1><p>Monthly plan: $14.99</p></body></html>"
           }
         }
       ],
@@ -1137,17 +1141,17 @@
           },
           {
             "action": "done",
-            "speech": "The monthly plan is $12."
+            "speech": "The monthly plan is $14.99."
           },
           {
             "action": "done",
-            "speech": "The monthly plan is $12."
+            "speech": "The monthly plan is $14.99."
           }
         ]
       ],
       "expect": {
         "speech_contains_any": [
-          "12"
+          "14.99"
         ]
       }
     },
@@ -1335,6 +1339,13 @@
           {
             "path": "{tmp}\\reminder.txt",
             "text": "call mom at 6",
+            "ignore_case": true
+          }
+        ],
+        "file_not_contains": [
+          {
+            "path": "{tmp}\\reminder.txt",
+            "text": "call mom at 5",
             "ignore_case": true
           }
         ]

@@ -1464,7 +1464,7 @@ def test_new_timing_lines_reach_the_live_checks_summary():
 # SCENARIO HARNESS REALISTIC TIER
 # ============================================================
 
-# --tag, the realistic tier, file_contains, the serve_tmp server and needs.
+# --tag, the realistic tier, file_contains / file_not_contains, the serve_tmp server and needs.
 
 ORIGINAL_ELEVEN_SHA256 = "885724159440fca97f2fae06f903a9353d4ff82c9e74093440ab426165a660ac"
 ORIGINAL_ELEVEN = ["edge-open", "latest-download", "env-withheld", "notepad-follow-up",
@@ -1577,6 +1577,58 @@ def test_file_contains(tmp_path):
                             _outcome()) == []
 
 
+def _not_contains(want):
+    return rs.check_desktop({"file_not_contains": [want]}, _outcome())
+
+
+def _bom_crlf_file(tmp_path):
+    (tmp_path / "r.txt").write_bytes(b"\xef\xbb\xbfCall mom at 6\r\nbuy milk")   # BOM + CRLF
+    return str(tmp_path / "r.txt")
+
+
+def test_file_not_contains_passes_when_the_text_is_absent(tmp_path):
+    path = _bom_crlf_file(tmp_path)
+    assert _not_contains({"path": path, "text": "call mom at 5"}) == []
+    assert _not_contains({"path": path, "text": "call mom at 6"}) == []      # case counts
+    assert _not_contains({"path": path, "text": "﻿Call"}) == []         # BOM is not content
+
+
+def test_file_not_contains_fails_when_the_text_is_present(tmp_path):
+    path = _bom_crlf_file(tmp_path)
+    assert _not_contains({"path": path, "text": "Call mom at 6"}) == [
+        f"file_not_contains: {path} still contains 'Call mom at 6'"]
+    assert _not_contains({"path": path, "text": "6\nbuy"}) != []             # CRLF -> LF
+    assert _not_contains({"path": path, "text": "6\r\nbuy"}) != []
+
+
+def test_file_not_contains_ignore_case(tmp_path):
+    path = _bom_crlf_file(tmp_path)
+    assert _not_contains({"path": path, "text": "CALL MOM AT 6", "ignore_case": True}) == [
+        f"file_not_contains: {path} still contains 'CALL MOM AT 6'"]
+    assert _not_contains({"path": path, "text": "CALL MOM AT 5", "ignore_case": True}) == []
+
+
+def test_file_not_contains_fails_on_a_missing_or_unreadable_file(tmp_path):
+    missing = str(tmp_path / "gone.txt")
+    assert _not_contains({"path": missing, "text": "x"}) == [
+        f"file_not_contains: missing file {missing}"]
+    (tmp_path / "bad.txt").write_bytes(b"\xff\xfe\x00not utf-8 \xc3")
+    bad = str(tmp_path / "bad.txt")
+    assert _not_contains({"path": bad, "text": "x"}) == [
+        f"file_not_contains: could not read {bad} (UnicodeDecodeError)"]
+
+
+def test_file_not_contains_combines_with_file_contains_and_any_of(tmp_path):
+    path = _bom_crlf_file(tmp_path)
+    both = {"file_contains": [{"path": path, "text": "call mom at 6", "ignore_case": True}],
+            "file_not_contains": [{"path": path, "text": "call mom at 5", "ignore_case": True}]}
+    assert rs.check_desktop(both, _outcome()) == []
+    (tmp_path / "r.txt").write_text("call mom at 5\ncall mom at 6")         # appended, not edited
+    assert rs.check_desktop(both, _outcome()) == [
+        f"file_not_contains: {path} still contains 'call mom at 5'"]
+    assert rs.check_desktop({"any_of": [both, {"files_exist": [path]}]}, _outcome()) == []
+
+
 def test_serve_dir_is_loopback_only_serves_only_its_folder_and_stops(tmp_path):
     import http.client
 
@@ -1671,3 +1723,43 @@ def test_bundled_realistic_tier_order_gates_and_stub_skips(tmp_path, monkeypatch
             assert recs[name]["failures"] == ["tagged ui_input; pass --allow-ui-input to run"]
         elif kind == "browser":
             assert recs[name]["status"] == "SKIP" and "run without --stub" in recs[name]["failures"][0]
+
+
+def test_tightened_realistic_scenarios(tmp_path):
+    by = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)[11:]}
+    assert by["rt-two-part-project"]["answers"] == ["yes", "yes"]
+    edit = by["rt-notepad-edit"]["expect"]
+    assert edit["file_contains"] == [
+        {"path": r"{tmp}\reminder.txt", "text": "call mom at 6", "ignore_case": True}]
+    assert edit["file_not_contains"] == [
+        {"path": r"{tmp}\reminder.txt", "text": "call mom at 5", "ignore_case": True}]
+
+    follow = by["rt-browser-follow-link"]
+    assert follow["expect"] == {"speech_contains_any": ["14.99"]}
+    assert "pricing.html" not in json.dumps(follow)               # the page name cannot be guessed
+    # The stub's scripted speech passes; an answer that only names the URL does not.
+    script_speech = follow["stub"][0][-1]["speech"]
+    assert rs.check_desktop(follow["expect"], _outcome(speech=script_speech)) == []
+    assert rs.check_desktop(follow["expect"], _outcome(
+        speech="I opened http://127.0.0.1:51234/index.html and the pricing page.")) != []
+
+    # Served for real: the index's "Pricing" link leads to the page with $14.99.
+    import re
+    import urllib.request
+
+    tmp = str(tmp_path)
+    server = rs.serve_dir(tmp)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}"
+        sc = rs.expand(follow, tmp, url)
+        assert rs.run_setup(sc["setup"]) is None
+        assert sc["stub"][0][0] == {"action": "browser_navigate",
+                                    "parameter": f"{url}/index.html", "speech": ""}
+        assert sc["stub"][0][1]["parameter"] == "Pricing|link"
+        index = urllib.request.urlopen(f"{url}/index.html", timeout=5).read().decode()
+        (href,) = re.findall(r'<a href="([^"]+)">Pricing</a>', index)
+        assert href == "p-7f3a.html" and "14.99" not in index
+        page = urllib.request.urlopen(f"{url}/{href}", timeout=5).read().decode()
+        assert "Monthly plan: $14.99" in page
+    finally:
+        rs.stop_server(server)
