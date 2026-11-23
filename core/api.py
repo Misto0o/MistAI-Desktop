@@ -3632,8 +3632,12 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 failed.append(f"{base} ({type(e).__name__})")
         text = (f"{done_verb} {len(done)} of {len(sources)} item(s) into {dst}: "
                 f"{', '.join(done) or 'none'}.")
+        if done and copy:
+            text += f" The originals remain in {src}; nothing was moved or removed."
+        elif done:
+            text += f" The moved item(s) are no longer in {src}."
         if failed:
-            text += f" NOT {verb.upper()}: {', '.join(failed)}."
+            text += f" NOT {verb.upper()} (still in {src}): {', '.join(failed)}."
         self.last_result_text = f"{text} {dst} now contains {self._folder_listing(dst)}"
         return not failed
 

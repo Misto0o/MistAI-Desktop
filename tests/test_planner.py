@@ -188,8 +188,99 @@ def test_command_wrappers_and_copy_overwrites_are_confirmation_worthy(command):
     assert command_is_mutating(command)
 
 
-def test_read_only_help_is_not_classified_as_mutating():
-    assert not command_is_mutating("Get-Help Remove-Item")
+def test_help_that_names_a_mutating_verb_now_asks():
+    """Changed on purpose: a verb is mutating anywhere as its own token, so a
+    command that only names one asks too (a confirmation beats a miss)."""
+    assert command_is_mutating("Get-Help Remove-Item")
+
+
+RUN4_MOVE = (r"Get-ChildItem -Path C:\t\mess -Filter *.txt | ForEach-Object "
+             r"{ Move-Item -Path $_.FullName -Destination C:\t\texts -Force }")
+
+
+@pytest.mark.parametrize("command", [
+    RUN4_MOVE,                                                      # the real run 4
+    r"Get-ChildItem C:\t | % { Remove-Item $_.FullName }",
+    r"Get-ChildItem C:\t | ForEach-Object -Process { Rename-Item $_.FullName x.bak }",
+    r"foreach ($f in Get-ChildItem C:\t) { Copy-Item $f.FullName C:\out }",
+    r"if (Test-Path C:\t) { Remove-Item C:\t -Recurse }",
+    r"Start-Job { Stop-Process -Name notepad }",
+    r"$x = $(Remove-Item C:\t\a.txt)",
+    r"(Remove-Item C:\t\a.txt)",
+    r"[IO.File]::Move('C:\t\a.txt', 'C:\t\b.txt')",
+    r"[IO.File]::Delete('C:\t\a.txt')",
+    r"[System.IO.Directory]::Delete('C:\t', $true)",
+    r"New-Object System.IO.StreamWriter 'C:\t\a.txt'",
+    r"(Get-Item C:\t\a.txt).Delete()",
+    r"Get-ChildItem C:\t | % Delete",
+    r"Get-ChildItem C:\t | ForEach-Object { $_.MoveTo('C:\x\' + $_.Name) }",
+    r"Get-Content cmds.txt | iex",
+    r"Invoke-Expression $cmd",
+    r"$c = 'Remove-Item'; & $c C:\t\a.txt",
+    r"& ('Remo' + 've-Item') C:\t\a.txt",
+    r"& 'C:\tools\cleanup.exe' /all",
+    r"Invoke-Command -ScriptBlock ([scriptblock]::Create('Remove-Item C:\t\a.txt'))",
+    r"C:\Windows\System32\robocopy.exe C:\t C:\u /MOVE",
+    r"Microsoft.PowerShell.Management\Remove-Item C:\t\a.txt",
+    r"$null = reg add HKCU\Software\X /v Y /d 1 /f",
+    r"robocopy C:\t C:\u /MOVE",
+    r"reg add HKCU\Software\X /v Y /d 1 /f",
+    r"Get-ChildItem C:\t | ForEach-Object { cmd /c del $_.FullName }",
+    r'cmd /c "del /q C:\t\*.txt"',
+])
+def test_a_verb_hidden_in_a_block_loop_or_call_is_mutating(command):
+    assert command_is_mutating(command)
+
+
+@pytest.mark.parametrize("command", [
+    r"Get-ChildItem -Path C:\t -Filter *.txt",
+    r"Get-ChildItem C:\t -Recurse | Measure-Object -Property Length -Sum",
+    r"Get-Content C:\t\a.txt | Select-String -Pattern error",
+    r"Test-Path C:\t\texts",
+    r"Get-Content C:\t\a.txt -Tail 20",
+    r"Get-ChildItem C:\t -Recurse -File | Measure-Object | Select-Object -ExpandProperty Count",
+    r"Get-ChildItem C:\t | Sort-Object Length -Descending | Select-Object -First 5 Name, Length",
+    r"Get-ChildItem C:\t | Where-Object { $_.Extension -eq '.txt' } | Format-Table Name, Length",
+    r"Get-ChildItem C:\t | ForEach-Object { $_.Name }",
+    r"(Get-ChildItem C:\t -File).Count",
+    r"Get-Process | Sort-Object CPU -Descending | Select-Object -First 5",
+    r"Get-Process notepad -ErrorAction SilentlyContinue",
+    r"Get-Date -Format 'yyyy-MM-dd'",
+    r"Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version",
+    r"Get-Service | Where-Object Status -eq Running | Select-Object -First 10",
+    r"Resolve-Path C:\t; Split-Path C:\t -Leaf; Join-Path C:\t texts",
+    r"[math]::Round((Get-PSDrive C).Free / 1GB, 1)",
+])
+def test_ordinary_read_only_pipelines_stay_read_only(command):
+    assert not command_is_mutating(command)
+
+
+@pytest.mark.parametrize("command, mutating", [
+    # A verb only inside a longer word or file name never counts.
+    (r"Get-Content C:\t\copyright.txt -TotalCount 5", False),
+    (r"Get-ChildItem C:\t\removed -Recurse | Measure-Object", False),
+    (r"Get-Item 'C:\t\report-copy.docx'", False),
+    (r"Select-String -Path C:\t\notes.txt -Pattern 'files were moved'", False),
+    # A verb that is a whole word in a quoted string or a path segment asks:
+    # PowerShell can run strings (&, iex, Start-Process, scriptblock::Create).
+    (r"Select-String -Path C:\t\notes.txt -Pattern 'please move the files'", True),
+    (r"Get-Item 'C:\t\copy of report.docx'", True),
+    (r"Write-Output 'Remove-Item C:\t\a.txt'", True),
+    # Any .NET System.IO call asks, the read-only [IO.Path] ones too.
+    (r"[IO.Path]::GetExtension('C:\t\a.txt')", True),
+])
+def test_quoted_text_and_file_names_prefer_a_confirmation(command, mutating):
+    assert command_is_mutating(command) is mutating
+
+
+def test_the_run4_move_now_asks_before_it_runs(tmp_path):
+    registry = ToolRegistry(db_path=str(tmp_path / "memory.db"))
+    try:
+        assert registry.requires_confirmation("run_command", RUN4_MOVE)
+        assert not registry.requires_confirmation("run_command", r"Get-ChildItem C:\t\texts")
+    finally:
+        if registry._conn:
+            registry._conn.close()
 
 
 def test_manual_send_and_close_shortcuts_are_confirmation_worthy(tmp_path):

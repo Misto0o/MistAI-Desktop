@@ -1488,6 +1488,28 @@ def test_copy_files_copies_files_and_folders_and_leaves_the_source(tmp_path):
     assert api.last_result_text.endswith("now contains 2 item(s): a.txt (9 bytes), mess\\ (folder)")
 
 
+def test_results_say_plainly_where_the_originals_are(tmp_path):
+    """copy_files: the originals remain and nothing was moved or removed;
+    move_files: the moved items are no longer in the source. Both true on disk."""
+    api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
+    assert _transfer(api, "copy_files", mess / "*.txt", tmp_path / "backup")
+    copied = api.last_result_text
+    assert (f"The originals remain in {mess / '*.txt'}; nothing was moved or removed."
+            in copied)
+    assert "no longer in" not in copied
+    assert sorted(p.name for p in mess.glob("*.txt")) == ["a.txt", "b.txt", "d.txt"]
+
+    assert _transfer(api, "move_files", mess / "*.txt", mess / "texts")
+    moved = api.last_result_text
+    assert f"The moved item(s) are no longer in {mess / '*.txt'}." in moved
+    assert "originals remain" not in moved
+    assert not list(mess.glob("*.txt"))
+    # A refusal changes nothing, so it claims neither.
+    assert not _transfer(api, "move_files", tmp_path / "backup" / "a.txt", mess / "texts")
+    assert "no longer in" not in api.last_result_text
+    assert "originals remain" not in api.last_result_text
+
+
 def test_move_and_copy_refuse_bad_input_without_changing_anything(tmp_path):
     api, mess = _api_with_workspace(tmp_path), _mess(tmp_path)
     cases = [

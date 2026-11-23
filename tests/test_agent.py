@@ -466,6 +466,21 @@ def test_a_move_followed_by_a_read_only_check_costs_no_extra_call(monkeypatch, o
     assert not any("Before finishing" in o for o in obs)
 
 
+def test_the_run4_script_block_move_now_gets_the_reminder(monkeypatch, capsys):
+    """Run 4's move hid Move-Item in a ForEach-Object block: it counted as read-only,
+    so no question and no reminder. Now it is a state change no later read observed."""
+    run4 = (r"Get-ChildItem -Path C:\t\mess -Filter *.txt | ForEach-Object "
+            r"{ Move-Item -Path $_.FullName -Destination C:\t\texts -Force }")
+    out, _, _, obs, _ = _input_repeat_and_done_check_run(monkeypatch, [
+        {"action": "run_command", "parameter": run4},
+        MOVED_DONE, MOVED_DONE,
+    ], task="put all the txt files in C:\\t\\mess into a folder called texts")
+    assert out["success"]
+    assert sum("A command that changes state ran and nothing since has checked" in o
+               for o in obs) == 1
+    assert "[DoneCheck] reminder sent (unobserved command)" in capsys.readouterr().out
+
+
 def test_only_a_successful_check_after_the_last_change_counts(monkeypatch):
     listing = {"action": "run_command", "parameter": "Get-ChildItem 'C:\\t\\mess'"}
     # A listing before the change does not observe it.

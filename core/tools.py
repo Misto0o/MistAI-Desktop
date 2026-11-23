@@ -21,10 +21,10 @@ import sqlite3
 import threading
 from dataclasses import dataclass, field
 
-# PowerShell/cmd verbs that destroy or overwrite data. These are matched only
-# where PowerShell expects a command (start of a statement or after a pipe),
-# rather than anywhere in the string: `Get-Help Remove-Item` is read-only and
-# must not prompt merely because it mentions a destructive command.
+# PowerShell/cmd verbs that destroy or overwrite data. They count ANYWHERE in a
+# command as a whole token (see command_is_mutating): inside { } script blocks,
+# ( ) and $( ) sub-expressions, loops and quoted strings, which PowerShell can
+# run as well. A confirmation beats a miss, so `Get-Help Remove-Item` asks too.
 # Aliases matter too -- `ri` IS Remove-Item.
 MUTATING_COMMAND_VERBS = (
     # delete
@@ -73,19 +73,26 @@ MUTATING_COMMAND_VERBS = (
     "stop-service",
 )
 
-_MUTATING_COMMAND_RX = re.compile(
-    r"(?:^|[;|&\r\n])\s*(?:&\s*)?(?:\{\s*)?("
-    + "|".join(re.escape(v) for v in MUTATING_COMMAND_VERBS)
-    + r")(?![\w-])(?=\s|$|[;|&])",
-    re.IGNORECASE,
-)
+_MUTATING_VERB_SET = frozenset(MUTATING_COMMAND_VERBS)
+_DYNAMIC_EVAL_TOKENS = frozenset({"invoke-expression", "iex"})
+# A token ends at whitespace or a PowerShell/cmd operator or quote character.
+_TOKEN_END_RX = re.compile(r"[\s;|&(){}\[\],=+'\"`<>@$!]+")
+_PATH_SEP_RX = re.compile(r"[\\/]")
+_PROGRAM_EXT_RX = re.compile(r"\.(?:exe|com|bat|cmd)$")
 _REG_MUTATING_RX = re.compile(
-    r"(?:^|[;|&\r\n])\s*reg(?:\.exe)?\s+"
-    r"(?:add|delete|restore|load|unload|save)(?:\s|$)",
+    r"(?<![\w-])reg(?:\.exe)?\s+(?:add|delete|restore|load|unload|save)(?![\w-])",
     re.IGNORECASE,
 )
-_DYNAMIC_EVAL_RX = re.compile(
-    r"(?:^|[;|&\r\n])\s*(?:invoke-expression|iex)(?:\s|$)",
+# & applied to a string, a variable or an expression (what it runs is only known at
+# run time); `& { ... }` script blocks are scanned like any other text.
+_CALL_ON_VALUE_RX = re.compile(r"(?<!&)&\s*['\"$(]")
+# .NET file-system calls: [IO.File]::Move, [System.IO.Directory]::Delete,
+# New-Object System.IO.StreamWriter, and FileSystemInfo mutators on an object
+# ((Get-Item x).Delete(), $_.MoveTo(...), `% Delete`).
+_DOTNET_IO_RX = re.compile(r"\[\s*(?:system\s*\.\s*)?io\s*\.|(?<![\w.])system\.io\.", re.IGNORECASE)
+_FS_MUTATOR_RX = re.compile(
+    r"(?:\.|(?:^|[\s;|{(])(?:%|foreach-object)\s+(?:-membername\s+)?)"
+    r"(?:delete|moveto|copyto)(?![\w-])",
     re.IGNORECASE,
 )
 _CMD_WRAPPER_RX = re.compile(
@@ -96,12 +103,6 @@ _POWERSHELL_WRAPPER_RX = re.compile(
     r"(?:^|[;|&\r\n])\s*(?:powershell|pwsh)(?:\.exe)?\b.*?"
     r"\s-(?:command|c)\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
-)
-_QUOTED_INVOKE_RX = re.compile(
-    r"(?:^|[;|&\r\n])\s*&\s*['\"]\s*(?:"
-    + "|".join(re.escape(v) for v in MUTATING_COMMAND_VERBS)
-    + r")\s*['\"](?=\s|$|[;|&])",
-    re.IGNORECASE,
 )
 _DANGEROUS_CLICK_TEXT_RX = re.compile(
     r"\b(send|submit|post|publish|buy|purchase|pay|place\s+order|"
@@ -162,23 +163,38 @@ def _strip_outer_quotes(text):
     return text
 
 
-def command_is_mutating(command, _depth=0):
-    """Whether a shell command can overwrite, destroy, or alter state.
+def _command_tokens(text):
+    """Lower-cased tokens of a command, quotes and comments included. A path
+    token is reduced to its last segment and a program extension is dropped,
+    so C:\\Windows\\System32\\robocopy.exe and Microsoft.PowerShell.Management\\
+    Remove-Item count; a verb only inside a longer word or file name
+    (copyright.txt, Format-Table, report-copy.docx) never does."""
+    for tok in _TOKEN_END_RX.split(text.lower()):
+        if tok:
+            yield _PROGRAM_EXT_RX.sub("", _PATH_SEP_RX.split(tok)[-1])
 
-    This is intentionally conservative for actual executable statements, but
-    it avoids flagging read-only help/search commands that merely *mention* a
-    destructive verb. File redirection is state-changing even when its source
-    command is read-only (``Get-Date > status.txt``), so it is handled too.
+
+def command_is_mutating(command, _depth=0):
+    """Whether a shell command can overwrite, destroy, or alter state. Fails
+    closed with one scan of the whole text (no PowerShell parser): mutating if a
+    known verb is any token anywhere (script blocks, sub-expressions, loops and
+    quoted strings included, since PowerShell can run those), iex/Invoke-Expression
+    is used, & is applied to a string/variable/expression, a .NET System.IO call
+    or FileSystemInfo mutator appears, `reg add|delete|...` runs, or output is
+    redirected outside quotes (``Get-Date > status.txt``). A command made only of
+    read-only verbs and arguments stays read-only.
     """
     raw = str(command or "")
-    source = _outside_quotes(raw)
-    if ">" in source:
+    if ">" in _outside_quotes(raw):
         return True
+    for tok in _command_tokens(raw):
+        if tok in _MUTATING_VERB_SET or tok in _DYNAMIC_EVAL_TOKENS:
+            return True
     if (
-        _MUTATING_COMMAND_RX.search(source)
-        or _REG_MUTATING_RX.search(source)
-        or _DYNAMIC_EVAL_RX.search(source)
-        or _QUOTED_INVOKE_RX.search(raw)
+        _REG_MUTATING_RX.search(raw)
+        or _CALL_ON_VALUE_RX.search(raw)
+        or _DOTNET_IO_RX.search(raw)
+        or _FS_MUTATOR_RX.search(raw)
     ):
         return True
 
