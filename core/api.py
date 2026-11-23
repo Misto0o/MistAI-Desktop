@@ -4146,6 +4146,20 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         return "typed into the input target" if sent else "NOT SENT (the input target is not in front)"
 
     def _act_press_key(self, param):
+        # pyautogui.press ignores a name it does not know ("ctrl+s") and sends
+        # nothing, so the step used to report success with no key pressed.
+        # Refuse it instead; a combo is NOT forwarded to hotkey, whose
+        # confirmation list press_key's gate does not check.
+        key = str(param or "").strip()
+        known = getattr(pyautogui, "KEYBOARD_KEYS", None)
+        if known is not None and len(key) > 1 and key.lower() not in known:
+            combo = len(key) > 1 and "+" in key
+            self.last_result_text = (
+                f"NOT SENT: press_key presses ONE key; '{key[:30]}' "
+                + (f"is a key combination. Use hotkey('{key[:30]}')." if combo
+                   else "is not a key name (e.g. enter, tab, esc, f5, a).")
+                + " Nothing was pressed.")
+            return False
         report, on_target = self._ensure_input_target(f"key '{param}'")
         self.last_result_text = report
         if not on_target:

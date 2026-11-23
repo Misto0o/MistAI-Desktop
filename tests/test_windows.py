@@ -272,6 +272,29 @@ def test_no_known_target_does_not_interfere(monkeypatch, action, param):
     assert "NOT SENT" not in api.last_result_text
 
 
+@pytest.mark.parametrize("param, hint", [
+    ("ctrl+s", "is a key combination. Use hotkey('ctrl+s')."),
+    ("Ctrl+Shift+S", "is a key combination. Use hotkey('Ctrl+Shift+S')."),
+    ("page down", "is not a key name"),
+    ("savefile", "is not a key name"),
+])
+def test_press_key_refuses_a_combo_or_unknown_name_and_sends_nothing(monkeypatch, param, hint):
+    """pyautogui.press ignores names it does not know: rt-notepad-save's
+    press_key('ctrl+s') pressed nothing and reported success."""
+    api, events = _input_api(monkeypatch, "notepad", 20)
+    assert Api._exec_sync(api, "press_key", param) is False
+    assert api.last_result_text.startswith("NOT SENT: press_key presses ONE key;")
+    assert hint in api.last_result_text and "Nothing was pressed." in api.last_result_text
+    assert events == []
+
+
+@pytest.mark.parametrize("param", ["+", "A", "a", "Enter", "esc", "f5", "pagedown", "tab"])
+def test_press_key_still_presses_real_keys(monkeypatch, param):
+    api, events = _input_api(monkeypatch, "notepad", 20)
+    assert Api._exec_sync(api, "press_key", param) is True
+    assert events == [param]
+
+
 def test_failed_switch_app_still_records_the_intended_target(monkeypatch):
     api, events = _input_api(monkeypatch, None, 21)
     assert Api._exec_sync(api, "switch_app", "Notepad") is False

@@ -25,6 +25,7 @@ from .config import (
     BATCH_MAX_STEPS,
     BATCHABLE_ACTIONS,
     batch_steps_enabled,
+    opens_dialog,
     confirm_listen_profile,
     confirmation_answer,
     credential_failure_reason,
@@ -583,6 +584,50 @@ class AgentLoop:
             return (hwnd, win32gui.GetWindowText(hwnd))
         except Exception:
             return self._foreground_key(getattr(self.api.live, "snapshot", {}) or {})
+
+    # After a dialog key: up to this many short waits for the window in front
+    # to change (a file dialog can take a moment to appear).
+    WINDOW_CHECK_POLLS = 6
+    WINDOW_CHECK_WAIT_S = 0.15
+
+    @staticmethod
+    def _unsaved_title(title):
+        """The title carries an unsaved-changes marker ('*name - App', 'name*',
+        '● name')."""
+        t = str(title or "").strip()
+        return t.startswith(("*", "●", "•")) or t.endswith("*")
+
+    def _window_check(self, before):
+        """The WINDOW CHECK note after a key that usually opens a dialog: from
+        the window in front before and after it (no model call, no screen read).
+        Logs a fixed label only (titles are content)."""
+        after = before
+        for _ in range(self.WINDOW_CHECK_POLLS):
+            after = self._current_foreground_key()
+            if after[0] and after != before:
+                break
+            time.sleep(self.WINDOW_CHECK_WAIT_S)
+        hwnd, title = after
+        if not hwnd:
+            print("  [WindowCheck] after a dialog key: unknown")
+            return ""
+        shown = (title or "(untitled window)")[:60]
+        if hwnd != before[0]:
+            print("  [WindowCheck] after a dialog key: new window")
+            return (f"WINDOW CHECK: a new window or dialog is in front now ('{shown}'). "
+                    "Read it before typing into it.")
+        if title != before[1]:
+            print("  [WindowCheck] after a dialog key: title changed")
+            return (f"WINDOW CHECK: no new window or dialog appeared; the same window's title "
+                    f"changed to '{shown}'.")
+        unsaved = self._unsaved_title(title)
+        print("  [WindowCheck] after a dialog key: nothing appeared"
+              f" (unsaved marker: {'yes' if unsaved else 'no'})")
+        return ("WINDOW CHECK: no new window or dialog appeared; "
+                f"'{shown}' is still in front."
+                + (" Its title still shows unsaved changes, so the shortcut may not have "
+                   "taken effect." if unsaved else "")
+                + " Do not type a file name or path now: it would go into this window.")
 
     _NUMBER_RX = re.compile(r"\d+(?:[.,]\d+)*")
 
@@ -1521,6 +1566,9 @@ class AgentLoop:
                 self.api.caption_window.show_action(action, str(param)[:50], 4)
 
             self._publish_step(action)
+            # A key that usually opens a dialog: the window in front before it,
+            # for the WINDOW CHECK in its observation.
+            fg_before = self._current_foreground_key() if opens_dialog(action, param) else None
             t0 = time.monotonic()
             if deferred_send is not None:
                 self.api._send_confirm = deferred_send["hook"]
@@ -1666,6 +1714,11 @@ class AgentLoop:
                 if cred:
                     print(f"[AgentLoop] Credential hint: {cred}")
                     obs += f" {CREDENTIAL_NOTE}"
+            if (fg_before and success and opens_dialog(executed_action, executed_param)
+                    and not str(result_text or "").startswith("NOT SENT")):
+                window_check = self._window_check(fg_before)
+                if window_check:
+                    obs += f" {window_check}"
             if format_note:
                 obs += f" {format_note}"
             if action in SPECS and arg_problem(action, param):
@@ -2007,13 +2060,18 @@ class AgentLoop:
             known_folders = "unavailable"
 
         batching = batch_steps_enabled()
+        dialog_keys = "a key that opens a dialog (save, open, print, menus)"
         loop_rule = (
             "- You work in a LOOP: reply, then observe the result. A predictable input "
             "sequence (e.g. type, then Enter) goes in ONE reply as the steps form below "
-            "(no reads, no done); it stops at the first failure or question."
+            f"(no reads, no done); it stops at the first failure or question and after {dialog_keys}. "
+            "After such a key"
             if batching else
             "- You work in a LOOP. Each iteration, analyze the screen and decide exactly ONE "
-            "action. Observe the result before proceeding.")
+            f"action. Observe the result before proceeding. After {dialog_keys}"
+        ) + (", read the screen; type into a dialog only once an observation says one "
+             "appeared, never a file path into the document; to save under a name the user "
+             "gave, prefer the dialog's file-name box.")
         submit_hint = " (both in one steps reply)" if batching else ""
         response_format = (
             '{"thinking":"one short sentence","action":"...","parameter":"...","speech":""}'
@@ -2052,9 +2110,9 @@ OPERATING RULES:
 - "done" is the ONLY way to end a task (there is no "none" action). Its speech is the only thing the user hears or sees: when the task asked for information it must contain the answer; leave it empty only for a pure action.
 
 DO NOT SECOND-GUESS COMPLETED ACTIONS:
-- An action reported as 'succeeded' DID happen (browser_click raises a real error on failure, it never silently clicks the wrong thing). Do not re-run it "to be sure" or follow it with a screen read just to confirm it: that wastes steps and, on toggles (Subscribe, Like, Save, mute, checkboxes), a second click UNDOES the first. If the screen looks unchanged, the page updated out of view or is slow: move on. Re-attempt only what reported FAILED or VERIFY-CONTRADICTED. Before clicking a toggle, check its current state (e.g. browser_get_text on the button); if it is already set, call done and say so.
+- An action reported as 'succeeded' DID happen (browser_click raises a real error on failure). Do not re-run it "to be sure" or follow it with a screen read just to confirm it: that wastes steps and, on toggles (Subscribe, Like, Save, mute, checkboxes), a second click UNDOES the first. If a page looks unchanged, it updated out of view or is slow: move on. Re-attempt only what reported FAILED or VERIFY-CONTRADICTED. Before clicking a toggle, check its current state (e.g. browser_get_text on the button); if it is already set, call done and say so.
 - read_screen_text is for information you don't have that is VISIBLE on screen (a header, an error, a value), not a success-checker. Facts about the machine (running apps, processes, files) come from the Open apps list or commands like Get-Process / Test-Path, never from read_screen_text or analyze_screen. The Open apps list outranks the screen description for which apps are running: if an app isn't listed, don't assume it's open; use open_app. Open apps lists tracked apps only: confirm absence with Get-Process; for lookups that may legitimately find nothing (Get-Process, Get-Item, Get-ChildItem on a path) add -ErrorAction SilentlyContinue, so "not found" is an empty result instead of a failed command. "(background)" means running with no window, so use open_app, not switch_app.
-- If browser_click/browser_fill raises an error, read the page with browser_get_text before retrying. If two different approaches to the same target have both failed, stop trying variations -- use ask_user.
+- If browser_click/browser_fill raises an error, read the page with browser_get_text before retrying. If two different approaches to the same target, or two tries of the same key sequence, have failed, stop trying variations: use ask_user or say so in done.
 
 MESSAGING A SPECIFIC PERSON (required flow):
 1. ALWAYS try `quick_message("app|recipient|message")` first. The recipient and the message must both come from the user's words; if either is missing, or the recipient is ambiguous (could match multiple people, or you have no idea who they are/if they exist), use ask_user FIRST -- never call quick_message with a guessed recipient or an empty or guessed message.
@@ -2087,10 +2145,11 @@ RESPONSE FORMAT (JSON ONLY):
         "Otherwise reply with ONE action: "
         '{{"thinking":"...","action":"...","parameter":"...","speech":""}}')
     BATCH_DROP_NOTE = (
-        "[OBSERVATION] These steps of your list were NOT run ({why}): {left}. A steps list "
-        "may hold only " + _BATCH_SET + "; every other action (run_command, file, browser, "
-        "read actions, done, ask_user) takes one reply of its own. Decide the next step "
-        "from the current state.")
+        "[OBSERVATION] These steps of your list were NOT run ({why}): {left}.{rule} Decide "
+        "the next step from the current state.")
+    BATCH_RULE = (
+        " A steps list may hold only " + _BATCH_SET + "; every other action (run_command, "
+        "file, browser, read actions, done, ask_user) takes one reply of its own.")
     # Content-free reason labels (logged) -> what the model is told.
     BATCH_REASONS = {
         "not-json": "the reply was not valid JSON",
@@ -2101,6 +2160,8 @@ RESPONSE FORMAT (JSON ONLY):
         "bad-parameter": "a step's parameter was not plain text",
         "non-batchable-action": "'{action}' cannot share a reply with other steps",
         "mixed-form": "the reply had both a top-level action and a steps list",
+        "dialog-key": ("'{action}' usually opens a dialog or a new window, so run these "
+                       "after seeing the screen"),
     }
 
     @classmethod
@@ -2164,6 +2225,9 @@ RESPONSE FORMAT (JSON ONLY):
                 break
             param = st.get("parameter", "")
             prefix.append({"action": action, "parameter": "" if param is None else param})
+            if opens_dialog(action, param) and len(prefix) < len(steps):
+                stop = ("dialog-key", f"{action}('{str(param)[:20]}')")
+                break
 
         if len(prefix) >= 2:
             first = dict(prefix[0], thinking=obj.get("thinking", ""), speech="")
@@ -2181,13 +2245,15 @@ RESPONSE FORMAT (JSON ONLY):
         dropped = steps[len(prefix):]
         if dropped:
             log, why = cls._batch_reason(*stop)
-            print(f"  [Batch] malformed steps list ({log}) -- running {len(prefix)} of "
-                  f"{len(steps)} steps")
+            cut = stop[0] == "dialog-key"
+            print(f"  [Batch] {'cut after a dialog key' if cut else f'malformed steps list ({log})'}"
+                  f" -- running {len(prefix)} of {len(steps)} steps")
             left = ", ".join(
                 (f"{s.get('action')}({str(s.get('parameter', ''))[:40]})"
                  if isinstance(s, dict) else "(not a step)")
                 for s in dropped)
-            first["_batch_note"] = cls.BATCH_DROP_NOTE.format(why=why, left=left)
+            first["_batch_note"] = cls.BATCH_DROP_NOTE.format(
+                why=why, left=left, rule="" if cut else cls.BATCH_RULE)
         return first
 
     def _parse_cmd(self, raw):

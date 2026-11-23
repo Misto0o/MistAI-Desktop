@@ -625,7 +625,7 @@ _PLAYBOOK = {
         "text with the app's submit key."),
     "type_search": ("Type text and press Enter", "text"),
     "hotkey": ("Press a key combo", "ctrl+t"),
-    "press_key": ("Press one key", "key"),
+    "press_key": ("Press one key (a combo is hotkey)", "key"),
     "scroll": ("Scroll the window", "up or down"),
     "quick_message": (
         "Send a message to a named person (try this first)", "app|recipient|message",

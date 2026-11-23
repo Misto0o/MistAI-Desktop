@@ -535,6 +535,30 @@ def lazy_vision_mode():
 BATCHABLE_ACTIONS = frozenset({"open_app", "switch_app", "type_text", "press_key", "hotkey"})
 BATCH_MAX_STEPS = 4
 
+# Key combos that usually open a dialog or a new window (save / save as, open,
+# print, new window, F12-style save-as, the menu keys; also any alt+<letter>
+# menu): a batch ends after one, and its observation says whether a window
+# appeared. Keys, not apps: what follows depends on what is on screen.
+DIALOG_KEYS = frozenset({
+    "ctrl+s", "ctrl+shift+s", "ctrl+o", "ctrl+p", "ctrl+n", "ctrl+shift+n",
+    "f12", "alt", "f10",
+})
+
+
+def normalized_keys(param):
+    """'Ctrl + S' -> 'ctrl+s' ('+' alone stays the plus key)."""
+    text = str(param or "").strip().lower()
+    parts = [p.strip() for p in text.split("+") if p.strip()]
+    return "+".join(parts) if parts else text
+
+
+def opens_dialog(action, param):
+    """Whether a press_key/hotkey step is a DIALOG_KEYS combo or alt+<letter>."""
+    if action not in ("press_key", "hotkey"):
+        return False
+    keys = normalized_keys(param)
+    return keys in DIALOG_KEYS or bool(re.fullmatch(r"alt\+[a-z]", keys))
+
 
 def single_shot_enabled():
     """MISTAI_SINGLE_SHOT (default off): the router also says whether a task

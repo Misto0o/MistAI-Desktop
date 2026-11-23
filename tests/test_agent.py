@@ -1138,7 +1138,9 @@ def batch(*steps, **extra):
 # ============================================================
 
 def _batched_steps_run(monkeypatch, tmp_path, replies, answers=(), fail=(), enter_safe=False,
-         in_front=lambda app: True, on_run=None):
+         in_front=lambda app: True, on_run=None, foreground=((1, "Notepad"),)):
+    """``foreground``: the (hwnd, title) values the window in front takes, one
+    per read; the last one repeats."""
     replies = iter(json.dumps(r) if isinstance(r, dict) else r for r in replies)
     answers = list(answers)
     rec = SimpleNamespace(calls=[], asked=[], requests=[], reads=[], steps=[])
@@ -1195,7 +1197,14 @@ def _batched_steps_run(monkeypatch, tmp_path, replies, answers=(), fail=(), ente
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context",
                         lambda *a, **k: rec.reads.append(1) or "screen")
-    monkeypatch.setattr(loop, "_current_foreground_key", lambda: (1, "Notepad"))
+    fg_values = list(foreground)
+    rec.fg_reads = 0
+
+    def fg():
+        rec.fg_reads += 1
+        return fg_values.pop(0) if len(fg_values) > 1 else fg_values[0]
+
+    monkeypatch.setattr(loop, "_current_foreground_key", fg)
     rec.result = loop._loop("do it", "m", "none", "text",
                             lambda n, a, p, s: rec.steps.append((n, a)))
     api.tools._conn and api.tools._conn.close()
@@ -1341,6 +1350,103 @@ class TestBatchedSteps:
         log = capsys.readouterr().out
         assert f"[Batch] malformed steps list ({label}) -- running {len(ran)} of" in log
         assert "parse retry" not in log
+
+    @pytest.mark.parametrize("reply, ran, dropped", [
+        # The real rt-notepad-save batch: the path must never be typed blind.
+        (batch(("type_text", "milk"), ("hotkey", "ctrl+s"), ("type_text", r"C:\t\g.txt"),
+               ("press_key", "enter")),
+         [("type_text", "milk"), ("hotkey", "ctrl+s")], r"type_text(C:\t\g.txt), press_key(enter)"),
+        (batch(("hotkey", "Ctrl + Shift + S"), ("type_text", "x")),       # first step: alone
+         [("hotkey", "Ctrl + Shift + S")], "type_text(x)"),
+        (batch(("press_key", "alt"), ("press_key", "f")),                 # a menu key
+         [("press_key", "alt")], "press_key(f)"),
+        (batch(("type_text", "x"), ("hotkey", "alt+f"), ("press_key", "a")),
+         [("type_text", "x"), ("hotkey", "alt+f")], "press_key(a)"),
+    ])
+    def test_a_dialog_key_ends_its_batch(self, monkeypatch, tmp_path, capsys, reply, ran, dropped):
+        rec = _batched_steps_run(monkeypatch, tmp_path, [reply, BATCHED_STEPS_DONE])
+        assert rec.calls == ran
+        assert len(rec.requests) == 2
+        note = _batched_steps_observations(rec)[-1]
+        assert note.startswith("[OBSERVATION] These steps of your list were NOT run (")
+        assert "usually opens a dialog or a new window, so run these after seeing the screen" in note
+        assert dropped in note and "one reply of its own" not in note
+        log = capsys.readouterr().out
+        assert f"[Batch] cut after a dialog key -- running {len(ran)} of" in log
+        assert "malformed" not in log
+
+    @pytest.mark.parametrize("foreground, says, label", [
+        # The Save As dialog appears (after one wait): its own window.
+        ([(1, "*milk - Notepad"), (1, "*milk - Notepad"), (7, "Save As")],
+         "WINDOW CHECK: a new window or dialog is in front now ('Save As'). Read it before "
+         "typing into it.", "new window"),
+        # Saved in place: the same window, its unsaved marker gone.
+        ([(1, "*milk - Notepad"), (1, "milk - Notepad")],
+         "WINDOW CHECK: no new window or dialog appeared; the same window's title changed to "
+         "'milk - Notepad'.", "title changed"),
+        # rt-notepad-save: nothing happened and the document is still unsaved.
+        ([(1, "*milk - Notepad")],
+         "WINDOW CHECK: no new window or dialog appeared; '*milk - Notepad' is still in front. "
+         "Its title still shows unsaved changes, so the shortcut may not have taken effect. "
+         "Do not type a file name or path now: it would go into this window.",
+         "nothing appeared (unsaved marker: yes)"),
+        ([(1, "Report - Word")],
+         "WINDOW CHECK: no new window or dialog appeared; 'Report - Word' is still in front. "
+         "Do not type a file name or path now: it would go into this window.",
+         "nothing appeared (unsaved marker: no)"),
+    ])
+    def test_a_dialog_key_observation_says_whether_a_window_appeared(
+            self, monkeypatch, tmp_path, capsys, foreground, says, label):
+        rec = _batched_steps_run(monkeypatch, tmp_path,
+                                 [{"action": "hotkey", "parameter": "ctrl+s"}, BATCHED_STEPS_DONE],
+                                 foreground=foreground)
+        assert rec.calls == [("hotkey", "ctrl+s")]
+        assert len(rec.requests) == 2                  # no extra model call
+        assert rec.reads == [1, 1]                     # no extra screen read
+        obs = _batched_steps_observations(rec)[-1]
+        assert says in obs and obs.count("WINDOW CHECK") == 1
+        if "may not have taken effect" not in says:
+            assert "may not have taken effect" not in obs
+        log = capsys.readouterr().out
+        assert f"[WindowCheck] after a dialog key: {label}" in log
+        for title in ("Save As", "milk", "Report"):  # titles are content
+            assert title not in log
+
+    @pytest.mark.parametrize("cmd, ok", [
+        ({"action": "hotkey", "parameter": "ctrl+a"}, True),    # not a dialog key
+        ({"action": "press_key", "parameter": "tab"}, True),
+        ({"action": "hotkey", "parameter": "ctrl+s"}, False),   # the key failed
+    ])
+    def test_no_window_check_for_other_keys_or_a_failed_key(self, monkeypatch, tmp_path, capsys, cmd, ok):
+        fail = () if ok else ((cmd["action"], cmd["parameter"]),)
+        rec = _batched_steps_run(monkeypatch, tmp_path, [cmd, BATCHED_STEPS_DONE], fail=fail,
+                                 foreground=[(1, "*milk - Notepad")])
+        assert "WINDOW CHECK" not in _batched_steps_observations(rec)[-1]
+        assert "[WindowCheck]" not in capsys.readouterr().out
+
+    def test_dialog_keys_are_a_small_key_set_not_apps(self):
+        from core.config import opens_dialog
+        for action, key in [("hotkey", "ctrl+s"), ("hotkey", "CTRL + SHIFT + S"), ("hotkey", "ctrl+o"),
+                            ("hotkey", "ctrl+p"), ("hotkey", "ctrl+n"), ("press_key", "f12"),
+                            ("press_key", "alt"), ("press_key", "F10"), ("hotkey", "alt+e")]:
+            assert opens_dialog(action, key), key
+        for action, key in [("hotkey", "ctrl+a"), ("hotkey", "ctrl+f"), ("hotkey", "alt+tab"),
+                            ("hotkey", "alt+f4"), ("press_key", "enter"), ("press_key", "+"),
+                            ("type_text", "ctrl+s"), ("browser_press_key", "ctrl+s")]:
+            assert not opens_dialog(action, key), key
+
+    @pytest.mark.parametrize("steps", [
+        (("hotkey", "ctrl+s"),),                                          # last step: no cut
+        (("type_text", "x"), ("hotkey", "ctrl+a"), ("press_key", "delete")),
+        (("hotkey", "ctrl+f"), ("type_text", "word"), ("press_key", "enter")),
+        (("press_key", "tab"), ("hotkey", "alt+tab"), ("type_text", "y")),
+    ])
+    def test_other_keys_and_a_final_dialog_key_keep_the_batch(self, monkeypatch, tmp_path, capsys, steps):
+        reply = batch(("open_app", "notepad"), *steps)
+        rec = _batched_steps_run(monkeypatch, tmp_path, [reply, BATCHED_STEPS_DONE],
+                                 answers=["yes"])
+        assert rec.calls == [("open_app", "notepad"), *steps]
+        assert "cut after a dialog key" not in capsys.readouterr().out
 
     def test_a_list_starting_with_run_command_runs_it_alone(self, monkeypatch, tmp_path, capsys):
         reply = batch(("run_command", "Get-Date"), ("open_app", "notepad"), ("type_text", "hi"))
@@ -1737,6 +1843,20 @@ def test_plan_prompt_plans_only_what_remains_and_only_what_was_asked():
     planner._PLAN_PROMPT.format(goal="g", max_nodes=4, workspace="w")
 
 
+def test_plan_prompt_keeps_earlier_content_on_a_follow_up_edit():
+    """The planner never sees the conversation: "actually make that 6 and save it"
+    must not become a phase that saves only "6". Said once, merged into the
+    existing "Each desc" rule (no new rule line, no phrase list)."""
+    prompt = planner._PLAN_PROMPT
+    (rule,) = [l for l in prompt.split("\n") if l.startswith("- Each desc names its OWN deliverable")]
+    for phrase in ('keep the goal\'s own words for what it refers back to ("that", "it")',
+                   "the agent sees the recent conversation and you do not",
+                   'an edit to earlier content ("make that 6") keeps that content, never '
+                   "replaces it with only the new value"):
+        assert prompt.count(phrase) == 1 and phrase in rule, phrase
+    assert prompt.count("\n- ") == 7                 # still seven rules
+
+
 def test_file_changes_rule_is_merged_into_paths_once():
     """Moves and copies go to move_files / copy_files; destination first, no
     overwrite flags unless asked, and a separate listing after any other
@@ -2039,14 +2159,17 @@ STATES = {
 # merged into PATHS AND FILES (destination folder first, no overwrite flags unless
 # asked, a separate read-only listing after a file-changing command), then for the
 # move_files / copy_files menu lines, then for PATHS AND FILES sending moves and
-# copies to them (the listing advice kept for other file changes).
+# copies to them (the listing advice kept for other file changes), then for the
+# dialog-key guidance merged into the LOOP rule, "two tries of the same key
+# sequence" merged into the two-approaches rule, press_key's menu line naming
+# hotkey for combos, and two sentences of the succeeded-actions rule tightened.
 PROMPT_HASHES = {
-    "plain": "d93de971844b5c4ec9fc89f4a8c5ea89097a2ef651968749e0cf39f18882dd0b",
-    "project": "78e68d936366ebbc56cdfbcad5cbaab4f13922af7205ec17cfb730711e7278b2",
-    "long-screen": "1d1d7344422163e7f3ba88f0de2bc5abe1e53a4dbaa69323d50db2e83e00318d",
-    "hints-and-conversation": "29547afceb69eeb9399640b27e21e66e89642c7ec0e8f8c26f226cda41d7aa18",
+    "plain": "d832e27637fa7d3038a3b380b477884eee80b10361026cecdd81cc53ca8faaf9",
+    "project": "6211c71cde7e65241355ced1eab08b07973058a8ae07afd76a0c62dccf9e6b6e",
+    "long-screen": "0bb8c0569eb136b3834429da65ac0b78948562c72100f58f5c5feca95e7988e9",
+    "hints-and-conversation": "dbeb5eaa9bb22dbd92469da27c25db3854d72ce5d8c9a5bbf67690f30df38eb3",
 }
-PLAIN_LENGTH = 14362            # 14,251 with the menu lines only; 13,924 before move/copy_files; 21,056 originally
+PLAIN_LENGTH = 14650            # 14,362 before the dialog-key guidance; 13,924 before move/copy_files; 21,056 originally
 
 
 # ============================================================
@@ -2122,6 +2245,26 @@ def test_the_plain_prompt_length_is_pinned_with_headroom():
     n = len(build("plain"))
     assert n == PLAIN_LENGTH
     assert n < BACKEND_SYSTEM_LIMIT * 0.8
+
+
+@pytest.mark.parametrize("batching", ["1", "0"])
+def test_dialog_key_guidance_is_in_the_prompt_once(monkeypatch, batching):
+    """rt-notepad-save typed a path into the document after a Ctrl+S that opened
+    nothing. With or without batched steps the prompt says it once, merged into
+    the LOOP rule and the two-approaches rule."""
+    monkeypatch.setenv("MISTAI_BATCH_STEPS", batching)
+    text = build("plain")
+    loop_line = next(l for l in text.split("\n") if l.startswith("- You work in a LOOP"))
+    for phrase in ("a key that opens a dialog (save, open, print, menus)",
+                   "read the screen; type into a dialog only once an observation says one appeared",
+                   "never a file path into the document",
+                   "prefer the dialog's file-name box"):
+        assert text.count(phrase) == 1 and phrase in loop_line, phrase
+    assert ("stops at the first failure or question and after a key that opens a dialog"
+            in loop_line) is (batching == "1")
+    assert text.count("or two tries of the same key sequence, have failed, stop trying "
+                      "variations: use ask_user or say so in done.") == 1
+    assert text.count("- press_key <key>: Press one key (a combo is hotkey)") == 1
 
 
 # ============================================================

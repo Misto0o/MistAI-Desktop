@@ -283,7 +283,7 @@ Rules:
 - NEVER create nodes like "locate the button", "verify the button is enabled", "move the cursor", "click it", "check if X exists", "confirm it worked", "open the editor": those are steps INSIDE a phase. BAD (4 nodes): locate_button -> verify_button -> move_to_button -> click_button. GOOD (1 node): subscribe_to_channel: "Subscribe to the channel on the open video". No verification-only nodes: each phase verifies its own work.
 - Don't split steps that use the same tool and can't fail independently: creating a folder and a file inside it is ONE phase.
 - depends_on means "cannot start until that phase's OUTPUT exists"; do NOT chain independent phases (style.css does not depend on script.js -- both depend only on the folder).
-- Each desc names its OWN deliverable in one sentence and must be executable given just its dependencies' results.
+- Each desc names its OWN deliverable in one sentence and must be executable given just its dependencies' results; keep the goal's own words for what it refers back to ("that", "it"), since the agent sees the recent conversation and you do not: an edit to earlier content ("make that 6") keeps that content, never replaces it with only the new value.
 - Plan ONLY what remains. Things the goal or WORKSPACE says are already done are context, not phases.
 - Deliver only what was asked, and NEVER specify an output format the user didn't ask for: no "return true/false", "output a list", "write a report", "save to a file". A QUESTION's deliverable is the spoken answer, so its desc just says what to find out. When the goal DOES ask for an output ("...then write the names in Notepad"), that output is a deliverable and must have a phase."""
 
