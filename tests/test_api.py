@@ -341,7 +341,7 @@ def _run_page(tmp_path, **config):
 needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 
 
-LABELLED = [["gemini", "Nova"], ["cohere", "Sage"], ["mistral", "Flux"]]
+LABELLED = [["gemini", "Nova"], ["mistral", "Flux"]]
 
 
 STARTUP_CALLS = {"get_ui_flags", "get_user_gender", "get_model_options", "get_memory_stats",
@@ -359,14 +359,14 @@ def test_whole_page_starts_with_storage_denied_and_renders_the_real_options(tmp_
     assert STARTUP_CALLS <= set(r["calls"])
     assert r["intervals"] == [1000, 4000, 20000, 1500]   # clock, then the three
     assert r["gender"] == "female"                  # from Python, not the browser
-    assert r["options"] == LABELLED and r["value"] == "cohere"
+    assert r["options"] == LABELLED and r["value"] == "gemini"
     assert r["note"] == ["", "card-note"]
     assert r["online"] == "Online" and r["stats"] == "3"
     # Choosing Flux sends the id; an id Python refuses shows its error and the
     # card reloads to the model really in use.
     assert r["after"]["msgs"] == [
         ["msg system", "Model: Flux (applies from the next request)"],
-        ["msg error", "Unknown model. Choose one of: gemini, cohere, mistral."],
+        ["msg error", "Unknown model. Choose one of: gemini, mistral."],
         # A refused gender shows Python's error and reloads the saved value.
         ["msg error", "Unknown gender address. Choose one of: male, female, none."],
     ]
@@ -387,7 +387,7 @@ def test_a_failed_model_load_shows_a_visible_error_and_blocks_nothing(tmp_path):
 
 @needs_node
 def test_an_empty_model_list_is_an_error_not_a_blank_dropdown(tmp_path):
-    r = _run_page(tmp_path, options={"choices": [], "current": "cohere"})
+    r = _run_page(tmp_path, options={"choices": [], "current": "gemini"})
     assert r["options"] == []
     assert r["note"] == ["Could not load the model list: no models were returned",
                          "card-note error"]

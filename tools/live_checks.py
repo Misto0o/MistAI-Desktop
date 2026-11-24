@@ -8,7 +8,7 @@ main-laptop live checklist (batch5/LIVE_CHECKLIST.md).
     python tools/live_checks.py --live --yes --allow-send  # also the message checks
 
 Options: --only id,id   --allow-send   --allow-elevated   --local-config PATH
-         --checks PATH  --log-root PATH   --model ID|LABEL (e.g. cohere/Sage, gemini/Nova)
+         --checks PATH  --log-root PATH   --model ID|LABEL (e.g. gemini/Nova, mistral/Flux)
 
 --stub: the REAL Api class, AgentLoop, Executor, confirmation prompt and action
 handlers, with the OS layer faked (no microphone, TTS, browser, screen capture,
@@ -155,7 +155,7 @@ def parse_timing(text):
 
 
 def resolve_model(name):
-    """A MODEL_CHOICES id for an id or a Settings label (Nova, Sage, ...), else None."""
+    """A MODEL_CHOICES id for an id or a Settings label (Nova, Flux), else None."""
     from core.config import MODEL_CHOICES, MODEL_LABELS
 
     key = str(name or "").strip().lower()
@@ -1390,7 +1390,7 @@ def parse_args(argv=None):
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--allow-send", action="store_true")
     ap.add_argument("--allow-elevated", action="store_true")
-    ap.add_argument("--model", default="", help="a model id or its Settings label (Nova, Sage, Flux)")
+    ap.add_argument("--model", default="", help="a model id or its Settings label (Nova, Flux)")
     ap.add_argument("--local-config", default=DEFAULT_LOCAL)
     ap.add_argument("--checks", default=DEFAULT_CHECKS)
     ap.add_argument("--log-root", default=os.path.join(os.path.expanduser("~"), "MistAI", "logs"))

@@ -37,6 +37,7 @@
 
 """The planner, the tool registry and the conversation router."""
 
+import inspect
 import json
 import re
 import threading
@@ -670,8 +671,8 @@ def test_try_chat_uses_the_requests_model_then_the_users_choice(monkeypatch):
     api = _api()
     api.current_model = lambda: "mistral"
     conversation.try_chat(api, "joke")
-    conversation.try_chat(api, "joke", model="cohere")
-    assert models == ["mistral", "cohere"]
+    conversation.try_chat(api, "joke", model="gemini")
+    assert models == ["mistral", "gemini"]
 
 
 @pytest.mark.parametrize(("fallback", "urls"), [
@@ -957,12 +958,13 @@ class _Resp:
 # ============================================================
 
 def test_choices_labels_and_default():
-    assert config.MODEL_CHOICES == ("gemini", "cohere", "mistral")
-    assert config.MODEL_LABELS == {"gemini": "Nova", "cohere": "Sage", "mistral": "Flux"}
+    assert config.MODEL_CHOICES == ("gemini", "mistral")
+    assert config.MODEL_LABELS == {"gemini": "Nova", "mistral": "Flux"}
     assert set(config.MODEL_LABELS) == set(config.MODEL_CHOICES)  # a label for every id
-    assert config.DEFAULT_MODEL == "cohere" and config.AGENT_MODEL == "cohere"
+    assert config.DEFAULT_MODEL == "gemini" and config.AGENT_MODEL == "gemini"
+    assert config.MODEL == "gemini"
     assert not hasattr(config, "CHAT_MODEL")
-    assert Api.__new__(Api).current_model() == "cohere"   # bare test object
+    assert Api.__new__(Api).current_model() == "gemini"   # bare test object
 
 
 # ============================================================
@@ -990,13 +992,12 @@ def _api_with(memory):
 
 def test_set_model_validates_saves_and_survives_a_restart(memory):
     api = _api_with(memory)
-    assert api.current_model() == "cohere"
+    assert api.current_model() == "gemini"
     assert api.set_model(" Mistral ") == {"success": True, "model": "mistral", "label": "Flux"}
     assert memory.get_profile("model") == "mistral"
     assert _api_with(memory).current_model() == "mistral"     # next start
     assert api.get_model_options() == {
-        "choices": [{"id": "gemini", "label": "Nova"}, {"id": "cohere", "label": "Sage"},
-                    {"id": "mistral", "label": "Flux"}],
+        "choices": [{"id": "gemini", "label": "Nova"}, {"id": "mistral", "label": "Flux"}],
         "current": "mistral",
     }
 
@@ -1004,26 +1005,34 @@ def test_set_model_validates_saves_and_survives_a_restart(memory):
 def test_real_model_options_are_complete():
     """What the UI renders: never empty, every entry has an id and a label."""
     opts = Api.__new__(Api).get_model_options()
-    assert opts["choices"] and opts["current"] == "cohere"
+    assert opts["choices"] and opts["current"] == "gemini"
+    assert [c["label"] for c in opts["choices"]] == ["Nova", "Flux"]   # only these, in order
     assert [c["id"] for c in opts["choices"]] == list(config.MODEL_CHOICES)
     assert all(isinstance(c["label"], str) and c["label"].strip() for c in opts["choices"])
     assert opts["current"] in [c["id"] for c in opts["choices"]]
 
 
-@pytest.mark.parametrize("name", ["gpt-4", "Flux", "", None, "cohere; drop table"])
+@pytest.mark.parametrize("name", ["gpt-4", "Flux", "", None, "cohere", "cohere; drop table"])
 def test_set_model_rejects_anything_outside_the_choices(memory, name):
     """Ids only: a label such as "Flux" is not an id."""
     api = _api_with(memory)
     api.set_model("mistral")
     result = api.set_model(name)
-    assert result["success"] is False and "gemini, cohere, mistral" in result["error"]
+    assert result["success"] is False and "gemini, mistral" in result["error"]
     assert api.current_model() == "mistral" and memory.get_profile("model") == "mistral"
 
 
 def test_a_bad_saved_value_falls_back_to_the_default(memory, capsys):
     memory.set_profile("model", "gpt-9")
-    assert _api_with(memory).current_model() == "cohere"
-    assert "using cohere" in capsys.readouterr().out
+    assert _api_with(memory).current_model() == "gemini"
+    assert "using gemini" in capsys.readouterr().out
+
+
+def test_a_saved_cohere_choice_now_runs_nova(memory):
+    memory.set_profile("model", "cohere")       # saved before Sage was removed
+    api = _api_with(memory)
+    assert api.current_model() == "gemini"
+    assert config.model_chain(api.current_model()) == ("gemini", "mistral")
 
 
 # -- gender, read back for the UI -------------------------------------------------
@@ -1107,18 +1116,18 @@ def test_request_uses_the_choice_everywhere_and_keeps_it_while_running(monkeypat
     api.memory.set_profile = lambda *_a: None
     api._model = "mistral"
 
-    Api.ask_mistai(api, "open notepad", model="cohere", input_mode="text")  # arg ignored
+    Api.ask_mistai(api, "open notepad", model="gemini", input_mode="text")  # arg ignored
     assert api.rec["router"][0][2] == "mistral"                 # router
     assert api.agent.runs[0][1][1] == "mistral"                  # agent + planner
     sent = _hotkey_models(monkeypatch, api)
 
-    api.set_model("cohere")                                      # changed mid-task
+    api.set_model("gemini")                                      # changed mid-task
     assert Api._ask_llm_for_hotkey(api, "discord") == "ctrl+k"
     assert sent == ["mistral"]                                   # running request's model
 
     api.agent.callbacks["on_done"]({"success": True, "steps": 1})
     Api._ask_llm_for_hotkey(api, "discord")
-    assert sent == ["mistral", "cohere"]                         # next one: the new choice
+    assert sent == ["mistral", "gemini"]                         # next one: the new choice
 
 
 # -- the plain error message ------------------------------------------------------
@@ -1129,9 +1138,9 @@ def test_request_uses_the_choice_everywhere_and_keeps_it_while_running(monkeypat
      "Pick another model in Settings or try again later."),
     (_Resp(400, {"error": {"message": "Unknown model 'mistral'"}}), "mistral",
      "Flux request failed (HTTP 400: Unknown model 'mistral')."),
-    (_Resp(503, {"message": "Upstream down"}), "cohere",
-     "Sage request failed (HTTP 503: Upstream down)."),
-    (_Resp(502, text="<html>bad gateway</html>"), "cohere", "Sage request failed (HTTP 502)."),
+    (_Resp(503, {"message": "Upstream down"}), "gemini",
+     "Nova request failed (HTTP 503: Upstream down)."),
+    (_Resp(502, text="<html>bad gateway</html>"), "gemini", "Nova request failed (HTTP 502)."),
 ])
 def test_describe_api_error(resp, model, expected):
     assert describe_api_error(resp, model) == expected
@@ -1140,41 +1149,140 @@ def test_describe_api_error(resp, model, expected):
 def test_error_text_never_carries_urls_or_keys_and_is_capped():
     body = {"error": "Key mistai_abc123def456 rejected at https://api.mistai.org/v1?k=1 "
                      "bearer sk-ZYXWVUTSRQ " + "x" * 300}
-    msg = describe_api_error(_Resp(401, body), "cohere")
+    msg = describe_api_error(_Resp(401, body), "gemini")
     for leak in ("mistai_abc", "https://", "api.mistai.org", "sk-ZYX"):
         assert leak not in msg
     detail = msg.split("(HTTP 401: ", 1)[1].rsplit(").", 1)[0]
     assert len(detail) <= 120 and detail.endswith("...")
 
 
-def test_planner_logs_the_failure_and_sends_only_the_given_model(monkeypatch, capsys):
+def _chain_api(fallback="https://fallback.invalid"):
+    return SimpleNamespace(api_manager=SimpleNamespace(
+        get_headers=lambda: {"Authorization": "Bearer mistai_secret1"},
+        get_api_url=lambda: "https://primary.invalid",
+        get_fallback_url=lambda: fallback))
+
+
+def _scripted_post(monkeypatch, target, replies, sent):
+    """requests.post on ``target`` answering ``replies`` in order (a _Resp or an
+    exception to raise), recording (url host label, model) per call."""
+    replies = list(replies)
+
+    def post(url, json=None, **_k):
+        sent.append((url.split("//")[1].split(".")[0], json["model"]))
+        reply = replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(target, post)
+
+
+def test_planner_429_on_nova_goes_to_flux_once_with_no_same_model_retry(monkeypatch, capsys):
     sent = []
-    monkeypatch.setattr(planner.requests, "post", lambda url, json=None, **_k: (
-        sent.append(json["model"]), _Resp(429, {"error": "Rate limit exceeded"}))[1])
-    api = SimpleNamespace(api_manager=SimpleNamespace(
-        get_headers=lambda: {}, get_api_url=lambda: "https://primary.invalid",
-        get_fallback_url=lambda: "https://fallback.invalid"))
-    assert planner._llm(api, "prompt", "mistral") == ""
-    assert sent == ["mistral", "mistral"]            # fallback URL, same model
+    _scripted_post(monkeypatch, "core.planner.requests.post",
+                   [_Resp(429, {"error": "Rate limit exceeded"}),
+                    _Resp(429, {"error": "Rate limit exceeded"})], sent)
+    assert planner._llm(_chain_api(), "prompt", "gemini") == ""
+    assert sent == [("primary", "gemini"), ("primary", "mistral")]   # no Nova retry
     out = capsys.readouterr().out
+    assert "[Planner] Nova is rate-limited" in out
+    assert "[Planner] Nova HTTP 429, trying Flux" in out
     assert "[Planner] Flux is rate-limited" in out
-    assert "invalid" not in out                      # no URLs in the log line
+    for leak in ("invalid", "secret", "prompt"):
+        assert leak not in out                       # no URLs, keys or prompt text
+
+
+def test_planner_5xx_keeps_the_url_fallback_then_flux_once(monkeypatch):
+    sent = []
+    _scripted_post(monkeypatch, "core.planner.requests.post",
+                   [_Resp(503, {}), _Resp(502, {}), _Resp(200, {"response": "ok"})], sent)
+    assert planner._llm(_chain_api(), "prompt", "gemini") == "ok"
+    assert sent == [("primary", "gemini"), ("fallback", "gemini"), ("primary", "mistral")]
+
+
+def test_planner_network_failure_never_switches_model(monkeypatch):
+    sent = []
+    _scripted_post(monkeypatch, "core.planner.requests.post",
+                   [TimeoutError("t"), TimeoutError("t")], sent)
+    assert planner._llm(_chain_api(), "prompt", "gemini") == ""
+    assert [m for _u, m in sent] == ["gemini", "gemini"]
+
+
+def test_router_picks_nova_then_flux_on_the_primary_url_only(monkeypatch):
+    sent = []
+    _scripted_post(monkeypatch, "core.planner.requests.post",
+                   [_Resp(429, {"error": "busy"}),
+                    _Resp(200, {"response": '{"route": "chat", "reply": "Hi."}'})], sent)
+    api = _chain_api()
+    api.agent = SimpleNamespace(_recent_conversation_block=lambda _m: "")
+    assert conversation.try_chat(api, "hello") == "Hi."
+    assert sent == [("primary", "gemini"), ("primary", "mistral")]
+
+
+@pytest.mark.parametrize("picked, chain", [
+    ("gemini", ("gemini", "mistral")),
+    ("mistral", ("mistral", "gemini")),
+    ("cohere", ("gemini", "mistral")),       # a removed id: the default chain
+    ("command-r-plus", ("gemini", "mistral")),
+    (None, ("gemini", "mistral")),
+    (" GEMINI ", ("gemini", "mistral")),
+])
+def test_model_chain_is_nova_then_flux_and_never_cohere(picked, chain):
+    assert config.model_chain(picked) == chain
+
+
+def test_no_cohere_chat_model_is_reachable_from_any_call_site(monkeypatch):
+    """Whatever model a call is handed, it only ever sends a MODEL_CHOICES id."""
+    for name in ("cohere", "command-a-03-2025", "command-r"):
+        assert name not in config.MODEL_CHOICES
+        assert config.model_chain(name) == ("gemini", "mistral")
+    assert "Sage" not in config.MODEL_LABELS.values()
+    sent = []
+    _scripted_post(monkeypatch, "core.planner.requests.post", [_Resp(500, {})] * 3, sent)
+    planner._llm(_chain_api(), "prompt", "cohere")
+    assert [m for _u, m in sent] == ["gemini", "gemini", "mistral"]
+
+
+def test_vision_still_uses_cohere():
+    from core.screen import CohereVision
+    assert CohereVision.MODEL == "command-a-vision-07-2025"
+    assert CohereVision.MODEL not in config.MODEL_CHOICES
+    src = inspect.getsource(CohereVision)
+    assert "cohere.ClientV2" in src and "COHERE_API_KEY" in src
+
+
+def test_failover_line_is_content_free():
+    assert (config.model_failover_line("AgentLoop", "gemini", 429, "mistral")
+            == "[AgentLoop] Nova HTTP 429, trying Flux")
 
 
 def test_hotkey_failure_is_logged_plainly(monkeypatch, capsys):
     api = Api.__new__(Api)
     api.api_manager = SimpleNamespace(get_headers=lambda: {}, get_api_url=lambda: "u")
-    monkeypatch.setattr(api_mod.requests, "post",
-                        lambda *_a, **_k: _Resp(429, {"error": "slow down"}))
+    sent = []
+    monkeypatch.setattr(api_mod.requests, "post", lambda url, json=None, **_k: (
+        sent.append(json["model"]), _Resp(429, {"error": "slow down"}))[1])
     assert Api._ask_llm_for_hotkey(api, "discord") is None
-    assert "[Hotkey] Sage is rate-limited" in capsys.readouterr().out
+    assert sent == ["gemini", "mistral"]
+    out = capsys.readouterr().out
+    assert "[Hotkey] Nova is rate-limited" in out and "[Hotkey] Flux is rate-limited" in out
+    assert "[Hotkey] Nova HTTP 429, trying Flux" in out
 
 
-@pytest.mark.parametrize("mode, spoken_expected", [("voice", True), ("text", False)])
-def test_agent_reports_a_429_plainly_and_never_tries_another_model(
-        monkeypatch, mode, spoken_expected):
-    sent, spoken = [], []
-    api = SimpleNamespace(
+def test_hotkey_429_on_nova_is_answered_by_flux(monkeypatch):
+    api = Api.__new__(Api)
+    api.api_manager = SimpleNamespace(get_headers=lambda: {}, get_api_url=lambda: "u")
+    replies = [_Resp(429, {"error": "slow down"}), _Resp(200, {"response": "ctrl+k"})]
+    sent = []
+    monkeypatch.setattr(api_mod.requests, "post", lambda url, json=None, **_k: (
+        sent.append(json["model"]), replies.pop(0))[1])
+    assert Api._ask_llm_for_hotkey(api, "discord") == "ctrl+k"
+    assert sent == ["gemini", "mistral"]
+
+
+def _agent_chain_api(spoken):
+    return SimpleNamespace(
         task_memory=SimpleNamespace(get_hints_for_task=lambda _t: []),
         caption_window=None, captions_enabled=False,
         _stop_requested=threading.Event(),
@@ -1189,20 +1297,50 @@ def test_agent_reports_a_429_plainly_and_never_tries_another_model(
         speak=spoken.append,
         _last_opened_app=None,
     )
-    monkeypatch.setattr("core.agent.requests.post", lambda url, json=None, **_k: (
-        sent.append(json["model"]), _Resp(429, {"error": "Rate limit exceeded"}))[1])
+
+
+def _agent_chain_loop(monkeypatch, api):
     monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
     loop = AgentLoop(api, None)
     monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
     monkeypatch.setattr(loop, "_current_foreground_key", lambda: (1, "Notepad"))
+    return loop
 
-    out = loop._loop("open notepad", "mistral", "none", mode, None)
+
+@pytest.mark.parametrize("mode, spoken_expected", [("voice", True), ("text", False)])
+def test_agent_429_on_nova_goes_to_flux_once_then_reports_plainly(
+        monkeypatch, capsys, mode, spoken_expected):
+    sent, spoken = [], []
+    api = _agent_chain_api(spoken)
+    _scripted_post(monkeypatch, "core.agent.requests.post",
+                   [_Resp(429, {"error": "Rate limit exceeded"})] * 2, sent)
+    loop = _agent_chain_loop(monkeypatch, api)
+
+    out = loop._loop("open notepad", "gemini", "none", mode, None)
     msg = ("Flux is rate-limited or unavailable right now (HTTP 429: Rate limit "
            "exceeded). Pick another model in Settings or try again later.")
     assert out == {"success": False, "error": msg, "speech": msg}
     assert spoken == ([msg] if spoken_expected else [])
-    assert sent == ["mistral", "mistral"]            # same model on the fallback URL
+    assert sent == [("primary", "gemini"), ("primary", "mistral")]   # no same-model retry
     assert "secret" not in json.dumps(out) and "invalid" not in json.dumps(out)
+    log = capsys.readouterr().out
+    assert "[AgentLoop] Nova HTTP 429, trying Flux" in log
+    assert "[AgentLoop] API failed: Nova primary 429; Flux primary 429" in log
+    assert "trying fallback" not in log
+    for leak in ("invalid", "secret", "open notepad"):
+        assert leak not in log
+
+
+def test_agent_5xx_on_nova_keeps_the_url_fallback_then_flux_answers(monkeypatch):
+    sent = []
+    api = _agent_chain_api([])
+    done = json.dumps({"action": "done", "parameter": "", "speech": "Done.", "thinking": ""})
+    _scripted_post(monkeypatch, "core.agent.requests.post",
+                   [_Resp(503, {}), _Resp(502, {})] + [_Resp(200, {"response": done})] * 5,
+                   sent)
+    loop = _agent_chain_loop(monkeypatch, api)
+    loop._loop("open notepad", "gemini", "none", "text", None)
+    assert sent[:3] == [("primary", "gemini"), ("fallback", "gemini"), ("primary", "mistral")]
 
 
 # -- why a message went to the agent (a fixed label on the route line) -----------

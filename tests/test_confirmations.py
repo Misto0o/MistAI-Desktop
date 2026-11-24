@@ -1984,7 +1984,7 @@ def test_always_ignores_remembered_approvals(monkeypatch, memory):
 
 
 def test_forget_removes_only_the_approvals(monkeypatch, memory):
-    for key, value in (("model", "cohere"), ("user_gender", "none"), ("hotkey_discord", "ctrl+k"),
+    for key, value in (("model", "mistral"), ("user_gender", "none"), ("hotkey_discord", "ctrl+k"),
                        ("approvedish", "x"), ("my_approved:1", "y")):
         memory.set_profile(key, value)
     _remembered_approvals_run(monkeypatch, memory, [REMEMBERED_APPROVALS_SEND, REMEMBERED_APPROVALS_DONE], [CLICK], gen=1)

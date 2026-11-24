@@ -737,8 +737,8 @@ def test_no_key_backend_failure_is_not_masked_by_an_unauthenticated_fallback(
     )
     calls = []
 
-    def failed_post(*_args, **_kwargs):
-        calls.append(1)
+    def failed_post(url, json=None, **_kwargs):
+        calls.append((url, json["model"]))
         return _Response(status_code=503)
 
     monkeypatch.setattr("core.agent.requests.post", failed_post)
@@ -748,9 +748,12 @@ def test_no_key_backend_failure_is_not_masked_by_an_unauthenticated_fallback(
 
     result = loop._loop("perform a test task", "test-model", "none", "text", None)
 
-    assert calls == [1]  # no unauthenticated fallback call
-    # The primary failure itself is reported, plainly (describe_api_error).
-    assert result["error"] == "Test-model request failed (HTTP 503)."
+    # No unauthenticated fallback URL call: both models on the public URL
+    # (an unknown id runs the default chain, Nova then Flux).
+    assert calls == [("https://example.invalid/public", "gemini"),
+                     ("https://example.invalid/public", "mistral")]
+    # The last failure itself is reported, plainly (describe_api_error).
+    assert result["error"] == "Flux request failed (HTTP 503)."
 
 
 def test_stop_while_model_request_is_in_flight_prevents_returned_action_dispatch(

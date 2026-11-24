@@ -211,7 +211,7 @@ def main_mode(mode):
             return [
                 ("header leaves 'Checking...'", state["online"] not in ("", "Checking..."),
                  state["online"]),
-                ("Model dropdown has the 3 labelled options",
+                ("Model dropdown has the labelled options (Nova, Flux)",
                  state["options"] == expected_options, state["options"]),
                 ("saved model (mistral) is selected", state["model"] == "mistral",
                  state["model"]),

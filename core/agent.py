@@ -19,6 +19,9 @@ import requests
 from . import planner
 from .config import (
     describe_api_error,
+    MODEL_LABELS,
+    model_chain,
+    model_failover_line,
     BACKEND_LIMIT_WARN_RATIO,
     BACKEND_MESSAGES_LIMIT,
     BACKEND_SYSTEM_LIMIT,
@@ -1133,44 +1136,43 @@ class AgentLoop:
                     }
 
                     self._check_request_size(system, messages)
-                    r = _post(url, json=request_data, headers=headers, timeout=30)
+                    # model_chain: the picked model (today's URL fallback,
+                    # except a 429 goes straight on), then the other model
+                    # once at the primary URL; then the error path below.
+                    chain = model_chain(model)
+                    tried = []          # "<Label> primary|fallback <status>", numbers only
+                    for attempt, attempt_model in enumerate(chain):
+                        request_data["model"] = attempt_model
+                        name = MODEL_LABELS.get(attempt_model, attempt_model)
+                        r = _post(url, json=request_data, headers=headers, timeout=30)
+                        if r.ok:
+                            break
+                        failed_model, failed_response = attempt_model, r
+                        tried.append(f"{name} primary {r.status_code}")
+                        fallback_url = (self.api.api_manager.get_fallback_url()
+                                        if attempt == 0 and r.status_code != 429 else None)
+                        if fallback_url and fallback_url != url:
+                            print(f"[AgentLoop] Primary API {r.status_code}, trying fallback...")
+                            r = _post(fallback_url, json=request_data, headers=headers,
+                                      timeout=30)
+                            if r.ok:
+                                break
+                            tried.append(f"{name} fallback {r.status_code}")
+                        if attempt + 1 < len(chain):
+                            print(model_failover_line("AgentLoop", attempt_model,
+                                                      r.status_code, chain[attempt + 1]))
 
                     if not r.ok:
-                        primary_status = r.status_code
-                        primary_response = r
-                        print(
-                            f"[AgentLoop] Primary API {r.status_code}, trying fallback..."
-                        )
-                        fallback_url = self.api.api_manager.get_fallback_url()
-                        if fallback_url and fallback_url != url:
-                            r = _post(
-                                fallback_url,
-                                json=request_data,
-                                headers=headers,
-                                timeout=30,
-                            )
-
-                        if not fallback_url or fallback_url == url or not r.ok:
-                            fallback_status = (
-                                r.status_code
-                                if fallback_url and fallback_url != url
-                                else None
-                            )
-                            status_detail = (
-                                f"primary {primary_status}; fallback {fallback_status}"
-                                if fallback_status is not None
-                                else f"primary {primary_status} (no compatible fallback)"
-                            )
-                            print(f"[AgentLoop] API failed: {status_detail}")
-                            # Same model on the fallback URL only; never another
-                            # model. Say what the backend said, plainly.
-                            message = describe_api_error(primary_response, model)
-                            print(f"[AgentLoop] {message}")
-                            if self.api.caption_window and self.api.captions_enabled:
-                                self.api.caption_window.show_error(message, 5)
-                            if input_mode == "voice":
-                                self.api.speak(message)
-                            return {"success": False, "error": message, "speech": message}
+                        print(f"[AgentLoop] API failed: {'; '.join(tried)}")
+                        # Say what the backend said for the last model tried
+                        # (its primary-URL answer), plainly.
+                        message = describe_api_error(failed_response, failed_model)
+                        print(f"[AgentLoop] {message}")
+                        if self.api.caption_window and self.api.captions_enabled:
+                            self.api.caption_window.show_error(message, 5)
+                        if input_mode == "voice":
+                            self.api.speak(message)
+                        return {"success": False, "error": message, "speech": message}
 
                     raw = r.json().get("response", "")
                 except Exception as e:

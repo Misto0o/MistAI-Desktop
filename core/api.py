@@ -51,6 +51,8 @@ from .agent import NOT_VISIBLE_ON_SCREEN, AgentLoop
 from .config import (
     APIKeyManager,
     describe_api_error,
+    model_chain,
+    model_failover_line,
     ASK_BEFORE_SENDING_CHOICES,
     ASK_BEFORE_SENDING_HELP,
     ASK_BEFORE_SENDING_LABELS,
@@ -3777,14 +3779,22 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             )
             # The running request's model while a task runs, else the choice.
             model = getattr(self, "_request_model", None) or self.current_model()
-            r = requests.post(
-                url,
-                json={"message": prompt, "model": model},
-                headers=headers,
-                timeout=10,
-            )
+            # model_chain: the model, then the next one once after an HTTP error.
+            chain = model_chain(model)
+            for attempt, attempt_model in enumerate(chain):
+                r = requests.post(
+                    url,
+                    json={"message": prompt, "model": attempt_model},
+                    headers=headers,
+                    timeout=10,
+                )
+                if r.ok:
+                    break
+                print(f"[Hotkey] {describe_api_error(r, attempt_model)}")
+                if attempt + 1 < len(chain):
+                    print(model_failover_line("Hotkey", attempt_model, r.status_code,
+                                              chain[attempt + 1]))
             if not r.ok:
-                print(f"[Hotkey] {describe_api_error(r, model)}")
                 return None
             raw = r.json().get("response", "").strip().lower()
             if "unknown" in raw:

@@ -95,7 +95,7 @@ import urllib.parse
 
 VERSION = "2.0"
 STATUS_URL = "https://mist-ai.fly.dev/api/status"
-MODEL = "cohere"
+MODEL = "gemini"
 
 # ── API CONFIGURATION ─────────────────────────────────────────────────────────
 PRIMARY_API = "https://api.mistai.org/api/v1/chat"
@@ -107,18 +107,38 @@ API_MODE = "backend"  # "direct_api" or "backend"
 
 # The models the user can pick in Settings (Api.set_model, saved as the
 # user_profile key "model"). Every LLM call -- agent, planner, conversation
-# router, hotkey lookup -- uses the one picked (Api.current_model()), and a
-# failure never switches to another one. Vision stays on Cohere (vision.py).
-MODEL_CHOICES = ("gemini", "cohere", "mistral")   # ids sent to the backend
+# router, hotkey lookup -- tries model_chain(the one picked): that model, then
+# the other one once when the backend answers with an HTTP error. Vision
+# stays on Cohere (screen.py CohereVision), never one of these.
+MODEL_CHOICES = ("gemini", "mistral")   # ids sent to the backend; first = default
 # What the UI shows for each id (Api.get_model_options). The only place the
 # names appear: ui/html.py hardcodes no id or label.
-MODEL_LABELS = {"gemini": "Nova", "cohere": "Sage", "mistral": "Flux"}
-DEFAULT_MODEL = "cohere"
+MODEL_LABELS = {"gemini": "Nova", "mistral": "Flux"}
+DEFAULT_MODEL = "gemini"
 AGENT_MODEL = DEFAULT_MODEL  # alias: the default before the user picks one
 # Conversation layer (core/conversation.py): timeout of the chat-or-task
 # routing call (primary URL only, no fallback). Any failure routes to the
 # agent.
 CHAT_TIMEOUT = 5
+
+
+# -- model chain (every backend LLM call) ---------------------------------------
+
+def model_chain(model):
+    """The models one LLM call may try, in order: ``model`` (if it is one of
+    MODEL_CHOICES, else DEFAULT_MODEL), then every other choice. Never an id
+    outside MODEL_CHOICES. Nova picked: ("gemini", "mistral")."""
+    first = str(model or "").strip().lower()
+    if first not in MODEL_CHOICES:
+        first = DEFAULT_MODEL
+    return (first,) + tuple(m for m in MODEL_CHOICES if m != first)
+
+
+def model_failover_line(label, model, status, next_model):
+    """The fixed log line when a model's HTTP error hands the call to the next
+    model: labels and the status code only, never the body or URL."""
+    return (f"[{label}] {MODEL_LABELS.get(model, model)} HTTP {status}, "
+            f"trying {MODEL_LABELS.get(next_model, next_model)}")
 
 
 # ============================================================

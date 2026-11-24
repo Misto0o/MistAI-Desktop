@@ -396,7 +396,7 @@ def test_infra_lines_are_recognised_by_shape_only():
         "[AgentLoop] Network error: ReadTimeout after 30.1s",
         "  [Conversation] Nova request failed (HTTP 503: upstream busy).",
         "[Planner] LLM call failed: ConnectTimeout",
-        "[AgentLoop] Sage is rate-limited or unavailable right now (HTTP 429: slow down). Pick ...",
+        "[AgentLoop] Flux is rate-limited or unavailable right now (HTTP 429: slow down). Pick ...",
         "[AgentLoop] Nova request failed (HTTP 400: bad request).",        # a client error: not INFRA
         "[Conversation] Router failed (ValueError) -- routing to agent",
         "[AgentLoop] Agent call failed: KeyError after 0.1s",
@@ -521,8 +521,10 @@ def test_summary_shows_model_and_screen_seconds_per_check(tmp_path):
 def test_model_is_validated_against_the_choices(tmp_path, capsys):
     assert lc.main(["--stub", "--model", "gpt-9", "--log-root", str(tmp_path)]) == 2
     assert not os.listdir(tmp_path)
-    assert "cohere (Sage)" in capsys.readouterr().out
-    assert lc.resolve_model("Nova") == "gemini" and lc.resolve_model(" COHERE ") == "cohere"
+    out = capsys.readouterr().out
+    assert "gemini (Nova), mistral (Flux)" in out and "cohere" not in out.lower()
+    assert lc.resolve_model("Nova") == "gemini" and lc.resolve_model(" MISTRAL ") == "mistral"
+    assert lc.resolve_model("cohere") is None and lc.resolve_model("Sage") is None
     assert lc.resolve_model("") is None
 
 
@@ -541,10 +543,10 @@ def test_model_is_applied_through_the_profile_and_restored(tmp_path, monkeypatch
 
     monkeypatch.setitem(lc.CHECK_FUNCS, "approval-count", look)
     monkeypatch.setattr(lc, "restore_settings", restore)
-    code, summary = _run(tmp_path, "--only", "approval-count", "--model", "Nova")
-    assert code == 0 and seen["during"] == ("gemini", "gemini")
-    assert seen["after"] != "gemini"
-    assert "Model: gemini (Nova), set with --model" in summary
+    code, summary = _run(tmp_path, "--only", "approval-count", "--model", "Flux")
+    assert code == 0 and seen["during"] == ("mistral", "mistral")
+    assert seen["after"] != "mistral"
+    assert "Model: mistral (Flux), set with --model" in summary
 
 
 # -- scrub and injection-note: judged from what reached the backend ----------------------------------

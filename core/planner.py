@@ -69,6 +69,8 @@ from . import planner, live_state as events
 from .floating_orb import signal_scope, orb_signal, task_finished
 from .config import (
     describe_api_error,
+    model_chain,
+    model_failover_line,
     confirmation_answer,
     log_text,
     single_shot_enabled,
@@ -243,23 +245,37 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback
             if u
         )
     )
-    for url in urls:
-        try:
-            r = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=timeout,
-            )
-            if r.ok:
-                return r.json().get("response", "")
-            # Logged only: planning and routing fail over to their safe paths
-            # (one phase / the agent), which then report the same error.
-            print(f"[{label}] {describe_api_error(r, model)}")
-        except Exception as e:
-            # The URL and message only under verbose logs (the message can quote the URL).
-            print(f"[{label}] LLM call failed: "
-                  f"{(f'via {url}: {e}') if verbose_logs() else type(e).__name__}")
+    # model_chain: the picked model on every URL (a 429 skips the rest), then
+    # the next model once on the first URL -- only after an HTTP error, never
+    # after a timeout or network failure.
+    chain = model_chain(model)
+    for attempt, attempt_model in enumerate(chain):
+        payload["model"] = attempt_model
+        status = None
+        for url in (urls if attempt == 0 else urls[:1]):
+            try:
+                r = requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout,
+                )
+                if r.ok:
+                    return r.json().get("response", "")
+                # Logged only: planning and routing fail over to their safe paths
+                # (one phase / the agent), which then report the same error.
+                print(f"[{label}] {describe_api_error(r, attempt_model)}")
+                status = r.status_code
+                if status == 429:
+                    break
+            except Exception as e:
+                # The URL and message only under verbose logs (the message can quote the URL).
+                print(f"[{label}] LLM call failed: "
+                      f"{(f'via {url}: {e}') if verbose_logs() else type(e).__name__}")
+                status = None
+        if status is None or attempt + 1 >= len(chain):
+            break
+        print(model_failover_line(label, attempt_model, status, chain[attempt + 1]))
     return ""
 
 
