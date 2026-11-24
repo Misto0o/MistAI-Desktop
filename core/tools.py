@@ -224,6 +224,9 @@ class ToolSpec:
     requires_focus: bool = False
     expected_runtime: float = 0.5  # seconds, informational for the planner
     settle: float = 0.15  # post-action settle before verification
+    # Earliest end of that settle with window events (core/live_state.py
+    # settle, SETTLE_FLOORS below); None = always the full settle, as before.
+    settle_floor: object = None
     base_reliability: float = 0.85  # prior belief, blended with observed stats
     base_confidence: float = 0.85  # confidence assigned to a successful run
     categories: tuple = field(default_factory=tuple)
@@ -747,6 +750,23 @@ _PLAYBOOK = {
 for _name, _doc in _PLAYBOOK.items():
     _doc = tuple(_doc) + ("",) * (4 - len(_doc))
     SPECS[_name].purpose, SPECS[_name].args, SPECS[_name].limits, SPECS[_name].example = _doc
+
+# Settle floors (window events, core/live_state.py settle): the settle above
+# stays the maximum; it may end after the floor once the expected window is
+# in front and the desktop has been quiet for QUIET_S. Only app launches and
+# switches, browser navigation and the UI input actions; every other action
+# (and quick_message, open_url, check_email: their window is unknown or the
+# step is safety-sensitive) keeps its fixed settle.
+SETTLE_FLOORS = {
+    "open_app": 0.4, "switch_app": 0.25,
+    "window_activate": 0.25, "window_maximize": 0.25, "window_minimize": 0.2,
+    "browser_navigate": 0.2, "browser_open": 0.2, "browser_search": 0.2,
+    "click_on_text": 0.15, "click_nth": 0.15, "click_coords": 0.15, "uia_click": 0.15,
+    "uia_find_input": 0.15, "type_search": 0.3,
+    "press_key": 0.1, "hotkey": 0.1, "scroll": 0.1, "type_text": 0.1,
+}
+for _name, _floor in SETTLE_FLOORS.items():
+    SPECS[_name].settle_floor = min(_floor, SPECS[_name].settle)
 
 # Structural parameter checks for the actions with a fixed format. A mismatch
 # never blocks the action; the observation then carries the action's entry.

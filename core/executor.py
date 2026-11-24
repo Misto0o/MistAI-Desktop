@@ -19,7 +19,8 @@
 #   11. RUNNING A VERIFIER
 #   12. METHOD CONFIDENCE AND BROWSER HINTS
 #   13. EXECUTION RESULT
-#   14. ACTION EXECUTOR
+#   14. SETTLE AFTER AN ACTION
+#   15. ACTION EXECUTOR
 # ============================================================
 
 """
@@ -369,6 +370,37 @@ class ExecutionResult:
 
 
 # ============================================================
+# SETTLE AFTER AN ACTION
+# ============================================================
+
+# The settle after an action: ToolSpec.settle is the maximum; with window
+# events (core/live_state.py settle) an action with a ToolSpec.settle_floor
+# may end it after the floor once the window it expects is in front and the
+# desktop is quiet: the app it opened or switched to, MistAI's browser
+# window after a navigation, else any window. Stand-ins without window
+# events, and every action without a floor, sleep the full settle as before.
+
+BROWSER_NAVIGATION = ("browser_navigate", "browser_open", "browser_search")
+
+
+def settle_after(api, action, param, spec, cap):
+    floor = getattr(spec, "settle_floor", None)
+    watched = getattr(getattr(api, "live", None), "window_events", None)
+    if floor is None or not isinstance(watched, events.WindowEvents):
+        time.sleep(cap)
+        return
+    if action in ("open_app", "switch_app"):
+        app = str(param or "").lower().strip()
+        expect = events.foreground_is(lambda hwnd: api._window_belongs_to(hwnd, app))
+        label = "window+quiet"
+    elif action in BROWSER_NAVIGATION:
+        expect, label = events.browser_window_present(), "browser window+quiet"
+    else:
+        expect, label = events.foreground_exists(), "quiet"
+    events.settle(watched, cap, floor, expect, label)
+
+
+# ============================================================
 # ACTION EXECUTOR
 # ============================================================
 
@@ -417,7 +449,7 @@ class Executor:
 
         # Settle from tool metadata (replaces AgentLoop._smart_settle) --
         # the UI must catch up BEFORE verification looks at ground truth.
-        time.sleep(reg.settle(action))
+        settle_after(api, action, param, spec, reg.settle(action))
         t_settle = time.perf_counter()
         # Anything but a read may have changed the screen: later vision reads
         # must use a frame captured after this point.

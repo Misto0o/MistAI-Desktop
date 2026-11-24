@@ -13,7 +13,10 @@ from `ui/html.py`'s JavaScript. Python talks back to the page with
 
 Long work never runs on the UI thread: the agent runs on its own thread
 (`AgentLoop.run_project`), the wake-word and push-to-talk listeners have
-theirs, the event bus (`core/live_state.py`) has one dispatch thread, and the
+theirs, the event bus (`core/live_state.py`) has one dispatch thread,
+`LiveStateTracker` has its 1 s poll plus a WinEvent hook thread (window
+events that let settles end early and an unchanged screen skip a re-read;
+screen frames are captured on demand by `WindowWatch`), and the
 floating orb has a 4 Hz control thread plus a per-flight animation thread.
 `Api._agent_lock` is the run gate: one task at a time; a second request is
 answered "I'm still working on ..." instead of queued.

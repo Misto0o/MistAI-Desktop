@@ -7,7 +7,7 @@
 #
 # SECTION INDEX
 #   1. OPTIONAL CAPTURE LIBRARY
-#   2. FRAME BUFFER
+#   2. WINDOW WATCH
 #   3. VISION
 #   4. OPTIONAL VISION LIBRARY
 #   5. COHERE VISION CLIENT
@@ -25,6 +25,7 @@
 core/screen.py — continuously-updated screen capture buffer.
 """
 
+import hashlib
 import threading
 import time
 import io
@@ -52,59 +53,87 @@ except Exception:
 
 
 # ============================================================
-# FRAME BUFFER
+# WINDOW WATCH
 # ============================================================
 
-class ScreenBuffer:
-    """Captures the screen continuously. A vision read asks frame_for_read(),
-    which only hands out a buffered frame captured AFTER the last UI action
-    (or phase start, see mark_action) and otherwise takes a fresh capture --
-    a frame from before the action shows a screen that no longer exists."""
+# Screen frames on demand (there is no capture loop any more: the old
+# ScreenBuffer grabbed the whole screen 30 times a second for reads that only
+# ever needed one frame) plus change detection for the screen-context cache.
+# Frames stay in memory only and are never saved or logged; logs carry
+# numbers and fixed labels.
 
-    def __init__(self, fps=4):
+def _frame_digest(img):
+    """A hash of the full-resolution pixels. Stricter than a downscaled
+    grayscale copy, which can average a one-pixel change away: any doubt
+    must read as "changed"."""
+    return hashlib.blake2b(img.tobytes(), digest_size=16).hexdigest()
+
+
+def _foreground_identity():
+    """(hwnd, title hash) of the window in front; the title stays in memory."""
+    try:
+        import win32gui
+
+        hwnd = win32gui.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd) if hwnd else ""
+    except Exception:
+        return None
+    return int(hwnd or 0), hashlib.blake2b(title.encode("utf-8", "replace"),
+                                           digest_size=8).hexdigest()
+
+
+class WindowWatch:
+    """Vision reads ask frame_for_read(), which hands out the last on-demand
+    frame only if it was captured AFTER the last UI action (or phase start,
+    see mark_action) and otherwise takes a fresh capture -- a frame from
+    before the action shows a screen that no longer exists.
+
+    remember_read() / unchanged_since_read(): the screen-context cache may be
+    reused past its expiry only when ALL hold: window events are healthy, the
+    same foreground window (hwnd and title hash), the same Open apps, no
+    relevant window event since the read, and an identical frame. Anything
+    else (and any failure) means re-read."""
+
+    def __init__(self, live=None):
         self._pil = self._cv = None
-        self._time = 0.0  # monotonic time the buffered frame's capture started
+        self._time = 0.0  # monotonic time the last on-demand frame's capture started
         self.last_action_at = 0.0  # mark_action(): last UI action / phase start
         self._lock = threading.Lock()
-        self._running = True
-        self._fps = fps
-        t = threading.Thread(target=self._loop, daemon=True, name="ScreenBuffer")
-        t.start()
-        for _ in range(40):
-            if self._pil:
-                break
-            time.sleep(0.05)
-        print(f"[ScreenBuffer] {fps}fps")
+        self._live = live
+        self._read_mark = None     # what the last screen-context read saw
+        self._uia = None           # the accessibility-text snapshot (one window)
+        print("[WindowWatch] frames on demand")
 
-    def _loop(self):
-        iv = 1.0 / max(self._fps, 1)
-        while self._running:
-            try:
-                t0 = time.monotonic()
-                pil = ImageGrab.grab()
-                cv = None
-                if OCR_AVAILABLE:
-                    cv = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-                with self._lock:
-                    self._pil, self._cv, self._time = pil, cv, t0
-            except Exception as e:
-                print(f"[ScreenBuffer] {e}")
-            time.sleep(iv)
+    # -- frames ---------------------------------------------------------------------
+
+    def _capture(self):
+        """A fresh capture, kept as the last frame (memory only)."""
+        t0 = time.monotonic()
+        pil = ImageGrab.grab()
+        with self._lock:
+            self._pil, self._cv, self._time = pil, None, t0
+        return pil
 
     @property
     def frame(self):
-        with self._lock:
-            return self._pil
+        """A fresh capture (stand-in code paths only; reads use frame_for_read)."""
+        try:
+            return self._capture()
+        except Exception as e:
+            print(f"[WindowWatch] capture failed ({type(e).__name__})")
+            return None
 
     def mark_action(self):
         """Something may have changed the screen: frames captured before now
-        are not handed to vision reads any more."""
+        are not handed to vision reads any more, and the accessibility-text
+        snapshot is dropped."""
         self.last_action_at = time.monotonic()
+        self._uia = None
 
     def frame_for_read(self, label="vision"):
-        """The frame for a vision read: the buffered one if it was captured
-        after the last mark_action(), else a fresh capture (~20-30ms at
-        1080p). None if a fresh capture fails -- never a frame from before
+        """The frame for a vision read: the last on-demand one if it was
+        captured after the last mark_action(), else a fresh capture (~20-30ms
+        at 1080p). None if a fresh capture fails -- never a frame from before
         the action. Logs the age of whatever is used."""
         with self._lock:
             pil, t = self._pil, self._time
@@ -115,7 +144,7 @@ class ScreenBuffer:
             return pil
         t0 = time.monotonic()
         try:
-            fresh = ImageGrab.grab()
+            fresh = self._capture()
         except Exception as e:
             print(f"[Frame] {label}: fresh capture failed ({e}); {age}, older than the "
                   "last action -- not used")
@@ -126,11 +155,130 @@ class ScreenBuffer:
 
     @property
     def cv_frame(self):
+        """A fresh capture as an OpenCV BGR array (the OCR's last fallback)."""
+        if not OCR_AVAILABLE:
+            return None
+        pil = self.frame
+        if pil is None:
+            return None
+        cv = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
         with self._lock:
-            return self._cv
+            self._cv = cv
+        return cv
 
     def stop(self):
-        self._running = False
+        pass
+
+    # -- change detection -------------------------------------------------------------
+
+    def _events(self):
+        from .live_state import WindowEvents
+        from .config import window_events_enabled
+
+        watched = getattr(self._live, "window_events", None)
+        if not isinstance(watched, WindowEvents) or not window_events_enabled():
+            return None
+        return watched if watched.healthy() else None
+
+    def _apps(self):
+        try:
+            return tuple(self._live.snapshot.get("open_apps") or ())
+        except Exception:
+            return None
+
+    def remember_read(self):
+        """Call right BEFORE a screen-context read: what it is about to see.
+        The event mark is taken first and the frame last, so a change during
+        the read shows up as a difference later (re-read), never as a match."""
+        self._read_mark = None
+        watched = self._events()
+        if watched is None:
+            return
+        try:
+            mark = {"seq": watched.mark(), "who": _foreground_identity(), "apps": self._apps()}
+            mark["frame"] = _frame_digest(self._capture())
+        except Exception:
+            return
+        if mark["who"] is not None and mark["apps"] is not None:
+            self._read_mark = mark
+
+    def forget_read(self):
+        """A UI action or phase start: nothing to compare with any more."""
+        self._read_mark = None
+
+    def unchanged_since_read(self):
+        """(unchanged, reason label). True only when every check passes."""
+        mark = self._read_mark
+        if mark is None:
+            return False, "no baseline"
+        watched = self._events()
+        if watched is None:
+            return False, "no window events"
+        if watched.changed_since(mark["seq"]):
+            return False, "window event"
+        if _foreground_identity() != mark["who"]:
+            return False, "foreground changed"
+        if self._apps() != mark["apps"]:
+            return False, "apps changed"
+        try:
+            same = _frame_digest(self._capture()) == mark["frame"]
+        except Exception:
+            return False, "capture failed"
+        if not same:
+            return False, "frame changed"
+        if watched.changed_since(mark["seq"]):          # an event during the capture
+            return False, "window event"
+        return True, ""
+
+    # -- accessibility text snapshot ----------------------------------------------------
+    # The UIA-first read's walk result for one window, reused only while the
+    # same window shows the same frame, no UI action ran and no relevant
+    # window event arrived since the walk began. An empty or tiny text
+    # (Chromium/Electron trees, withheld or slow windows) is never kept. No UIA
+    # event subscriptions: the walk itself is the only UIA access.
+
+    SNAPSHOT_MIN_CHARS = 8
+
+    def begin_uia_snapshot(self):
+        """Taken right BEFORE a walk: (event mark, frame hash, time), or None
+        without healthy window events."""
+        watched = self._events()
+        if watched is None:
+            return None
+        try:
+            seq = watched.mark()
+            return seq, _frame_digest(self._capture()), time.monotonic()
+        except Exception:
+            return None
+
+    def store_uia_snapshot(self, hwnd, text, begun):
+        """Keep the walk's text for ``hwnd`` (memory only), or drop the old one."""
+        text = str(text or "")
+        if begun is None or not hwnd or len(text.strip()) < self.SNAPSHOT_MIN_CHARS:
+            self._uia = None
+            return
+        seq, frame, at = begun
+        self._uia = {"hwnd": int(hwnd), "text": text, "seq": seq, "frame": frame, "at": at}
+
+    def uia_snapshot(self, hwnd):
+        """The kept text for ``hwnd`` if it is still valid, else None (and
+        it is dropped). Any doubt = None: the caller walks the tree again."""
+        snap = getattr(self, "_uia", None)
+        if snap is None or snap["hwnd"] != int(hwnd or 0):
+            return None
+        watched = self._events()
+        ok = (watched is not None and snap["at"] > self.last_action_at
+              and not watched.changed_since(snap["seq"]))
+        if ok:
+            try:
+                ok = _frame_digest(self._capture()) == snap["frame"]
+            except Exception:
+                ok = False
+            ok = ok and not watched.changed_since(snap["seq"])
+        if not ok:
+            self._uia = None
+            return None
+        return snap["text"]
 
 
 # ============================================================

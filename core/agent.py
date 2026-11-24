@@ -44,6 +44,7 @@ from .config import (
 from .executor import Executor
 from .floating_orb import signal_scope, waiting_scope
 from .live_state import describe_open_apps
+from . import live_state as window_events
 from .tools import (CLICK_FAMILY, READ_RESULT_CHARS, SPECS, action_entry, action_menu,
                     arg_problem, command_is_mutating)
 from .screen import text_is_sufficient
@@ -487,6 +488,24 @@ class AgentLoop:
     def _foreground_key(snap):
         return (snap.get("foreground_hwnd"), snap.get("foreground_window"))
 
+    def _watch(self, name):
+        """Call a WindowWatch method if the screen object has it (stand-ins
+        don't); None on any failure."""
+        fn = getattr(getattr(self.api, "screen", None), name, None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def _screen_unchanged(self):
+        """(unchanged, reason label) from WindowWatch; any doubt = changed."""
+        got = self._watch("unchanged_since_read")
+        if not (isinstance(got, tuple) and len(got) == 2):
+            return False, "no change check"
+        return bool(got[0]), str(got[1] or "")
+
     def _changes_ui(self, action, categories):
         """Gated mode: does this action change what is on screen? browser_*
         DOM actions don't need a screen re-read (their result carries the page
@@ -586,6 +605,10 @@ class AgentLoop:
         except Exception:
             return self._foreground_key(getattr(self.api.live, "snapshot", {}) or {})
 
+    # After every executed step: at most this long, at least the floor when
+    # window events say the desktop is quiet (core/live_state.py settle).
+    STEP_SETTLE_S = 0.2
+    STEP_SETTLE_FLOOR = 0.05
     # After a dialog key: up to this many short waits for the window in front
     # to change (a file dialog can take a moment to appear).
     WINDOW_CHECK_POLLS = 6
@@ -1018,7 +1041,16 @@ class AgentLoop:
                         read_reason = "foreground changed" + (  # the title is content
                             f" to {fg_key[1]!r}" if verbose_logs() else "")
                     elif time.monotonic() - screen_cache_time > self.GATED_CACHE_SECONDS:
-                        read_reason = "cache expired"
+                        # Expired: reused only when nothing changed (WindowWatch:
+                        # no window events, same window, same frame), else re-read.
+                        same, why = self._screen_unchanged()
+                        if same:
+                            print("  [Screen] unchanged since last read "
+                                  "(no events, same frame), reuse")
+                            screen_cache_time = time.monotonic()
+                            read_reason = ""
+                        else:
+                            read_reason = f"cache expired ({why})"
                     else:
                         read_reason = ""
                     need_read = bool(read_reason)
@@ -1029,6 +1061,8 @@ class AgentLoop:
                 skip_now, verified_read_skip = verified_read_skip, False
                 if need_read:
                     t0 = time.monotonic()
+                    if gating:
+                        self._watch("remember_read")      # what this read is about to see
                     if lazy_first and first_read:
                         print(
                             "  [Screen] lazy first read: title + Open apps"
@@ -1627,7 +1661,14 @@ class AgentLoop:
             executed_param = getattr(res, "parameter", param)
             last_executed = executed_action
 
-            time.sleep(0.2)
+            # The breathing room after every step (0.2 s): with window events
+            # it may end after STEP_SETTLE_FLOOR once the desktop is quiet.
+            watched = getattr(getattr(self.api, "live", None), "window_events", None)
+            if isinstance(watched, window_events.WindowEvents):
+                window_events.settle(watched, self.STEP_SETTLE_S, self.STEP_SETTLE_FLOOR,
+                                     window_events.foreground_exists(), "quiet", "step settle")
+            else:
+                time.sleep(self.STEP_SETTLE_S)
 
             try:
                 spec = self.api.tools.get(executed_action)

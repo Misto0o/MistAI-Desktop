@@ -895,8 +895,9 @@ def test_built_in_apps_still_match_through_vendor_prefixes():
 # SEARCH, PROCESS AND TIMING GATED RUN
 # ============================================================
 
-def _gated_run(monkeypatch, script, gating, on_exec=None):
-    """Run the loop over scripted actions; returns the number of screen reads."""
+def _gated_run(monkeypatch, script, gating, on_exec=None, screen=None):
+    """Run the loop over scripted actions; returns the number of screen reads.
+    ``screen``: a WindowWatch stand-in (change detection), else none."""
     monkeypatch.setenv("MISTAI_VISION_GATING", "1" if gating else "0")
     replies = iter(
         [json.dumps({"action": a, "parameter": p}) for a, p in script]
@@ -929,6 +930,8 @@ def _gated_run(monkeypatch, script, gating, on_exec=None):
         _resolve_path_placeholders=lambda p: p,
         speak=lambda _s: None,
     )
+    if screen is not None:
+        api.screen = screen
     monkeypatch.setattr(
         "core.agent.requests.post",
         lambda *a, **k: SimpleNamespace(ok=True, status_code=200, json=lambda: {"response": next(replies)}),

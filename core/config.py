@@ -587,6 +587,14 @@ def uia_first_enabled():
     return env_flag("MISTAI_UIA_FIRST", True)
 
 
+def window_events_enabled():
+    """MISTAI_WINDOW_EVENTS (default on; for tests and rollback only, no
+    setting): the WinEvent hook (core/live_state.py WINDOW EVENTS) that lets
+    settles end early and an expired screen cache be reused when nothing
+    changed. 0 = no hook: the fixed waits and the 30 s expiry, as before."""
+    return env_flag("MISTAI_WINDOW_EVENTS", True)
+
+
 # Floating orb (core/floating_orb.py): window sides in logical px (scaled by
 # the monitor DPI) per state, and the flat frosted-glass tint of its page.
 ORB_SIZE_BIG = 82        # idle, listening (at home)

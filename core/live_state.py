@@ -30,12 +30,18 @@
 #   21. WINDOW OWNERSHIP
 #   22. UWP FRAME APPS
 #   23. VISIBLE WINDOW PROCESSES
-#   24. LIVE STATE TRACKER
-#   25. WATCHERS
-#   26. OPTIONAL FILE WATCHING LIBRARY
-#   27. STATE WATCHER
-#   28. FILE EVENT HANDLER
-#   29. FILE WATCHER
+#   24. WINDOW EVENTS
+#   25. WINDOW EVENT SETTINGS
+#   26. WINDOW EVENT STATE
+#   27. WINEVENT HOOK
+#   28. PLAYWRIGHT BROWSER WINDOW
+#   29. WINDOW SETTLE
+#   30. LIVE STATE TRACKER
+#   31. WATCHERS
+#   32. OPTIONAL FILE WATCHING LIBRARY
+#   33. STATE WATCHER
+#   34. FILE EVENT HANDLER
+#   35. FILE WATCHER
 # ============================================================
 
 """
@@ -58,6 +64,7 @@ import pyautogui
 
 from . import live_state as clipboard, live_state as events
 from .config import (
+    window_events_enabled,
     TRACKED_APPS,
     TRACKED_PROCESS_NAMES,
     is_self_process,
@@ -619,6 +626,482 @@ def _visible_window_pids():
 
 
 # ============================================================
+# WINDOW EVENTS
+# ============================================================
+
+# Real window events instead of guessing (MISTAI_WINDOW_EVENTS, default on;
+# for tests and rollback only). LiveStateTracker owns one WinEventHook: a
+# daemon thread that installs SetWinEventHook out of context and runs its own
+# message loop, so callbacks arrive on that thread. They are filtered to
+# top-level windows and copied into WindowEvents (foreground hwnd + pid, a
+# ring of recent events with timestamps, a sequence number). No titles, text
+# or pixels are kept; logs carry numbers and labels only.
+#
+# Everything that uses it (core/screen.py WindowWatch: settles, the screen
+# cache reuse, the accessibility-text cache) asks healthy() first and falls
+# back to today's fixed waits and reads when the hook is not installed, its
+# thread died, no event ever arrived, or the 1 s poll sees a foreground the
+# hook never reported (events stopped arriving).
+
+# ============================================================
+# WINDOW EVENT SETTINGS
+# ============================================================
+
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_CREATE = 0x8000
+EVENT_OBJECT_DESTROY = 0x8001
+EVENT_OBJECT_SHOW = 0x8002
+EVENT_OBJECT_HIDE = 0x8003
+EVENT_OBJECT_NAMECHANGE = 0x800C
+WINEVENT_OUTOFCONTEXT = 0x0000
+OBJID_WINDOW = 0
+CHILDID_SELF = 0
+GA_ROOT = 2
+WM_QUIT = 0x0012
+WINDOW_EVENT_KINDS = {
+    EVENT_SYSTEM_FOREGROUND: "foreground", EVENT_OBJECT_CREATE: "create",
+    EVENT_OBJECT_DESTROY: "destroy", EVENT_OBJECT_SHOW: "show", EVENT_OBJECT_HIDE: "hide",
+    EVENT_OBJECT_NAMECHANGE: "name",
+}
+WINDOW_EVENT_RANGES = ((EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+                       (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
+                       (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE))
+EVENT_RING = 64
+QUIET_S = 0.15            # no relevant event for this long = quiet
+WAIT_POLL_S = 0.05        # wait_for re-checks its condition at least this often
+STALE_POLLS = 2           # polls in a row whose foreground the hook never reported
+TOP_LEVEL_MEMORY = 4096   # top-level hwnds remembered so their destroy counts
+
+
+# ============================================================
+# WINDOW EVENT STATE
+# ============================================================
+
+class WindowEvents:
+    """Thread-safe window state fed by the hook (or by tests). Events from
+    MistAI's own process are kept but are not "relevant": the orb, its panels
+    and the caption window never count as the desktop changing."""
+
+    def __init__(self, clock=time.monotonic, own_pid=None):
+        self._cv = threading.Condition()
+        self._clock = clock
+        self._own_pid = os.getpid() if own_pid is None else own_pid
+        self.ring = deque(maxlen=EVENT_RING)   # (time, kind, hwnd, pid)
+        self.seq = 0                 # every event
+        self.relevant_seq = 0        # events from other processes
+        self.last_relevant_at = None
+        self.foreground = (0, 0)     # (hwnd, pid) from the last foreground event
+        self.seen = 0
+        self.installed = False
+        self.alive = lambda: False   # the hook thread is running (set by the hook)
+        self.stale = False           # events stopped arriving (the poll disagrees)
+        self._mismatch = (0, 0)      # (polled hwnd, polls in a row)
+        self._names = {}             # pid -> process name, looked up lazily
+        self._logged = set()
+        self.listener = None         # called (fast) on a foreground event
+
+    # -- feeding ------------------------------------------------------------------
+
+    def record(self, kind, hwnd, pid):
+        now = self._clock()
+        with self._cv:
+            self.seq += 1
+            self.seen += 1
+            self.ring.append((now, kind, int(hwnd or 0), int(pid or 0)))
+            if kind == "foreground":
+                self.foreground = (int(hwnd or 0), int(pid or 0))
+            if pid != self._own_pid:
+                self.relevant_seq += 1
+                self.last_relevant_at = now
+            self._cv.notify_all()
+        if kind == "foreground" and self.listener is not None:
+            try:
+                self.listener()
+            except Exception:
+                pass
+
+    def check_poll(self, polled_hwnd):
+        """The 1 s poll's foreground. Two polls in a row on the same window
+        the hook never reported as foreground = events stopped arriving
+        (stale, logged once); agreeing again clears it."""
+        polled_hwnd = int(polled_hwnd or 0)
+        if not polled_hwnd or not self.installed:
+            return
+        with self._cv:
+            if polled_hwnd == self.foreground[0]:
+                self._mismatch = (0, 0)
+                back = self.stale
+                self.stale = False
+            else:
+                prev, n = self._mismatch
+                n = n + 1 if prev == polled_hwnd else 1
+                self._mismatch = (polled_hwnd, n)
+                back = False
+                if n >= STALE_POLLS and not self.stale:
+                    self.stale = True
+                    self._log_once("stale", "[WindowWatch] window events stopped arriving "
+                                            "-- fixed waits")
+        if back:
+            self._log_once("back", "[WindowWatch] window events arriving again")
+
+    def _log_once(self, key, line):
+        if key not in self._logged:
+            self._logged.add(key)
+            print(line)
+
+    # -- reading ------------------------------------------------------------------
+
+    def healthy(self):
+        """Usable for early returns and reuse: installed, thread alive, at
+        least one event seen and not stale. Logs once when the thread died."""
+        if not self.installed:
+            return False
+        try:
+            alive = bool(self.alive())
+        except Exception:
+            alive = False
+        if not alive:
+            self._log_once("dead", "[WindowWatch] window event thread stopped -- fixed waits")
+            return False
+        return self.seen > 0 and not self.stale
+
+    def quiet_for(self, period=QUIET_S):
+        """No relevant event for ``period`` seconds."""
+        with self._cv:
+            last = self.last_relevant_at
+        return last is None or self._clock() - last >= period
+
+    def mark(self):
+        """The relevant-event sequence now (compare with changed_since)."""
+        with self._cv:
+            return self.relevant_seq
+
+    def changed_since(self, mark):
+        with self._cv:
+            return self.relevant_seq != mark
+
+    def foreground_changed(self, from_hwnd):
+        """A wait_for condition: the hook reported another foreground window."""
+        return lambda: self.foreground[0] not in (0, int(from_hwnd or 0))
+
+    def quiet(self, period=QUIET_S):
+        """A wait_for condition: no relevant event for ``period`` seconds."""
+        return lambda: self.quiet_for(period)
+
+    def process_name(self, pid):
+        """A process's name (cached per pid; looked up on demand only)."""
+        pid = int(pid or 0)
+        if pid not in self._names:
+            try:
+                self._names[pid] = psutil.Process(pid).name().lower().replace(".exe", "")
+            except Exception:
+                return ""
+            if len(self._names) > 512:
+                self._names.clear()
+        return self._names.get(pid, "")
+
+    def window_exists(self, title=None, process=None):
+        """A wait_for condition: a visible top-level window whose title
+        contains ``title`` (case-insensitive) or whose process matches
+        ``process`` exists. Titles are compared in memory, never logged."""
+        want = str(title or "").lower()
+
+        def check():
+            try:
+                import win32gui
+                import win32process
+            except Exception:
+                return False
+            found = []
+
+            def visit(h, _):
+                if found or not win32gui.IsWindowVisible(h):
+                    return True
+                if want and want in win32gui.GetWindowText(h).lower():
+                    found.append(h)
+                elif process:
+                    pid = win32process.GetWindowThreadProcessId(h)[1]
+                    if process_matches(process, self.process_name(pid)):
+                        found.append(h)
+                return True
+
+            try:
+                win32gui.EnumWindows(visit, None)
+            except Exception:
+                pass
+            return bool(found)
+
+        return check
+
+    def wait_for(self, condition, timeout, poll=WAIT_POLL_S):
+        """Wait until ``condition()`` is true (re-checked on every event and at
+        least every ``poll`` s) or ``timeout`` s passed. True when it held."""
+        deadline = self._clock() + max(0.0, float(timeout))
+        while True:
+            with self._cv:
+                seen = self.seq
+            try:
+                if condition():
+                    return True
+            except Exception:
+                pass
+            left = deadline - self._clock()
+            if left <= 0:
+                return False
+            with self._cv:
+                if self.seq == seen:
+                    self._cv.wait(min(poll, left))
+
+
+# ============================================================
+# WINEVENT HOOK
+# ============================================================
+
+class WinEventHook:
+    """SetWinEventHook out of context on its own daemon thread with a
+    GetMessage loop (the callbacks run there). start() waits briefly for the
+    install; a failure is logged once and leaves WindowEvents uninstalled, so
+    every user falls back to the fixed waits. stop() posts WM_QUIT; the
+    daemon thread never blocks app exit."""
+
+    def __init__(self, state, start_timeout=1.0):
+        self.state = state
+        self._start_timeout = start_timeout
+        self._ready = threading.Event()
+        self._thread = None
+        self._tid = 0
+        self._proc = None            # the ctypes callback; must outlive the hooks
+        self._top = set()            # top-level hwnds seen (so their destroy counts)
+        self._user32 = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="WindowEvents")
+        self.state.alive = lambda: bool(self._thread and self._thread.is_alive())
+        try:
+            self._thread.start()
+        except Exception as e:
+            print(f"[WindowWatch] window events unavailable ({type(e).__name__}) -- fixed waits")
+            return False
+        self._ready.wait(self._start_timeout)
+        return self.state.installed
+
+    def _api(self):
+        from ctypes import wintypes
+
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        proc_t = ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+                                    wintypes.LONG, wintypes.LONG, wintypes.DWORD,
+                                    wintypes.DWORD)
+        u.SetWinEventHook.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+                                      proc_t, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+        u.SetWinEventHook.restype = wintypes.HANDLE
+        u.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+        u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        u.GetAncestor.restype = wintypes.HWND
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                  wintypes.UINT, wintypes.UINT]
+        u.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM,
+                                         wintypes.LPARAM]
+        u.GetForegroundWindow.restype = wintypes.HWND
+        return u, proc_t
+
+    def _run(self):
+        from ctypes import wintypes
+
+        hooks = []
+        try:
+            u, proc_t = self._api()
+            self._user32 = u
+            self._proc = proc_t(self._callback)
+            for lo, hi in WINDOW_EVENT_RANGES:
+                h = u.SetWinEventHook(lo, hi, None, self._proc, 0, 0, WINEVENT_OUTOFCONTEXT)
+                if not h:
+                    code = ctypes.get_last_error()
+                    for x in hooks:
+                        u.UnhookWinEvent(x)
+                    print(f"[WindowWatch] window events unavailable (hook install failed, "
+                          f"error {code}) -- fixed waits")
+                    return
+                hooks.append(h)
+            self._tid = ctypes.WinDLL("kernel32").GetCurrentThreadId()
+            fg = u.GetForegroundWindow() or 0
+            pid = wintypes.DWORD(0)
+            if fg:
+                u.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            with self.state._cv:
+                self.state.foreground = (int(fg), int(pid.value))
+            self.state.installed = True
+            print(f"[WindowWatch] window events on ({len(hooks)} hooks)")
+            self._ready.set()
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u.TranslateMessage(ctypes.byref(msg))
+                u.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            print(f"[WindowWatch] window events unavailable ({type(e).__name__}) -- fixed waits")
+        finally:
+            self.state.installed = False         # the loop ended: fixed waits from now
+            try:
+                for h in hooks:
+                    self._user32.UnhookWinEvent(h)
+            except Exception:
+                pass
+            self._ready.set()
+
+    def _callback(self, _hook, event, hwnd, id_object, id_child, _thread, _ms):
+        """On the hook thread, per event: integer filters first, then copy
+        (kind, hwnd, pid) into WindowEvents. Never raises, never logs."""
+        try:
+            if id_object != OBJID_WINDOW or id_child != CHILDID_SELF or not hwnd:
+                return
+            kind = WINDOW_EVENT_KINDS.get(event)
+            if kind is None:
+                return
+            u = self._user32
+            if kind == "destroy":                    # a destroyed window has no ancestor
+                if hwnd not in self._top:
+                    return
+                self._top.discard(hwnd)
+            elif kind != "foreground" and u.GetAncestor(hwnd, GA_ROOT) != hwnd:
+                return
+            else:
+                if len(self._top) > TOP_LEVEL_MEMORY:
+                    self._top.clear()
+                self._top.add(hwnd)
+            from ctypes import wintypes
+
+            pid = wintypes.DWORD(0)
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            self.state.record(kind, hwnd, pid.value)
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            if self._tid and self._user32 is not None:
+                self._user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+
+
+# ============================================================
+# PLAYWRIGHT BROWSER WINDOW
+# ============================================================
+
+# MistAI's dedicated browser is Playwright's Firefox, run from its own folder.
+PLAYWRIGHT_PATH_HINTS = ("ms-playwright", ".local-browsers")
+
+
+def playwright_window():
+    """The visible top-level window of MistAI's Playwright Firefox, or None."""
+    try:
+        import win32gui
+        import win32process
+
+        found = []
+
+        def visit(hwnd, _):
+            if found or not win32gui.IsWindowVisible(hwnd) or not win32gui.GetWindowText(hwnd):
+                return True
+            try:
+                exe = psutil.Process(win32process.GetWindowThreadProcessId(hwnd)[1]).exe()
+            except Exception:
+                return True
+            if any(h in exe.lower() for h in PLAYWRIGHT_PATH_HINTS):
+                found.append(hwnd)
+            return True
+
+        win32gui.EnumWindows(visit, None)
+        return found[0] if found else None
+    except Exception:
+        return None
+
+
+# ============================================================
+# WINDOW SETTLE
+# ============================================================
+
+# A settle that ends early only when it is safe: never before ``floor``,
+# early only when the expected window is there (``expect``) AND no relevant
+# window event arrived for QUIET_S; otherwise the full ``cap`` (today's fixed
+# value). No floor, no healthy hook or MISTAI_WINDOW_EVENTS=0: exactly
+# time.sleep(cap), as before. One content-free log line per settle.
+
+def settle(watched, cap, floor=None, expect=None, label="quiet", tag="settle", sleep=None):
+    """Wait after an action; returns (seconds waited, reason label)."""
+    sleep = sleep or time.sleep
+    cap = max(0.0, float(cap or 0.0))
+    usable = False
+    if floor is not None and isinstance(watched, WindowEvents) and floor < cap:
+        try:
+            usable = window_events_enabled() and watched.healthy()
+        except Exception:
+            usable = False
+    if not usable:
+        sleep(cap)
+        return cap, "fixed"
+    t0 = time.monotonic()
+    sleep(floor)
+
+    def ready():
+        if expect is not None and not expect():
+            return False
+        return watched.quiet_for(QUIET_S)
+
+    try:
+        early = watched.wait_for(ready, cap - (time.monotonic() - t0))
+    except Exception:
+        early = False
+    waited = time.monotonic() - t0
+    if not early:                                    # never less than the cap without a signal
+        if waited < cap:
+            sleep(cap - waited)
+        waited = cap
+    reason = label if early else "no early signal"
+    print(f"[WindowWatch] {tag} {waited:.2f}s (cap {cap:.2f}s, {reason})")
+    return waited, reason
+
+
+def foreground_is(matches):
+    """An ``expect`` for settle: the foreground window satisfies
+    ``matches(hwnd)`` (e.g. it belongs to the app that was opened)."""
+    def check():
+        try:
+            import win32gui
+
+            hwnd = win32gui.GetForegroundWindow()
+            return bool(hwnd) and bool(matches(hwnd))
+        except Exception:
+            return False
+
+    return check
+
+
+def foreground_exists():
+    """An ``expect`` for settle: some window is in front."""
+    return foreground_is(lambda hwnd: True)
+
+
+def browser_window_present():
+    """An ``expect`` for settle: MistAI's Playwright Firefox window is
+    visible (looked up once per settle, then only re-validated)."""
+    box = {}
+
+    def check():
+        try:
+            import win32gui
+
+            if "hwnd" not in box:
+                box["hwnd"] = playwright_window() or 0
+            return bool(box["hwnd"]) and bool(win32gui.IsWindowVisible(box["hwnd"]))
+        except Exception:
+            return False
+
+    return check
+
+
+# ============================================================
 # LIVE STATE TRACKER
 # ============================================================
 
@@ -637,18 +1120,37 @@ class LiveStateTracker:
         }
         self._lock = threading.Lock()
         self._running = True
+        # Window events (WINDOW EVENTS): a foreground change re-polls at once
+        # instead of up to 1 s later; the poll cross-checks the hook.
+        self._kick = threading.Event()
+        self.window_events = WindowEvents()
+        self._hook = None
+        if window_events_enabled():
+            self.window_events.listener = self._kick.set
+            self._hook = WinEventHook(self.window_events)
+            self._hook.start()
+        else:
+            print("[WindowWatch] window events off (MISTAI_WINDOW_EVENTS=0) -- fixed waits")
         t = threading.Thread(target=self._loop, daemon=True, name="LiveStateTracker")
         t.start()
         time.sleep(1.2)
         print("[LiveStateTracker] Running")
 
+    POLL_S = 1.0
+    MIN_POLL_S = 0.2          # a burst of foreground events re-polls at most this often
+
     def _loop(self):
         while self._running:
+            t0 = time.monotonic()
             try:
                 self._update()
             except Exception as e:
                 print(f"[LiveState] {e}")
-            time.sleep(1.0)
+            self._kick.wait(self.POLL_S)
+            self._kick.clear()
+            spent = time.monotonic() - t0
+            if spent < self.MIN_POLL_S:
+                time.sleep(self.MIN_POLL_S - spent)
 
     def _update(self):
         s = {}
@@ -657,6 +1159,9 @@ class LiveStateTracker:
             fg = win32gui.GetForegroundWindow()
             s["foreground_hwnd"] = fg
             s["foreground_window"] = win32gui.GetWindowText(fg) or "Unknown"
+            watched = getattr(self, "window_events", None)
+            if watched is not None:
+                watched.check_poll(fg)          # did the hook see this foreground?
             wins = []
 
             def _cb(h, _):
@@ -730,6 +1235,9 @@ class LiveStateTracker:
 
     def stop(self):
         self._running = False
+        hook = getattr(self, "_hook", None)
+        if hook is not None:
+            hook.stop()
 
 
 # ============================================================
@@ -791,7 +1299,15 @@ class StateWatcher:
                 self._diff(self.live.snapshot)
             except Exception as e:
                 print(f"[StateWatcher] {e}")
-            time.sleep(self.interval)
+            # With window events: wake as soon as a relevant window event
+            # arrives (still at most every interval), else sleep as before.
+            watched = getattr(self.live, "window_events", None)
+            if watched is not None and watched.healthy():
+                mark = watched.mark()
+                watched.wait_for(lambda: watched.changed_since(mark), self.interval)
+                time.sleep(0.1)                 # let the tracker's re-poll land first
+            else:
+                time.sleep(self.interval)
 
     def _diff(self, snap):
         if self._prev is None:

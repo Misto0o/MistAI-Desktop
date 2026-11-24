@@ -107,7 +107,7 @@ from .live_state import EventBus, LiveStateTracker, window_belongs_to, FileWatch
 from .executor import Executor
 from .floating_orb import signal_scope, waiting_scope
 from .memory import Memory, recall_builtin, TaskStore
-from .screen import ScreenBuffer, CohereVision
+from .screen import WindowWatch, CohereVision
 from .tools import ToolRegistry
 from .tts import NeuralTTS, VoiceTimer, WakeCalibration
 from .workspace import Workspace
@@ -728,8 +728,10 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         self._model = self._load_model_choice()
         self._request_model = None  # the running request's model (hotkey lookup)
         self.vision = CohereVision()
-        self.screen = ScreenBuffer(fps=30)
         self.live = LiveStateTracker()
+        # Frames on demand + change detection (WindowWatch), fed by the
+        # tracker's window events; no capture loop.
+        self.screen = WindowWatch(live=self.live)
         self.click_handler = ImprovedClickHandler(
             live_state=self.live, vision_engine=self.vision, screen_buffer=self.screen
         )
@@ -3051,11 +3053,19 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         """Wait for a VISIBLE window, not merely a process -- Electron apps
         register a process well before they have anything to show."""
         deadline = time.time() + timeout
+        watched = getattr(getattr(self, "live", None), "window_events", None)
         while time.time() < deadline:
             state, _ = self.app_window_state(app_lower)
             if state in ("foreground", "visible"):
                 return True
-            time.sleep(0.4)
+            if isinstance(watched, clip.WindowEvents) and watched.healthy():
+                # Wake on the next window event instead of a blind 0.4 s
+                # (the same check, the same timeout).
+                mark = watched.mark()
+                watched.wait_for(lambda: watched.changed_since(mark),
+                                 min(0.4, max(0.0, deadline - time.time())), poll=0.4)
+            else:
+                time.sleep(0.4)
         return False
 
     def switch_to_app(self, app_name):
@@ -4547,7 +4557,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
 
     def _vision_frame(self, label):
         """Frame for a vision read: captured after the last UI action
-        (ScreenBuffer.frame_for_read), falling back to .frame for stand-ins."""
+        (WindowWatch.frame_for_read), falling back to .frame for stand-ins."""
         get = getattr(self.screen, "frame_for_read", None)
         return get(label) if callable(get) else self.screen.frame
 
@@ -4629,8 +4639,37 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         native = not any(h in title.lower() for h in BROWSER_HINTS)
         if not native and not include_browser:
             return "", title, False, kind, asked
-        text, _ = foreground_uia_text(hwnd)
+        text = self._uia_text_cached(hwnd, foreground_uia_text)
         return text, title, native, kind, asked
+
+    def _uia_text_cached(self, hwnd, walk):
+        """The window's accessibility text: WindowWatch's snapshot while it
+        is valid (same window and frame, no UI action or window event since),
+        else a fresh walk that becomes the new snapshot. Stand-ins without
+        WindowWatch always walk. Logs a fixed label and a length only."""
+        watch = getattr(self, "screen", None)
+        get = getattr(watch, "uia_snapshot", None)
+        begin = getattr(watch, "begin_uia_snapshot", None)
+        store = getattr(watch, "store_uia_snapshot", None)
+        if not (callable(get) and callable(begin) and callable(store)):
+            return walk(hwnd)[0]
+        try:
+            kept = get(hwnd)
+        except Exception:
+            kept = None
+        if kept is not None:
+            print(f"[UIA] snapshot reused (no events, same frame, {len(kept)} chars)")
+            return kept
+        try:
+            begun = begin()
+        except Exception:
+            begun = None
+        text = walk(hwnd)[0]
+        try:
+            store(hwnd, text, begun)
+        except Exception:
+            pass
+        return text
 
     def _vision_read(self, query):
         """(answer, ok): the vision model's literal reading of the screen."""

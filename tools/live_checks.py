@@ -328,7 +328,7 @@ def stub_api_factory():
     patches.set(api_mod, "sr", SimpleNamespace(Recognizer=sr.Recognizer,
                                                Microphone=lambda *a, **k: None))
     for name, fake in (("NeuralTTS", FakeTTS), ("CohereVision", FakeVision),
-                       ("ScreenBuffer", FakeScreen), ("LiveStateTracker", FakeLive),
+                       ("WindowWatch", FakeScreen), ("LiveStateTracker", FakeLive),
                        ("StateWatcher", _Nothing), ("FileWatcher", _Nothing),
                        ("EnhancedUIANavigator", _Nothing), ("ENHANCED_UTILS_AVAILABLE", False)):
         patches.set(api_mod, name, fake)

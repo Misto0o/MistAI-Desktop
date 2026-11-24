@@ -36,6 +36,9 @@
 #   29. CLIPBOARD RELIABILITY TESTS
 #   30. CLIPBOARD RELIABILITY FAKE WIN32
 #   31. CLIPBOARD RELIABILITY TESTS (2)
+#   32. WINDOW EVENTS
+#   33. WINDOW EVENTS HELPERS
+#   34. WINDOW EVENTS TESTS
 # ============================================================
 
 """Windows and input targets, restore after a task, clipboard reliability."""
@@ -44,6 +47,8 @@ import sys
 from types import SimpleNamespace
 import os
 import inspect
+import re
+import time
 import threading
 
 import pytest
@@ -1290,3 +1295,307 @@ def test_previous_clipboard_is_restored_even_if_the_paste_fails(monkeypatch, key
                         lambda *k: (_ for _ in ()).throw(RuntimeError("x")))
     assert Api._act_type_text(api, "hello") is False
     assert api.clip_sets[-1] == "keep me"
+
+
+# ============================================================
+# WINDOW EVENTS
+# ============================================================
+
+# core/live_state.py WINDOW EVENTS / WINEVENT HOOK / WINDOW SETTLE: a
+# WinEvent hook feeds WindowEvents; settles end early only after their floor,
+# with the expected window in front and the desktop quiet, else wait the old
+# cap; any failure (no hook, dead thread, stale events, MISTAI_WINDOW_EVENTS=0)
+# means the old fixed waits. The real hook is only installed by the
+# Windows-only test.
+
+
+# ============================================================
+# WINDOW EVENTS HELPERS
+# ============================================================
+
+def _healthy_events(quiet=True):
+    ev = clip.WindowEvents(own_pid=1)
+    ev.installed = True
+    ev.alive = lambda: True
+    ev.record("show", 10, 2)
+    if quiet:
+        ev.last_relevant_at = time.monotonic() - 10
+    return ev
+
+
+def _settle_line(out):
+    return [l for l in out.splitlines() if l.startswith("[WindowWatch]")]
+
+
+def _later(seconds, fn):
+    t = threading.Timer(seconds, fn)
+    t.daemon = True
+    t.start()
+    return t
+
+
+# ============================================================
+# WINDOW EVENTS TESTS
+# ============================================================
+
+def test_wait_for_returns_early_on_a_matching_event():
+    ev = _healthy_events()
+    _later(0.05, lambda: ev.record("foreground", 42, 2))
+    t0 = time.monotonic()
+    assert ev.wait_for(ev.foreground_changed(0), 2.0) is True
+    assert time.monotonic() - t0 < 1.0
+    assert ev.foreground == (42, 2)
+
+
+def test_wait_for_times_out_when_nothing_matches():
+    ev = _healthy_events()
+    t0 = time.monotonic()
+    assert ev.wait_for(lambda: False, 0.2) is False
+    assert 0.19 <= time.monotonic() - t0 < 1.0
+
+
+def test_settle_returns_early_but_never_before_the_floor(monkeypatch, capsys):
+    monkeypatch.delenv("MISTAI_WINDOW_EVENTS", raising=False)
+    ev = _healthy_events()
+    waited, reason = clip.settle(ev, 1.5, 0.3, lambda: True, "window+quiet")
+    assert 0.3 <= waited < 1.0 and reason == "window+quiet"
+    line = _settle_line(capsys.readouterr().out)
+    assert len(line) == 1
+    assert re.fullmatch(r"\[WindowWatch\] settle 0\.\d\ds \(cap 1\.50s, window\+quiet\)", line[0])
+
+
+def test_settle_waits_the_old_cap_when_the_window_never_appears(monkeypatch, capsys):
+    monkeypatch.delenv("MISTAI_WINDOW_EVENTS", raising=False)
+    ev = _healthy_events()
+    waited, reason = clip.settle(ev, 0.4, 0.1, lambda: False, "window+quiet")
+    assert waited == 0.4 and reason == "no early signal"
+    assert "(cap 0.40s, no early signal)" in capsys.readouterr().out
+
+
+def test_settle_waits_the_cap_while_events_keep_arriving(monkeypatch):
+    monkeypatch.delenv("MISTAI_WINDOW_EVENTS", raising=False)
+    ev = _healthy_events(quiet=False)
+    stop = threading.Event()
+
+    def busy():
+        while not stop.is_set():
+            ev.record("name", 11, 2)
+            time.sleep(0.03)
+
+    threading.Thread(target=busy, daemon=True).start()
+    try:
+        waited, reason = clip.settle(ev, 0.4, 0.1, lambda: True)
+    finally:
+        stop.set()
+    assert waited == 0.4 and reason == "no early signal"
+
+
+def test_own_process_events_do_not_break_the_quiet():
+    ev = _healthy_events()
+    ev.record("show", 5, 1)                    # MistAI's own orb / caption window
+    assert ev.quiet_for(0.15)
+    ev.record("show", 5, 2)
+    assert not ev.quiet_for(0.15)
+
+
+@pytest.mark.parametrize("break_it", ["not installed", "dead thread", "no events", "stale",
+                                      "env off", "no floor", "floor >= cap", "not real"])
+def test_any_failure_means_the_old_fixed_wait(monkeypatch, capsys, break_it):
+    monkeypatch.delenv("MISTAI_WINDOW_EVENTS", raising=False)
+    ev, floor, cap = _healthy_events(), 0.05, 0.3
+    if break_it == "not installed":
+        ev.installed = False
+    elif break_it == "dead thread":
+        ev.alive = lambda: False
+    elif break_it == "no events":
+        ev = clip.WindowEvents(own_pid=1)
+        ev.installed, ev.alive = True, lambda: True
+    elif break_it == "stale":
+        ev.check_poll(777)
+        ev.check_poll(777)
+        assert ev.stale
+    elif break_it == "env off":
+        monkeypatch.setenv("MISTAI_WINDOW_EVENTS", "0")
+    elif break_it == "no floor":
+        floor = None
+    elif break_it == "floor >= cap":
+        floor = cap
+    elif break_it == "not real":
+        ev = SimpleNamespace(healthy=lambda: True, quiet_for=lambda p: True,
+                             wait_for=lambda c, t: True)
+    slept = []
+    assert clip.settle(ev, cap, floor, lambda: True, sleep=slept.append) == (cap, "fixed")
+    assert slept == [cap]
+
+
+def test_failures_are_logged_once_without_content(capsys):
+    ev = _healthy_events()
+    ev.alive = lambda: False
+    assert not ev.healthy() and not ev.healthy()
+    ev.alive = lambda: True
+    for _ in range(4):
+        ev.check_poll(999)
+    ev.record("foreground", 999, 2)
+    ev.check_poll(999)
+    assert not ev.stale
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["[WindowWatch] window event thread stopped -- fixed waits",
+                     "[WindowWatch] window events stopped arriving -- fixed waits",
+                     "[WindowWatch] window events arriving again"]
+
+
+def test_a_failed_hook_install_falls_back_and_says_so_once(monkeypatch, capsys):
+    ev = clip.WindowEvents()
+    hook = clip.WinEventHook(ev, start_timeout=2.0)
+    fake = SimpleNamespace(SetWinEventHook=lambda *a: 0, UnhookWinEvent=lambda h: None)
+    monkeypatch.setattr(hook, "_api", lambda: (fake, lambda fn: fn))
+    monkeypatch.setattr(clip.ctypes, "get_last_error", lambda: 5)
+    assert hook.start() is False
+    hook._thread.join(2)
+    assert not ev.installed and not ev.healthy()
+    out = capsys.readouterr().out
+    assert "[WindowWatch] window events unavailable (hook install failed, error 5) -- fixed waits" in out
+    slept = []
+    assert clip.settle(ev, 1.5, 0.4, lambda: True, sleep=slept.append) == (1.5, "fixed")
+
+
+def test_the_callback_filters_and_never_prints(capsys):
+    ev = clip.WindowEvents(own_pid=1)
+    hook = clip.WinEventHook(ev)
+    roots = {100: 100, 200: 100}                        # 200 is a child of 100
+
+    def pid_of(hwnd, out):
+        out._obj.value = 7
+
+    hook._user32 = SimpleNamespace(GetAncestor=lambda h, f: roots.get(h, 0),
+                                   GetWindowThreadProcessId=pid_of)
+    cb = hook._callback
+    cb(0, clip.EVENT_OBJECT_SHOW, 100, 0, 0, 0, 0)       # top-level: kept
+    cb(0, clip.EVENT_OBJECT_SHOW, 200, 0, 0, 0, 0)       # child window: dropped
+    cb(0, clip.EVENT_OBJECT_SHOW, 100, -4, 0, 0, 0)      # not OBJID_WINDOW: dropped
+    cb(0, clip.EVENT_OBJECT_NAMECHANGE, 100, 0, 3, 0, 0)  # a child element: dropped
+    cb(0, 0x8005, 100, 0, 0, 0, 0)                       # not a hooked event: dropped
+    cb(0, clip.EVENT_OBJECT_DESTROY, 300, 0, 0, 0, 0)    # never seen top-level: dropped
+    cb(0, clip.EVENT_OBJECT_DESTROY, 100, 0, 0, 0, 0)    # seen top-level: kept
+    cb(0, clip.EVENT_SYSTEM_FOREGROUND, 100, 0, 0, 0, 0)
+    assert [(k, h, p) for _t, k, h, p in ev.ring] == [("show", 100, 7), ("destroy", 100, 7),
+                                                      ("foreground", 100, 7)]
+    assert capsys.readouterr().out == ""
+
+
+def test_window_exists_compares_titles_in_memory_only(monkeypatch, capsys):
+    import win32gui
+    import win32process
+
+    wins = {1: ("Secret Budget.xlsx - Excel", 50), 2: ("Untitled - Notepad", 60)}
+    monkeypatch.setattr(win32gui, "EnumWindows", lambda fn, x: [fn(h, x) for h in wins])
+    monkeypatch.setattr(win32gui, "IsWindowVisible", lambda h: True)
+    monkeypatch.setattr(win32gui, "GetWindowText", lambda h: wins[h][0])
+    monkeypatch.setattr(win32process, "GetWindowThreadProcessId", lambda h: (0, wins[h][1]))
+    ev = clip.WindowEvents()
+    ev._names = {50: "excel", 60: "notepad"}
+    assert ev.window_exists(title="budget")()
+    assert ev.window_exists(process="notepad")()
+    assert not ev.window_exists(title="calculator")()
+    assert capsys.readouterr().out == ""
+
+
+def test_the_executor_settles_with_the_expected_window(monkeypatch):
+    calls = []
+    monkeypatch.setattr(verify.events, "settle",
+                        lambda w, cap, floor, expect, label: calls.append((cap, floor, label)))
+    ev = _healthy_events()
+    api = SimpleNamespace(live=SimpleNamespace(window_events=ev),
+                          _window_belongs_to=lambda h, app: True)
+    from core.tools import SPECS
+
+    for action, param in (("open_app", "notepad"), ("browser_navigate", "x.org"),
+                          ("click_on_text", "OK")):
+        verify.settle_after(api, action, param, SPECS[action], SPECS[action].settle)
+    assert calls == [(1.5, 0.4, "window+quiet"), (1.0, 0.2, "browser window+quiet"),
+                     (0.3, 0.15, "quiet")]
+
+
+@pytest.mark.parametrize("live", [None, SimpleNamespace(), SimpleNamespace(window_events=object())])
+def test_the_executor_keeps_the_fixed_settle_without_window_events(monkeypatch, live):
+    slept = []
+    monkeypatch.setattr(verify.time, "sleep", slept.append)
+    from core.tools import SPECS
+
+    api = SimpleNamespace(live=live) if live is not None else SimpleNamespace()
+    verify.settle_after(api, "open_app", "notepad", SPECS["open_app"], 1.5)
+    verify.settle_after(api, "run_command", "dir", SPECS["run_command"], 0.15)
+    assert slept == [1.5, 0.15]
+
+
+def test_floors_never_exceed_the_settle_and_risky_actions_have_none():
+    from core.tools import SPECS, SETTLE_FLOORS
+
+    for name, spec in SPECS.items():
+        if name in SETTLE_FLOORS:
+            assert 0 < spec.settle_floor <= spec.settle, name
+        else:
+            assert spec.settle_floor is None, name
+    for name in ("quick_message", "open_url", "check_email", "run_command", "write_file"):
+        assert name not in SETTLE_FLOORS
+
+
+def test_the_step_pause_and_the_window_poll_use_window_events():
+    from core.agent import AgentLoop
+
+    src = inspect.getsource(AgentLoop._loop_steps)
+    i = src.index("window_events.settle(watched, self.STEP_SETTLE_S, self.STEP_SETTLE_FLOOR")
+    assert "time.sleep(self.STEP_SETTLE_S)" in src[i:i + 400]
+    assert AgentLoop.STEP_SETTLE_S == 0.2 and AgentLoop.STEP_SETTLE_FLOOR == 0.05
+    wait = inspect.getsource(Api._wait_for_app_window)
+    assert "watched.healthy()" in wait and "time.sleep(0.4)" in wait
+
+
+def test_the_open_app_window_poll_wakes_on_an_event():
+    ev = _healthy_events()
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(window_events=ev)
+    states = iter(["missing", "missing", "foreground"])
+    api.app_window_state = lambda app: (next(states), "")
+    _later(0.05, lambda: ev.record("show", 99, 2))
+    _later(0.10, lambda: ev.record("foreground", 99, 2))
+    t0 = time.monotonic()
+    assert Api._wait_for_app_window(api, "notepad", timeout=5.0) is True
+    assert time.monotonic() - t0 < 0.5                   # not 2 x 0.4 s
+
+
+def test_a_tracker_poll_cross_checks_the_hook(monkeypatch):
+    import win32gui
+
+    from core import live_state
+
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 55)
+    monkeypatch.setattr(win32gui, "GetWindowText", lambda h: "x")
+    monkeypatch.setattr(win32gui, "EnumWindows", lambda fn, x: None)
+    monkeypatch.setattr(live_state, "_visible_window_pids", lambda: set())
+    monkeypatch.setattr(live_state, "_uwp_frame_apps", lambda: [])
+    monkeypatch.setattr(live_state.psutil, "process_iter", lambda _a: [])
+    tracker = live_state.LiveStateTracker.__new__(live_state.LiveStateTracker)
+    tracker._state, tracker._lock = {}, threading.Lock()
+    tracker.window_events = _healthy_events()
+    tracker.window_events.foreground = (54, 2)
+    tracker._update()
+    tracker._update()
+    assert tracker.window_events.stale                   # the hook never saw window 55
+    tracker.window_events.record("foreground", 55, 2)
+    tracker._update()
+    assert not tracker.window_events.stale
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real WinEvent hook: Windows only")
+def test_the_real_hook_installs_and_stops_without_hanging():
+    ev = clip.WindowEvents()
+    hook = clip.WinEventHook(ev, start_timeout=3.0)
+    assert hook.start() is True and ev.installed
+    assert hook._thread.daemon                           # never blocks app exit
+    assert ev.foreground[0]                              # seeded at install
+    t0 = time.monotonic()
+    hook.stop()
+    hook._thread.join(3.0)
+    assert not hook._thread.is_alive() and time.monotonic() - t0 < 3.0
+    assert not ev.installed and not ev.healthy()

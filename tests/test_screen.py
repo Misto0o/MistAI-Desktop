@@ -52,6 +52,12 @@
 #   45. OCR COMPACT MATCH DATA
 #   46. OCR COMPACT MATCH HELPERS (2)
 #   47. OCR COMPACT MATCH TESTS
+#   48. WINDOW WATCH CHANGE DETECTION
+#   49. WINDOW WATCH CHANGE DETECTION HELPERS
+#   50. WINDOW WATCH CHANGE DETECTION TESTS
+#   51. ACCESSIBILITY TEXT SNAPSHOT
+#   52. ACCESSIBILITY TEXT SNAPSHOT HELPERS
+#   53. ACCESSIBILITY TEXT SNAPSHOT TESTS
 # ============================================================
 
 """Screen reads (UIA first, vision modes, frame freshness), vision coordinates and clicking."""
@@ -595,7 +601,7 @@ class TestUiaFirst:
 # ============================================================
 
 def _buffer(frame_time, action_time):
-    buf = screen_mod.ScreenBuffer.__new__(screen_mod.ScreenBuffer)
+    buf = screen_mod.WindowWatch.__new__(screen_mod.WindowWatch)
     buf._lock = threading.Lock()
     buf._pil, buf._cv, buf._time = "buffered", None, frame_time
     buf.last_action_at = action_time
@@ -1857,3 +1863,344 @@ def test_a_compact_score_between_65_and_80_is_not_a_match(ocr_compact_match_hand
     _ocr_sees(monkeypatch, [("So", 300, 400, 30, 20, 1, 1), ("Can", 336, 400, 40, 20, 1, 2),
                             ("Xam", 382, 400, 40, 20, 1, 3)])
     assert ocr_compact_match_handler.click_on_text("so can zan") is False
+
+
+# ============================================================
+# WINDOW WATCH CHANGE DETECTION
+# ============================================================
+
+# core/screen.py WINDOW WATCH: frames on demand (no capture loop) and the
+# screen-context cache reused past its expiry only when ALL hold: healthy
+# window events, the same foreground window, the same Open apps, no relevant
+# window event since the read, an identical frame. Fake frames and events.
+
+
+# ============================================================
+# WINDOW WATCH CHANGE DETECTION HELPERS
+# ============================================================
+
+def _ww_events():
+    from core.live_state import WindowEvents
+
+    ev = WindowEvents(own_pid=1)
+    ev.installed, ev.alive = True, lambda: True
+    ev.record("show", 10, 2)
+    return ev
+
+
+class _WWDesk:
+    """A fake desktop: the frame ImageGrab returns, the foreground identity."""
+
+    def __init__(self, monkeypatch):
+        self.img = Image.new("RGB", (64, 36), (20, 30, 40))
+        self.who = (7, "titlehash")
+        self.grabs = 0
+        monkeypatch.setattr(screen_mod.ImageGrab, "grab", self.grab)
+        monkeypatch.setattr(screen_mod, "_foreground_identity", lambda: self.who)
+
+    def grab(self):
+        self.grabs += 1
+        return self.img.copy()
+
+
+def _ww(monkeypatch, apps=("notepad",)):
+    monkeypatch.delenv("MISTAI_WINDOW_EVENTS", raising=False)
+    desk = _WWDesk(monkeypatch)
+    ev = _ww_events()
+    live = SimpleNamespace(window_events=ev, snapshot={"open_apps": list(apps)})
+    watch = screen_mod.WindowWatch(live=live)
+    return watch, desk, ev, live
+
+
+# ============================================================
+# WINDOW WATCH CHANGE DETECTION TESTS
+# ============================================================
+
+def test_identical_frames_and_no_events_skip_the_reread(monkeypatch):
+    watch, desk, _ev, _live = _ww(monkeypatch)
+    watch.remember_read()
+    assert watch.unchanged_since_read() == (True, "")
+
+
+def test_one_pixel_different_rereads(monkeypatch):
+    watch, desk, _ev, _live = _ww(monkeypatch)
+    watch.remember_read()
+    desk.img.putpixel((63, 35), (20, 30, 41))        # one channel of one pixel, by one
+    assert watch.unchanged_since_read() == (False, "frame changed")
+
+
+def test_a_window_event_since_the_read_rereads(monkeypatch):
+    watch, _desk, ev, _live = _ww(monkeypatch)
+    watch.remember_read()
+    ev.record("name", 12, 3)
+    assert watch.unchanged_since_read() == (False, "window event")
+
+
+def test_own_window_events_alone_do_not_force_a_reread(monkeypatch):
+    watch, _desk, ev, _live = _ww(monkeypatch)
+    watch.remember_read()
+    ev.record("show", 12, 1)                          # MistAI's own process
+    assert watch.unchanged_since_read() == (True, "")
+
+
+def test_a_different_foreground_window_rereads(monkeypatch):
+    watch, desk, _ev, _live = _ww(monkeypatch)
+    watch.remember_read()
+    desk.who = (8, "titlehash")
+    assert watch.unchanged_since_read() == (False, "foreground changed")
+    watch.remember_read()
+    desk.who = (8, "othertitle")                       # same window, new title
+    assert watch.unchanged_since_read() == (False, "foreground changed")
+
+
+def test_changed_open_apps_reread(monkeypatch):
+    watch, _desk, _ev, live = _ww(monkeypatch)
+    watch.remember_read()
+    live.snapshot["open_apps"] = ["notepad", "calculator"]
+    assert watch.unchanged_since_read() == (False, "apps changed")
+
+
+@pytest.mark.parametrize("break_it, reason", [
+    ("no read", "no baseline"), ("dead hook", "no window events"),
+    ("env off", "no window events"), ("stale", "no window events"),
+    ("capture fails", "capture failed"), ("forgotten", "no baseline"),
+])
+def test_any_doubt_rereads(monkeypatch, break_it, reason):
+    watch, desk, ev, _live = _ww(monkeypatch)
+    if break_it != "no read":
+        watch.remember_read()
+    if break_it == "dead hook":
+        ev.alive = lambda: False
+    elif break_it == "env off":
+        monkeypatch.setenv("MISTAI_WINDOW_EVENTS", "0")
+    elif break_it == "stale":
+        ev.stale = True
+    elif break_it == "capture fails":
+        monkeypatch.setattr(screen_mod.ImageGrab, "grab",
+                            lambda: (_ for _ in ()).throw(OSError("x")))
+    elif break_it == "forgotten":
+        watch.forget_read()
+    assert watch.unchanged_since_read() == (False, reason)
+
+
+def test_no_baseline_without_healthy_events(monkeypatch):
+    watch, desk, ev, _live = _ww(monkeypatch)
+    ev.installed = False
+    watch.remember_read()
+    assert watch._read_mark is None and desk.grabs == 0     # no capture wasted
+
+
+def test_an_event_during_the_baseline_capture_rereads(monkeypatch):
+    watch, desk, ev, _live = _ww(monkeypatch)
+    real = desk.grab
+
+    def grab_with_event():
+        ev.record("show", 44, 3)                       # arrives while capturing
+        return real()
+
+    monkeypatch.setattr(screen_mod.ImageGrab, "grab", grab_with_event)
+    watch.remember_read()
+    monkeypatch.setattr(screen_mod.ImageGrab, "grab", real)
+    assert watch.unchanged_since_read() == (False, "window event")
+
+
+def test_the_frame_hash_sees_a_change_a_downscale_would_hide():
+    a = Image.new("RGB", (64, 64), (100, 100, 100))
+    b = a.copy()
+    b.putpixel((0, 0), (101, 100, 100))
+    small = lambda im: im.convert("L").resize((8, 8), Image.BOX).tobytes()
+    assert small(a) == small(b)                        # downscaled grayscale: equal
+    assert screen_mod._frame_digest(a) != screen_mod._frame_digest(b)
+
+
+def test_there_is_no_capture_loop(monkeypatch, capsys):
+    src = inspect.getsource(screen_mod.WindowWatch)
+    assert "Thread(" not in src and not hasattr(screen_mod.WindowWatch, "_loop")
+    grabs = []
+    monkeypatch.setattr(screen_mod.ImageGrab, "grab", lambda: grabs.append(1) or "img")
+    watch = screen_mod.WindowWatch()
+    assert grabs == []                                 # nothing captured until asked
+    assert capsys.readouterr().out == "[WindowWatch] frames on demand\n"
+    watch.mark_action()
+    assert watch.frame_for_read("vision") == "img" and grabs == [1]
+    assert watch.frame_for_read("vision") == "img" and grabs == [1]   # newer than the action
+    watch.mark_action()
+    assert watch.frame_for_read("vision") == "img" and grabs == [1, 1]
+
+
+def test_the_change_check_never_prints_or_keeps_pixels(monkeypatch, capsys):
+    watch, _desk, _ev, _live = _ww(monkeypatch)
+    capsys.readouterr()
+    watch.remember_read()
+    watch.unchanged_since_read()
+    assert capsys.readouterr().out == ""
+    assert set(watch._read_mark) == {"seq", "who", "apps", "frame"}
+    assert isinstance(watch._read_mark["frame"], str) and len(watch._read_mark["frame"]) == 32
+
+
+# -- the loop: an expired cache is reused only when unchanged ----------------------------
+
+class _WWScreen:
+    def __init__(self, answers):
+        self.answers, self.calls = list(answers), []
+
+    def remember_read(self):
+        self.calls.append("remember")
+
+    def unchanged_since_read(self):
+        self.calls.append("check")
+        return self.answers.pop(0)
+
+
+def test_an_expired_cache_with_no_change_is_reused(monkeypatch, capsys):
+    from test_browser import NON_UI, _gated_run
+
+    monkeypatch.setattr(AgentLoop, "GATED_CACHE_SECONDS", -1.0)
+    screen = _WWScreen([(True, "")] * len(NON_UI))
+    reads, _ = _gated_run(monkeypatch, NON_UI, gating=True, screen=screen)
+    assert reads == 1                                  # was 1 + len(NON_UI) on expiry
+    assert screen.calls == ["remember"] + ["check"] * len(NON_UI)
+    out = capsys.readouterr().out
+    assert out.count("[Screen] unchanged since last read (no events, same frame), reuse") == 3
+
+
+def test_an_expired_cache_that_changed_is_reread_with_the_reason(monkeypatch, capsys):
+    from test_browser import NON_UI, _gated_run
+
+    monkeypatch.setattr(AgentLoop, "GATED_CACHE_SECONDS", -1.0)
+    screen = _WWScreen([(False, "frame changed"), (True, ""), (False, "window event")])
+    reads, _ = _gated_run(monkeypatch, NON_UI, gating=True, screen=screen)
+    assert reads == 3
+    out = capsys.readouterr().out
+    assert "[Screen] re-read: cache expired (frame changed)" in out
+    assert "[Screen] re-read: cache expired (window event)" in out
+
+
+def test_without_window_watch_the_old_expiry_stays(monkeypatch):
+    from test_browser import NON_UI, _gated_run
+
+    monkeypatch.setattr(AgentLoop, "GATED_CACHE_SECONDS", -1.0)
+    reads, _ = _gated_run(monkeypatch, NON_UI, gating=True,
+                          screen=SimpleNamespace(frame_for_read=lambda _l: None))
+    assert reads == 1 + len(NON_UI)
+
+
+def test_ui_actions_and_new_windows_still_reread_with_window_watch(monkeypatch):
+    from test_browser import _gated_run
+
+    screen = _WWScreen([(True, "")] * 10)
+    script = [("open_app", "notepad"), ("type_text", "hi"), ("click_on_text", "File")]
+    reads, _ = _gated_run(monkeypatch, script, gating=True, screen=screen)
+    assert reads == 1 + len(script) and "check" not in screen.calls
+
+
+def test_api_builds_window_watch_after_the_tracker_and_checks_patch_it():
+    src = inspect.getsource(Api.__init__)
+    assert src.index("self.live = LiveStateTracker()") < src.index(
+        "self.screen = WindowWatch(live=self.live)")
+    assert "ScreenBuffer" not in src
+    checks = os.path.join(os.path.dirname(__file__), "..", "tools", "live_checks.py")
+    with open(checks, encoding="utf-8") as f:
+        assert '("WindowWatch", FakeScreen)' in f.read()
+
+
+# ============================================================
+# ACCESSIBILITY TEXT SNAPSHOT
+# ============================================================
+
+# core/screen.py WindowWatch accessibility text snapshot and
+# Api._uia_text_cached: the UIA-first read reuses its last walk of a window
+# only while the same window shows the same frame and no UI action or
+# relevant window event happened since the walk began; tiny or empty text is
+# never kept; anything else walks the tree again.
+
+
+# ============================================================
+# ACCESSIBILITY TEXT SNAPSHOT HELPERS
+# ============================================================
+
+def _snap_api(monkeypatch, texts=("Display is 42",)):
+    watch, desk, ev, live = _ww(monkeypatch)
+    api = Api.__new__(Api)
+    api.screen = watch
+    walks = []
+    answers = list(texts)
+
+    def walk(hwnd):
+        walks.append(hwnd)
+        return (answers.pop(0) if len(answers) > 1 else answers[0]), "Calculator"
+
+    return api, watch, desk, ev, walks, walk
+
+
+# ============================================================
+# ACCESSIBILITY TEXT SNAPSHOT TESTS
+# ============================================================
+
+def test_a_valid_snapshot_answers_without_a_walk(monkeypatch, capsys):
+    api, _watch, _desk, _ev, walks, walk = _snap_api(monkeypatch)
+    assert api._uia_text_cached(5, walk) == "Display is 42"
+    assert api._uia_text_cached(5, walk) == "Display is 42"
+    assert walks == [5]
+    out = capsys.readouterr().out
+    assert "[UIA] snapshot reused (no events, same frame, 13 chars)" in out
+    assert "Display is 42" not in out
+
+
+@pytest.mark.parametrize("change", ["ui action", "window event", "frame", "other window",
+                                    "dead hook", "env off"])
+def test_the_snapshot_is_dropped_on_any_change(monkeypatch, change):
+    api, watch, desk, ev, walks, walk = _snap_api(monkeypatch, ("Display is 42", "Display is 7"))
+    api._uia_text_cached(5, walk)
+    hwnd = 5
+    if change == "ui action":
+        watch.mark_action()                            # the executor does this after every action
+    elif change == "window event":
+        ev.record("name", 5, 3)
+    elif change == "frame":
+        desk.img.putpixel((0, 0), (0, 0, 0))
+    elif change == "other window":
+        hwnd = 6
+    elif change == "dead hook":
+        ev.alive = lambda: False
+    elif change == "env off":
+        monkeypatch.setenv("MISTAI_WINDOW_EVENTS", "0")
+    assert api._uia_text_cached(hwnd, walk) == "Display is 7"
+    assert walks == [5, hwnd]
+
+
+@pytest.mark.parametrize("text", ["", "   ", "OK", "Calc"])
+def test_empty_or_tiny_trees_are_never_kept(monkeypatch, text):
+    api, watch, _desk, _ev, walks, walk = _snap_api(monkeypatch, (text,))
+    api._uia_text_cached(5, walk)
+    api._uia_text_cached(5, walk)
+    assert walks == [5, 5] and watch._uia is None
+
+
+def test_an_event_during_the_walk_invalidates_it(monkeypatch):
+    api, watch, _desk, ev, walks, _walk = _snap_api(monkeypatch)
+
+    def walk_with_event(hwnd):
+        walks.append(hwnd)
+        ev.record("show", 9, 3)                        # the window changed mid-walk
+        return "Display is 42", "Calculator"
+
+    api._uia_text_cached(5, walk_with_event)
+    api._uia_text_cached(5, walk_with_event)
+    assert walks == [5, 5]
+
+
+def test_without_window_watch_every_read_walks():
+    api = Api.__new__(Api)
+    api.screen = SimpleNamespace(frame_for_read=lambda _l: None)
+    walks = []
+    walk = lambda h: walks.append(h) or ("Display is 42", "")
+    assert api._uia_text_cached(5, walk) == "Display is 42"
+    api._uia_text_cached(5, walk)
+    assert walks == [5, 5]
+
+
+def test_the_ui_text_read_goes_through_the_snapshot():
+    src = inspect.getsource(Api._exact_ui_text)
+    assert "self._uia_text_cached(hwnd, foreground_uia_text)" in src
+    assert "foreground_uia_text(hwnd)" not in src

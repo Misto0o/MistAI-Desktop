@@ -530,7 +530,7 @@ class ImprovedClickHandler:
         try:
             frame = self._vision_frame("vision click")
             if frame is None:
-                print("[Vision] ScreenBuffer.frame is None -- Vision has "
+                print("[Vision] WindowWatch frame is None -- Vision has "
                      "nothing to look at, coordinates would be pure guesses")
                 return None
             sw, sh = pyautogui.size()
@@ -711,13 +711,13 @@ class ImprovedClickHandler:
             return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
         except Exception as e:
             print(f"[OCR] Direct pyautogui capture failed ({e}) -- "
-                 f"falling back to ScreenBuffer")
+                 f"falling back to WindowWatch")
         try:
             cv_frame = self.screen.cv_frame
             if cv_frame is not None:
                 return cv_frame
         except Exception as e:
-            print(f"[OCR] ScreenBuffer.cv_frame also failed: {e}")
+            print(f"[OCR] WindowWatch.cv_frame also failed: {e}")
         return None
 
     # -- Button-region detection ------------------------------------------

@@ -813,8 +813,9 @@ SHELL_CLASSES = frozenset({"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman",
                            "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
                            "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow"})
 IGNORED_PROCESSES = ("taskmgr",)
-# MistAI's dedicated browser is Playwright's Firefox, run from its own folder.
-PLAYWRIGHT_PATH_HINTS = ("ms-playwright", ".local-browsers")
+# MistAI's dedicated browser is Playwright's Firefox, run from its own folder
+# (core/live_state.py PLAYWRIGHT BROWSER WINDOW owns the lookup).
+PLAYWRIGHT_PATH_HINTS = events.PLAYWRIGHT_PATH_HINTS
 # Organic result title links: DuckDuckGo's normal page (current and older
 # markup), its HTML endpoint, Google. Ads are flagged in the page and skipped.
 RESULT_LINKS = ('a[data-testid="result-title-a"], article[data-testid="result"] h2 a, '
@@ -1336,28 +1337,7 @@ class Win32:
 
     def browser_window(self):
         """The visible top-level window of MistAI's Playwright Firefox, or None."""
-        try:
-            import psutil
-            import win32gui
-            import win32process
-
-            found = []
-
-            def visit(hwnd, _):
-                if found or not win32gui.IsWindowVisible(hwnd) or not win32gui.GetWindowText(hwnd):
-                    return True
-                try:
-                    exe = psutil.Process(win32process.GetWindowThreadProcessId(hwnd)[1]).exe()
-                except Exception:
-                    return True
-                if any(h in exe.lower() for h in PLAYWRIGHT_PATH_HINTS):
-                    found.append(hwnd)
-                return True
-
-            win32gui.EnumWindows(visit, None)
-            return found[0] if found else None
-        except Exception:
-            return None
+        return events.playwright_window()
 
     def monitor_for_rect(self, rect):
         """(work area, scale) of the monitor nearest ``rect`` (l, t, r, b)."""
