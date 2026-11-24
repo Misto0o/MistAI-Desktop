@@ -1059,8 +1059,58 @@ btnStop.onclick = async () => {
 # The floating orb window (core/floating_orb.py): only the orb, no fonts, no
 # external resources; its js_api is OrbBridge. A flat frosted-glass disc
 # (config.ORB_TINT) sized in vmin, so it follows the window through the three
-# sizes: idle breathes, listening pulses a ring, thinking spins an arc,
-# speaking ripples. Static under prefers-reduced-motion.
+# sizes. Ten looks, one per data-state (core/floating_orb.py orb_state), all
+# CSS inside the page (the window never resizes per frame): idle breathes;
+# listening, two outward rings; thinking, a rotating half arc; planning,
+# three nodes lighting in turn; executing, a slow quarter arc (small, docked);
+# reading, a scan line inside the disc; waiting, amber, a slow pause ring and
+# a pause glyph; speaking, two ripples and three moving bars; completed,
+# green, a check and one ring burst; error, soft red, an exclamation mark and
+# one short shake. Shape tells them apart, not colour alone. Motion stops
+# under prefers-reduced-motion and when Windows animation effects are off
+# (the bridge's "still": data-motion="still"); glyphs and tints stay.
+
+# ============================================================
+# ORB PAGE STATE COLOURS
+# ============================================================
+
+ORB_STATE_TINTS = {
+    "waiting": ("rgba(255,206,112,.62)", "rgba(214,150,40,.30)", "rgba(255,214,140,.95)"),
+    "completed": ("rgba(140,236,180,.60)", "rgba(52,168,108,.28)", "rgba(190,255,215,.95)"),
+    "error": ("rgba(255,150,140,.58)", "rgba(196,72,72,.28)", "rgba(255,200,196,.95)"),
+}   # (tint centre, tint edge, glyph/ring colour)
+
+
+# ============================================================
+# ORB PAGE STILL RULES
+# ============================================================
+
+def _orb_still_rules(w):
+    """The static looks for wrapper selector ``w``: no motion, but every state
+    keeps its shape, glyph and tint (reduced motion, Windows animations off)."""
+    return (
+        f"{w},{w} .disc,{w} .ring,{w} .arc,{w} .ripple,{w} .halo,{w} .burst,{w} .scan,"
+        f"{w} .nodes i,{w} .bars i{{animation:none !important}}"
+        f'{w}[data-state="listening"] .ring{{opacity:.8;transform:scale(.95)}}'
+        f'{w}[data-state="listening"] .ring.r2{{opacity:.45;transform:scale(.8)}}'
+        f'{w}[data-state="thinking"] .arc{{opacity:1}}'
+        f'{w}[data-state="executing"] .arc{{opacity:.9}}'
+        f'{w}[data-state="planning"] .nodes i{{opacity:.4}}'
+        f'{w}[data-state="planning"] .nodes i:nth-child(2){{opacity:1}}'
+        f'{w}[data-state="reading"] .scan{{opacity:.9;transform:translateY(310%)}}'
+        f'{w}[data-state="waiting"] .halo{{opacity:.8;transform:none}}'
+        f'{w}[data-state="speaking"] .ripple{{opacity:.5;transform:scale(.9)}}'
+        f'{w}[data-state="speaking"] .ripple.r2{{opacity:0}}'
+        f'{w}[data-state="speaking"] .bars i{{transform:scaleY(.55)}}'
+        f'{w}[data-state="speaking"] .bars i:nth-child(2){{transform:none}}'
+        f'{w}[data-state="completed"] .burst{{opacity:0}}'
+    )
+
+
+# ============================================================
+# ORB PAGE
+# ============================================================
+
 def _orb_page():
     from core.config import ORB_TINT as t, orb_background
 
@@ -1068,32 +1118,80 @@ def _orb_page():
     # page and window background is the rim colour (config.orb_background),
     # so a frame the page has not painted yet never shows black.
     bg = orb_background()
+    tint = ""
+    for state, (centre, edge, _ink) in ORB_STATE_TINTS.items():
+        tint += (f'.orb-wrap[data-state="{state}"] .tint{{opacity:1;'
+                 f"background:radial-gradient(circle,{centre} 0%,{edge} 100%)}}")
+    w_ink, c_ink, e_ink = (ORB_STATE_TINTS[k][2] for k in ("waiting", "completed", "error"))
     css = (
         f"html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:{bg}}}"
         "body{display:flex;align-items:center;justify-content:center;user-select:none;"
         "-webkit-user-select:none;cursor:default}"
         ".orb-wrap{position:relative;width:100vmin;height:100vmin}"
-        ".disc,.ring,.arc,.ripple{position:absolute;inset:0;border-radius:50%;pointer-events:none}"
+        ".disc,.tint,.inner,.ring,.arc,.ripple,.halo,.burst{position:absolute;inset:0;"
+        "border-radius:50%;pointer-events:none}"
         f".disc{{background:radial-gradient(circle,{t['center']} 0%,{t['mid']} 58%,{t['edge']} 100%);"
         f"border:1px solid {t['border']};box-sizing:border-box;"
         "animation:breathe 3.2s ease-in-out infinite}"
+        ".tint{opacity:0;transition:opacity .35s ease}"
+        ".inner{inset:6%;overflow:hidden}"
+        f".scan{{position:absolute;left:0;right:0;top:0;height:14%;opacity:0;"
+        f"background:linear-gradient(to bottom,transparent,{t['border']},transparent)}}"
         f".ring,.ripple{{inset:8%;border:2px solid {t['glow']};opacity:0}}"
         f".arc{{inset:12%;border:2px solid transparent;border-top-color:{t['border']};"
         f"border-right-color:{t['mid']};opacity:0}}"
+        f".halo{{inset:10%;border:2px solid {w_ink};opacity:0}}"
+        f".burst{{inset:10%;border:2px solid {c_ink};opacity:0}}"
+        ".core{position:absolute;inset:0;display:flex;align-items:center;"
+        "justify-content:center;pointer-events:none}"
+        ".core>span{position:absolute;display:none;align-items:center;justify-content:center}"
+        f".nodes{{gap:7vmin}}.nodes i{{display:block;width:10vmin;height:10vmin;"
+        f"border-radius:50%;background:{t['center']};opacity:.25;"
+        "animation:node 1.2s ease-in-out infinite}"
+        ".nodes i:nth-child(2){animation-delay:.4s}.nodes i:nth-child(3){animation-delay:.8s}"
+        f".bars{{gap:5vmin}}.bars i{{display:block;width:7vmin;height:30vmin;"
+        f"border-radius:4vmin;background:{t['center']};transform:scaleY(.4);"
+        "animation:bar .9s ease-in-out infinite}"
+        ".bars i:nth-child(2){animation-delay:-.3s}.bars i:nth-child(3){animation-delay:-.6s}"
+        f".g-pause{{gap:7vmin}}.g-pause i{{display:block;width:8vmin;height:28vmin;"
+        f"border-radius:2vmin;background:{w_ink}}}"
+        f".g-check{{width:15vmin;height:30vmin;box-sizing:border-box;"
+        f"border-right:6vmin solid {c_ink};border-bottom:6vmin solid {c_ink};"
+        "border-radius:1vmin;transform:translateY(-4vmin) rotate(45deg)}"
+        ".g-excl{flex-direction:column;gap:4vmin}"
+        f".g-excl i{{display:block;width:8vmin;border-radius:4vmin;background:{e_ink}}}"
+        ".g-excl i:first-child{height:26vmin}.g-excl i:last-child{height:8vmin}"
         "@keyframes breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.08)}}"
         "@keyframes pulse{0%{transform:scale(.7);opacity:.9}100%{transform:scale(1.05);opacity:0}}"
         "@keyframes spin{to{transform:rotate(360deg)}}"
         "@keyframes ripple{0%{transform:scale(.5);opacity:.7}100%{transform:scale(1.05);opacity:0}}"
-        '.orb-wrap[data-state="listening"] .ring{animation:pulse 1.1s ease-out infinite}'
+        "@keyframes node{0%,100%{opacity:.25;transform:scale(.85)}33%{opacity:1;transform:scale(1.1)}}"
+        "@keyframes scan{from{transform:translateY(-100%)}to{transform:translateY(714%)}}"
+        "@keyframes halo{0%,100%{opacity:.35;transform:scale(.92)}50%{opacity:.9;transform:scale(1)}}"
+        "@keyframes bar{0%,100%{transform:scaleY(.35)}50%{transform:scaleY(1)}}"
+        "@keyframes burst{0%{transform:scale(.6);opacity:.95}100%{transform:scale(1.1);opacity:0}}"
+        "@keyframes shake{0%,100%{transform:none}20%{transform:translateX(-4%)}"
+        "40%{transform:translateX(4%)}60%{transform:translateX(-3%)}80%{transform:translateX(2%)}}"
+        '.orb-wrap[data-state="listening"] .ring{animation:pulse 1.4s ease-out infinite}'
+        '.orb-wrap[data-state="listening"] .ring.r2{animation-delay:.7s}'
         '.orb-wrap[data-state="thinking"] .arc{opacity:1;animation:spin 1.2s linear infinite}'
+        '.orb-wrap[data-state="executing"] .arc{opacity:.9;border-right-color:transparent;'
+        "animation:spin 3.2s linear infinite}"
+        '.orb-wrap[data-state="planning"] .nodes{display:flex}'
+        '.orb-wrap[data-state="reading"] .scan{opacity:.9;'
+        "animation:scan 1.6s ease-in-out infinite alternate}"
+        '.orb-wrap[data-state="waiting"] .halo{animation:halo 2.4s ease-in-out infinite}'
+        '.orb-wrap[data-state="waiting"] .g-pause{display:flex}'
         '.orb-wrap[data-state="speaking"] .ripple{animation:ripple 1.6s ease-out infinite}'
         '.orb-wrap[data-state="speaking"] .ripple.r2{animation-delay:.8s}'
-        "@media (prefers-reduced-motion: reduce){"
-        ".disc,.ring,.arc,.ripple{animation:none !important}"
-        '.orb-wrap[data-state="listening"] .ring{opacity:.8;transform:scale(.95)}'
-        '.orb-wrap[data-state="thinking"] .arc{opacity:1}'
-        '.orb-wrap[data-state="speaking"] .ripple{opacity:.5;transform:scale(.9)}'
-        '.orb-wrap[data-state="speaking"] .ripple.r2{opacity:0}}'
+        '.orb-wrap[data-state="speaking"] .bars{display:flex}'
+        '.orb-wrap[data-state="completed"] .burst{animation:burst .9s ease-out 1 both}'
+        '.orb-wrap[data-state="completed"] .g-check{display:block}'
+        '.orb-wrap[data-state="error"]{animation:shake .45s ease-in-out 1}'
+        '.orb-wrap[data-state="error"] .g-excl{display:flex}'
+        + tint
+        + "@media (prefers-reduced-motion: reduce){" + _orb_still_rules(".orb-wrap") + "}"
+        + _orb_still_rules('.orb-wrap[data-motion="still"]')
     )
     return """<!DOCTYPE html>
 <html lang="en">
@@ -1105,19 +1203,31 @@ def _orb_page():
 </style>
 </head>
 <body>
-<div class="orb-wrap" id="orb-wrap" data-state="idle">
+<div class="orb-wrap" id="orb-wrap" data-state="idle" data-motion="on">
   <span class="ripple"></span><span class="ripple r2"></span>
-  <div class="disc"></div><span class="ring"></span><span class="arc"></span>
+  <div class="disc"></div><div class="tint"></div>
+  <div class="inner"><span class="scan"></span></div>
+  <span class="ring"></span><span class="ring r2"></span><span class="arc"></span>
+  <span class="halo"></span><span class="burst"></span>
+  <div class="core">
+    <span class="nodes"><i></i><i></i><i></i></span>
+    <span class="bars"><i></i><i></i><i></i></span>
+    <span class="glyph g-pause"><i></i><i></i></span>
+    <span class="glyph g-check"></span>
+    <span class="glyph g-excl"><i></i><i></i></span>
+  </div>
 </div>
 <script>
 window.addEventListener('pywebviewready',()=>{
   const wrap=document.getElementById('orb-wrap');
-  const STATES=['idle','listening','thinking','speaking'];
+  const STATES=['idle','listening','thinking','planning','executing','reading','waiting',
+                'speaking','completed','error'];
   async function poll(){
     try{
       const s=await pywebview.api.orb_state();
       const st=String(s&&s.state||'idle');
       wrap.dataset.state=STATES.includes(st)?st:'idle';
+      wrap.dataset.motion=(s&&s.still)?'still':'on';
     }catch(e){}
   }
   poll();
@@ -1158,6 +1268,9 @@ ORB_HTML = _orb_page()
 # A task panel window (core/orb_panels.py): dark translucent glass, rounded,
 # a close button, a short drop in from above. Its js_api is
 # PanelBridge (panel_state, dismiss). Text goes in through textContent only.
+# The status kinds (waiting: the open question and a hint, amber, a pause
+# glyph; error: the plain reason, soft red, "!") are display-only: their page
+# removes the close button, so they hold no control at all.
 PANEL_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1179,6 +1292,15 @@ li .t{width:14px;flex:none;color:rgba(168,222,238,.9)}
 li.fail .t{color:#f8a3a3}
 li.run{opacity:.75}
 .answer{overflow:auto;height:100%}
+.panel.status{padding:10px 12px 10px 40px}
+.panel.waiting{border-color:rgba(255,206,112,.55)}
+.panel.error{border-color:rgba(255,150,140,.55)}
+.status .glyph{position:absolute;left:12px;top:10px;width:18px;height:18px;border-radius:50%;
+  font-size:11px;font-weight:700;line-height:18px;text-align:center;color:#161c26}
+.waiting .glyph{background:rgba(255,214,140,.95)}
+.error .glyph{background:rgba(255,200,196,.95)}
+.status .q{max-height:56px;overflow:hidden}
+.status .hint{margin-top:4px;font-size:11.5px;color:rgba(255,214,140,.95)}
 @media (prefers-reduced-motion: reduce){.panel{animation:none !important}}
 </style>
 </head>
@@ -1188,14 +1310,27 @@ li.run{opacity:.75}
 window.addEventListener('pywebviewready',()=>{
   const body=document.getElementById('body'),panel=document.getElementById('panel');
   const MARK={ok:'\u2713',fail:'\u2717',run:'\u2022'};
+  const GLYPH={waiting:'\u275a\u275a',error:'!'};
+  const close=document.getElementById('close');
   let last='';
-  document.getElementById('close').onclick=()=>{pywebview.api.dismiss();};
+  close.onclick=()=>{pywebview.api.dismiss();};
   function render(s){
     const key=JSON.stringify(s);
     if(key===last)return;
     last=key;
     body.textContent='';
-    if(s.kind==='steps'){
+    if(s.kind==='waiting'||s.kind==='error'){
+      // Display-only: no close button, nothing to click or focus.
+      if(close.parentNode)close.parentNode.removeChild(close);
+      panel.className='panel status '+s.kind;
+      const g=document.createElement('span');g.className='glyph';g.textContent=GLYPH[s.kind];
+      const q=document.createElement('div');q.className='q';q.textContent=String(s.text||'');
+      body.appendChild(g);body.appendChild(q);
+      if(s.hint){
+        const h=document.createElement('div');h.className='hint';h.textContent=String(s.hint);
+        body.appendChild(h);
+      }
+    }else if(s.kind==='steps'){
       const ul=document.createElement('ul');
       for(const st of (s.steps||[])){
         const li=document.createElement('li');

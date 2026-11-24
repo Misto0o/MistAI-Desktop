@@ -71,6 +71,9 @@
 #   64. ORB STATES TESTS
 #   65. ORB STATES HELPERS (2)
 #   66. ORB STATES TESTS (2)
+#   67. ORB NINE STATES
+#   68. ORB NINE STATES HELPERS
+#   69. ORB NINE STATES TESTS
 # ============================================================
 
 """The floating orb: window, states, layout geometry, motion and panels."""
@@ -3126,3 +3129,513 @@ def test_is_agent_busy_without_tts_is_not_speaking():
     api._agent_started_at = 0
     api._stop_requested = threading.Event()
     assert api.is_agent_busy()["speaking"] is False
+
+
+# ============================================================
+# ORB NINE STATES
+# ============================================================
+
+# The floating orb's nine states beyond idle (core/floating_orb.py ORB STATE
+# SIGNALS, ORB SIGNAL MODEL, ORB STATE FROM PYTHON FACTS; ui/html.py ORB
+# PAGE): content-free events.ORB_SIGNAL signals from PlanRunner, the loop and
+# Api, published only while the orb is shown; the waiting and error status
+# panels; every look in CSS, still under reduced motion or Windows animation
+# effects off.
+
+
+# ============================================================
+# ORB NINE STATES HELPERS
+# ============================================================
+
+NINE_STATES = ("listening", "thinking", "planning", "executing", "reading", "waiting",
+               "speaking", "completed", "error")
+
+
+class _SyncBus:
+    """Delivers every publish to its subscribers at once; records them."""
+
+    def __init__(self):
+        self.subs, self.sent = [], []
+
+    def publish(self, name, data=None, source=""):
+        self.sent.append((name, dict(data or {})))
+        for want, fn in list(self.subs):
+            if want in (None, name):
+                fn(events.Event(name, data or {}, source))
+
+    def subscribe(self, name, fn):
+        entry = (name, fn)
+        self.subs.append(entry)
+        return lambda: self.subs.remove(entry) if entry in self.subs else None
+
+    def signals(self):
+        return [d for n, d in self.sent if n == events.ORB_SIGNAL]
+
+
+def _sig_api(shown=True, panels=True, busy=True, ptt=False, speaking=False):
+    api = _state_api(ptt=ptt, speaking=speaking, busy=busy)
+    api.bus = _SyncBus()
+    api._orb = SimpleNamespace(visible=shown)
+    api.orb_option = lambda name: panels if name == "orb_panels" else False
+    return api
+
+
+def _signals(api, clock=None):
+    model = fo.OrbSignals(clock or _OrbPanelsClock())
+    api.bus.subscribe(None, model.on_event)
+    return model
+
+
+_PANEL_DOM = r"""
+const realSetTimeout = setTimeout;
+function el(tag) {
+  return {tag, children: [], className: '', parentNode: null, _t: '',
+    appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
+    removeChild(c) { this.children = this.children.filter(x => x !== c); c.parentNode = null; },
+    set textContent(v) { this._t = String(v); this.children = []; },
+    get textContent() { return this._t + this.children.map(c => c.textContent).join(''); }};
+}
+const panel = el('div'), body = el('div'), close = el('button');
+panel.appendChild(body); panel.appendChild(close);
+const ids = {panel, body, close};
+globalThis.document = {getElementById: (id) => ids[id], createElement: el};
+const listeners = {};
+globalThis.window = {addEventListener: (t, fn) => { listeners[t] = fn; }};
+globalThis.setInterval = () => 1;
+globalThis.pywebview = {api: {panel_state: () => Promise.resolve(%STATE%), dismiss: () => {}}};
+%SCRIPT%
+(async () => {
+  listeners['pywebviewready']();
+  await new Promise(r => realSetTimeout(r, 20));
+  const texts = body.children.map(c => [c.className, c.textContent]);
+  console.log(JSON.stringify({texts, closeLeft: panel.children.includes(close),
+                              cls: panel.className}));
+})();
+"""
+
+
+# ============================================================
+# ORB NINE STATES TESTS
+# ============================================================
+
+@pytest.mark.parametrize("feed, want", [
+    ([], "thinking"),
+    ([("planning", True)], "planning"),
+    ([("planning", True), ("planning", False)], "thinking"),
+    ([("reading", True)], "reading"),
+    ([("reading", True), ("reading", True), ("reading", False)], "reading"),   # nested
+    ([("reading", True), ("reading", False), ("reading", False)], "thinking"),  # never < 0
+    ([("planning", True), ("reading", True)], "reading"),
+    ([("waiting", True)], "waiting"),
+    ([("waiting", True), ("waiting", False)], "thinking"),
+    ([("step", "open_app")], "executing"),
+    ([("step", "open_app"), ("executed", "open_app")], "thinking"),
+    ([("step", "open_app"), ("waiting", True)], "waiting"),
+    ([("step", "done")], "thinking"),
+])
+def test_signals_map_to_states(feed, want):
+    api = _sig_api()
+    model = _signals(api)
+    for kind, value in feed:
+        if kind == "step":
+            api.bus.publish(events.AGENT_STEP, {"action": value})
+        elif kind == "executed":
+            api.bus.publish(events.ACTION_EXECUTED, {"action": value})
+        else:
+            fo.orb_signal(api, kind, value)
+    assert fo.orb_state(api, model) == want
+
+
+def test_state_priorities_over_the_signals():
+    api = _sig_api(ptt=True)
+    model = _signals(api)
+    fo.orb_signal(api, "waiting", True)
+    assert fo.orb_state(api, model) == "listening"             # the mic wins
+    api = _sig_api(speaking=True)
+    model = _signals(api)
+    fo.orb_signal(api, "waiting", True)
+    assert fo.orb_state(api, model) == "waiting"               # an open question beats the voice
+    fo.orb_signal(api, "waiting", False)
+    fo.orb_signal(api, "reading", True)
+    assert fo.orb_state(api, model) == "speaking"
+    api = _sig_api()
+    model = _signals(api)
+    assert fo.orb_state(api, model, docked=True) == "executing"   # docked beside the target
+    api = _sig_api(busy=False)
+    model = _signals(api)
+    fo.orb_signal(api, "reading", True)
+    fo.orb_signal(api, "waiting", True)
+    assert fo.orb_state(api, model) == "idle"                  # no task: stale flags ignored
+
+
+@pytest.mark.parametrize("result, outcome, hold", [
+    ({"success": True, "speech": "Done."}, "completed", fo.COMPLETED_S),
+    ({"success": False, "error": "Hit max steps (15)"}, "error", fo.ERROR_S),
+])
+def test_completed_and_error_return_to_idle(result, outcome, hold):
+    clock = _OrbPanelsClock()
+    api = _sig_api()
+    model = _signals(api, clock)
+    fo.orb_signal(api, "started")
+    fo.task_finished(api, result)
+    api._agent_lock.release()                                  # the task is over
+    assert fo.orb_state(api, model) == outcome
+    clock.t += hold - 0.1
+    assert fo.orb_state(api, model) == outcome
+    clock.t += 0.2
+    assert fo.orb_state(api, model) == "idle"
+    assert model.outcome is None
+
+
+def test_the_outcome_is_held_from_the_end_of_speech():
+    clock = _OrbPanelsClock()
+    api = _sig_api(busy=False, speaking=True)
+    model = _signals(api, clock)
+    fo.task_finished(api, {"success": True})
+    clock.t += 10
+    assert fo.orb_state(api, model) == "speaking"              # the answer is being spoken
+    api.tts.speaking = False
+    clock.t += 1
+    assert fo.orb_state(api, model) == "completed"             # held from the end of speech
+    clock.t += fo.COMPLETED_S
+    assert fo.orb_state(api, model) == "idle"
+
+
+def test_a_stop_is_not_an_error_and_a_new_task_clears_the_outcome():
+    api = _sig_api(busy=False)
+    model = _signals(api)
+    fo.task_finished(api, {"success": False, "error": "Stopped by user"})
+    assert fo.orb_state(api, model) == "idle"
+    fo.task_finished(api, {"success": False, "error": "x"})
+    assert fo.orb_state(api, model) == "error"
+    fo.orb_signal(api, "started")
+    assert fo.orb_state(api, model) == "idle"
+
+
+@pytest.mark.parametrize("result, want", [
+    (None, ("error", "crash")),
+    ({"success": True}, ("completed", "")),
+    ({"success": False, "paused": True, "error": "Stopped -- progress saved"}, ("stopped", "")),
+    ({"success": False, "error": "Stopped by user"}, ("stopped", "")),
+    ({"success": False, "error": "I couldn't reach my server, so I stopped. Please try again in a moment."},
+     ("error", "network")),
+    ({"success": False, "error": "Agent call failed (ValueError)"}, ("error", "network")),
+    ({"success": False, "error": "not confirmed"}, ("error", "declined")),
+    ({"success": False, "error": "User declined the requested action."}, ("error", "declined")),
+    ({"success": False, "error": "No response to question -- task paused"}, ("error", "no_reply")),
+    ({"success": False, "error": "no answer"}, ("error", "no_answer")),
+    ({"success": False, "error": "loop"}, ("error", "stuck")),
+    ({"success": False, "error": "Hit max steps (15)"}, ("error", "steps")),
+    ({"success": False, "error": "1 phase(s) failed, 0 blocked, 1 completed"}, ("error", "phases")),
+    ({"success": False, "error": "Could not parse LLM response"}, ("error", "model")),
+    ({"success": False, "error": "something new"}, ("error", "failed")),
+])
+def test_task_outcomes_and_reasons(result, want):
+    assert fo.task_outcome(result) == want
+    assert want[1] == "" or want[1] in fo.ERROR_REASONS
+
+
+def test_the_agent_error_strings_are_the_ones_the_outcome_knows():
+    from core import agent
+
+    assert fo.task_outcome({"error": agent.NETWORK_FAILURE_SPEECH}) == ("error", "network")
+    assert fo.task_outcome({"error": agent.NOT_CONFIRMED_ERROR}) == ("error", "declined")
+
+
+def test_the_network_sentence_makes_the_error_reason_network():
+    api = _sig_api(busy=False)
+    model = _signals(api)
+    api.bus.publish(events.AGENT_STEP, {"action": "failed"})
+    fo.task_finished(api, {"success": False, "error": "whatever"})
+    assert model.outcome == "error" and model.reason == "network"
+
+
+def test_nothing_is_published_while_the_orb_is_hidden():
+    hidden = _sig_api(shown=False)
+    with fo.signal_scope(hidden, "reading"):
+        pass
+    fo.orb_signal(hidden, "started")
+    fo.task_finished(hidden, {"success": True})
+    with fo.waiting_scope(hidden, "confirm", "voice", "Send it?"):
+        pass
+    assert hidden.bus.sent == []
+    no_orb = SimpleNamespace(bus=_SyncBus())                   # the orb never created
+    fo.orb_signal(no_orb, "started")
+    assert no_orb.bus.sent == []
+    shown = _sig_api()
+    fo.orb_signal(shown, "bogus")                              # unknown names: nothing
+    assert shown.bus.sent == []
+
+
+def test_scopes_turn_off_even_when_the_body_raises():
+    api = _sig_api()
+    with pytest.raises(RuntimeError):
+        with fo.signal_scope(api, "reading"):
+            raise RuntimeError("boom")
+    assert api.bus.signals() == [{"signal": "reading", "on": True},
+                                 {"signal": "reading", "on": False}]
+
+
+@pytest.mark.parametrize("panels", [True, False])
+def test_waiting_carries_the_question_only_with_task_panels(panels):
+    api = _sig_api(panels=panels)
+    with fo.waiting_scope(api, "confirm", "voice", "Send hi to Ada?"):
+        pass
+    first = api.bus.signals()[0]
+    assert first["kind"] == "confirm" and first["mode"] == "voice"
+    assert ("question" in first) is panels
+    if panels:
+        assert first["question"] == "Send hi to Ada?"
+    assert api.bus.signals()[1] == {"signal": "waiting", "on": False}
+
+
+def test_ask_confirmation_sets_and_clears_waiting():
+    seen = []
+    api = Api.__new__(Api)
+    api._answer_lock, api._answer_event = threading.Lock(), threading.Event()
+    api._awaiting_text_answer = threading.Event()
+    api._pending_answer = api._pending_source = None
+    api._notify_js = lambda js: None
+    api._window = None
+    api.speak = lambda t: None
+    api.tts = SimpleNamespace(speaking=False)
+    api._voice_start = api._voice_mark = lambda *x, **k: None
+    api.bus = _SyncBus()
+    api._orb = SimpleNamespace(visible=True)
+    api.orb_option = lambda name: True
+    model = _signals(api)
+    lock = threading.Lock()
+    lock.acquire()
+    api._agent_lock, api._ptt_wants_mic = lock, lambda: False
+
+    def listen(**_kw):
+        seen.append(fo.orb_state(api, model))
+        return "yes"
+
+    api._listen_once = listen
+    assert Api.ask_confirmation(api, "Delete the file?", "voice") == ("yes", "voice")
+    assert seen == ["waiting"]
+    assert fo.orb_state(api, model) == "thinking"             # cleared when answered
+    sig = api.bus.signals()
+    assert [s["on"] for s in sig] == [True, False] and sig[0]["question"] == "Delete the file?"
+
+
+def test_the_loop_and_api_publish_at_their_choke_points():
+    src = inspect.getsource(AgentLoop._loop_steps)
+    i = src.index('waiting_scope(self.api, "ask", input_mode, question)')
+    block = src[i:i + 900]
+    assert "_get_text_answer(question" in block and "_listen_once(" in block
+    j = src.index('with signal_scope(self.api, "reading"):   # vision or UIA')
+    assert "self._get_screen_context()" in src[j:j + 200]
+    k = src.index('with signal_scope(self.api, "reading"):\n')
+    assert "_get_screen_context(lazy=1)" in src[k:k + 200]
+    api_src = inspect.getsource(Api._exec_sync)
+    a = api_src.index("with signal_scope(self, \"reading\"):     # the orb's reading look")
+    assert "self.analyze_screen()" in api_src[a:a + 120]
+    b = api_src.index('with signal_scope(self, "reading"):\n')
+    assert "self.read_screen_text(param)" in api_src[b:b + 120]
+    confirm = inspect.getsource(Api.ask_confirmation)
+    assert 'waiting_scope(self, "confirm", input_mode, question)' in confirm
+    assert confirm.index("waiting.__exit__") > confirm.index("finally:")
+
+
+def test_signals_and_models_never_print(capsys):
+    api = _sig_api()
+    model = _signals(api)
+    panels = op.PanelModel(_OrbPanelsClock())
+    api.bus.subscribe(None, panels.on_event)
+    with fo.waiting_scope(api, "ask", "text", "SECRET-QUESTION-42"):
+        fo.orb_state(api, model)
+    with fo.signal_scope(api, "reading"):
+        pass
+    api.bus.publish(events.AGENT_STEP, {"action": "done", "speech": "SECRET-ANSWER-42"})
+    fo.task_finished(api, {"success": False, "error": "SECRET-ERROR-42"})
+    fo.orb_state(api, model)
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
+
+
+@pytest.mark.parametrize("state, docked, want", [
+    ("idle", False, 82), ("listening", False, 82), ("thinking", False, 70),
+    ("planning", False, 70), ("reading", False, 70), ("waiting", False, 70),
+    ("speaking", False, 70), ("completed", False, 70), ("error", False, 70),
+    ("executing", False, 70), ("executing", True, 28), ("waiting", True, 28),
+])
+def test_each_of_the_nine_states_has_its_size(monkeypatch, state, docked, want):
+    monkeypatch.delenv("MISTAI_ORB_SIZES", raising=False)
+    assert fo.size_for(state, docked) == want
+
+
+def test_the_bridge_reports_still_when_windows_animations_are_off():
+    api = _sig_api()
+    orb = fo.FloatingOrb(api)
+    orb._win = SimpleNamespace(animations_enabled=lambda: False)
+    bridge = fo.OrbBridge(api, orb)
+    assert bridge.orb_state() == {"state": "thinking", "still": True}
+    orb._win, orb._anim = SimpleNamespace(animations_enabled=lambda: True), (True, 0.0)
+    assert bridge.orb_state() == {"state": "thinking"}
+    assert [n for n in dir(bridge) if not n.startswith("_")] == ["orb_state", "talk"]
+
+
+def test_the_orb_goes_home_medium_after_an_error_with_flight_on():
+    orb, played = _orb()
+    orb.square = (1008, 108, 28)
+    orb._was_busy = True
+    finished = events.Event(events.ORB_SIGNAL, {"signal": "finished", "on": True,
+                                                "outcome": "error", "reason": "steps"})
+    orb._on_bus(finished)
+    orb.signals.on_event(finished)
+    assert orb.aborted is True
+    orb.tick()
+    hx, hy, hs = orb.home
+    x, y, side = played[0][-1][1]
+    assert side == round(fo.orb_sizes()[1] * orb.scale)             # medium at home
+    assert abs((x + side / 2) - (hx + hs / 2)) <= 1 and abs((y + side / 2) - (hy + hs / 2)) <= 1
+
+
+# -- panels -----------------------------------------------------------------------------
+
+def test_the_waiting_panel_shows_the_question_and_a_hint():
+    api = _sig_api()
+    m = op.PanelModel(_OrbPanelsClock())
+    api.bus.subscribe(None, m.on_event)
+    with fo.waiting_scope(api, "confirm", "voice", "Send hi to Ada?"):
+        assert m.visible("waiting", True)
+        assert m.state("waiting") == {"kind": "waiting", "text": "Send hi to Ada?",
+                                      "hint": "Say yes or no."}
+    assert not m.visible("waiting", True)
+    with fo.waiting_scope(api, "ask", "text", "Which folder?"):
+        assert m.state("waiting")["hint"] == "Type your answer in MistAI."
+
+
+def test_the_error_panel_shows_a_plain_reason_and_closes():
+    clock = _OrbPanelsClock()
+    api = _sig_api()
+    m = op.PanelModel(clock)
+    api.bus.subscribe(None, m.on_event)
+    api.bus.publish(events.AGENT_STEP, {"action": "open_app"})
+    api.bus.publish(events.AGENT_STEP, {"action": "failed"})     # the network sentence
+    fo.task_finished(api, {"success": False, "error": "Agent call failed (OSError)"})
+    assert m.ended and not m.visible("steps", False)            # task panels close as before
+    assert m.visible("error", False)
+    assert m.state("error") == {"kind": "error", "text": fo.ERROR_REASONS["network"]}
+    clock.t += fo.ERROR_S + 0.1
+    assert not m.visible("error", False)
+
+
+def test_the_status_panels_cannot_be_dismissed_and_kinds_stay_put():
+    panels = SimpleNamespace(model=op.PanelModel(), side="top-right")
+    assert op.PanelBridge(panels, "waiting").dismiss() == {"ok": False}
+    assert op.PanelBridge(panels, "error").dismiss() == {"ok": False}
+    assert op.PanelBridge(panels, "steps").dismiss() == {"ok": True}
+    assert op.KINDS == ("steps", "answer")
+    assert op.ALL_KINDS == ("waiting", "error", "steps", "answer")
+
+
+def test_the_waiting_panel_window_appears_through_the_real_bus(monkeypatch):
+    from core.live_state import EventBus
+
+    monkeypatch.setattr(op, "panel_blur_enabled", lambda: False)
+    bus = EventBus()
+    try:
+        api = SimpleNamespace(bus=bus, _orb=SimpleNamespace(visible=True),
+                              orb_option=lambda name: True)
+        wv, win = _OrbFixesWebview(), _PanelWin()
+        panels = op.OrbPanels(api, win, webview=wv, html="<p>")
+        panels.update((1000, 100, 35), None, ORB_FIXES_W, 1.0, busy=True)
+        fo.orb_signal(api, "waiting", True, kind="confirm", mode="text", question="Go on?")
+        deadline = time.monotonic() + 3
+        while panels.model.waiting is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        panels.update((1000, 100, 35), None, ORB_FIXES_W, 1.0, busy=True)
+        assert [w.kw["js_api"]._kind for w in wv.created] == ["waiting"]
+        assert panels.model.state("waiting")["text"] == "Go on?"
+    finally:
+        bus.stop()
+
+
+# -- pages ------------------------------------------------------------------------------
+
+def test_the_orb_page_has_a_look_for_each_of_the_nine_states():
+    css = ORB_HTML.split("<style>", 1)[1].split("</style>", 1)[0]
+    for state in NINE_STATES:
+        assert f'.orb-wrap[data-state="{state}"]' in css, state
+    script = ORB_HTML.split("<script>", 1)[1]
+    for state in ("idle",) + NINE_STATES:
+        assert f"'{state}'" in script
+    # shape or glyph, not colour alone
+    for cls in ("g-pause", "g-check", "g-excl", "nodes", "bars", "scan", "halo", "burst"):
+        assert re.search(rf'class="[^"]*\b{cls}\b', ORB_HTML), cls
+    burst = css.split('.orb-wrap[data-state="completed"] .burst{', 1)[1].split("}", 1)[0]
+    shake = css.split('.orb-wrap[data-state="error"]{', 1)[1].split("}", 1)[0]
+    assert "infinite" not in burst and " 1 " in burst          # one burst, then calm
+    assert "infinite" not in shake and " 1" in shake           # one shake, then steady
+
+
+def test_reduced_motion_and_windows_animations_off_freeze_every_state():
+    css = ORB_HTML.split("<style>", 1)[1].split("</style>", 1)[0]
+    reduced = css.split("@media (prefers-reduced-motion: reduce){", 1)[1]
+    still = '.orb-wrap[data-motion="still"]'
+    for block, w in ((reduced, ".orb-wrap"), (css, still)):
+        assert f"{w},{w} .disc,{w} .ring" in block and "animation:none !important" in block
+        assert f'{w}[data-state="reading"] .scan{{opacity:.9' in block
+        assert f'{w}[data-state="planning"] .nodes i:nth-child(2){{opacity:1}}' in block
+    # glyphs and tints are not animations: they stay in both
+    assert '[data-state="waiting"] .g-pause{display:flex}' in css
+    assert '[data-state="error"] .tint{opacity:1' in css
+
+
+@floating_orb_window_needs_node
+def test_the_orb_page_shows_the_bridge_state_and_still_flag(tmp_path):
+    script = ORB_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    js = r"""
+const realSetTimeout = setTimeout;
+const replies = [{state: 'reading'}, {state: 'error', still: true}, {state: 'nope'}];
+const wrap = {dataset: {}};
+globalThis.document = {getElementById: () => wrap, addEventListener: () => {}};
+const listeners = {};
+let poll = null;
+globalThis.window = {addEventListener: (t, fn) => { listeners[t] = fn; }};
+globalThis.setInterval = (fn) => { poll = fn; return 1; };
+globalThis.pywebview = {api: {orb_state: () => Promise.resolve(replies.shift())}};
+""" + script + r"""
+(async () => {
+  const seen = [];
+  listeners['pywebviewready']();
+  for (let i = 0; i < 3; i++) {
+    await new Promise(r => realSetTimeout(r, 10));
+    seen.push([wrap.dataset.state, wrap.dataset.motion]);
+    poll();
+  }
+  console.log(JSON.stringify(seen));
+})();
+"""
+    f = tmp_path / "orb_nine.js"
+    f.write_text(js, encoding="utf-8")
+    out = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == [["reading", "on"], ["error", "still"], ["idle", "on"]]
+
+
+@floating_orb_window_needs_node
+@pytest.mark.parametrize("state, texts, close_left", [
+    ({"kind": "waiting", "text": "Send hi to <b>Ada</b>?", "hint": "Say yes or no."},
+     [["glyph", "❚❚"], ["q", "Send hi to <b>Ada</b>?"], ["hint", "Say yes or no."]],
+     False),
+    ({"kind": "error", "text": "I ran out of steps before finishing."},
+     [["glyph", "!"], ["q", "I ran out of steps before finishing."]], False),
+    ({"kind": "answer", "text": "It says 42."}, None, True),
+])
+def test_the_panel_page_renders_the_status_kinds_display_only(tmp_path, state, texts, close_left):
+    script = PANEL_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    js = _PANEL_DOM.replace("%STATE%", json.dumps(state)).replace("%SCRIPT%", script)
+    f = tmp_path / "panel.js"
+    f.write_text(js, encoding="utf-8")
+    out = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30,
+                         encoding="utf-8")
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["closeLeft"] is close_left
+    if texts is not None:
+        assert res["texts"] == texts                       # text exactly as given, as text
+        assert res["cls"] == "panel status " + state["kind"]

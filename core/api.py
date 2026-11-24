@@ -105,6 +105,7 @@ from .click_handler import CoordinateValidator, ImprovedClickHandler, EnhancedUI
 from . import planner as conversation, workspace as file_search, live_state as clip
 from .live_state import EventBus, LiveStateTracker, window_belongs_to, FileWatcher, StateWatcher
 from .executor import Executor
+from .floating_orb import signal_scope, waiting_scope
 from .memory import Memory, recall_builtin, TaskStore
 from .screen import ScreenBuffer, CohereVision
 from .tools import ToolRegistry
@@ -2090,6 +2091,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             self._answer_event.clear()
             self._awaiting_text_answer.set()
         shown = False
+        waiting = waiting_scope(self, "confirm", input_mode, question)   # the orb waits
+        waiting.__enter__()
         try:
             window = getattr(self, "_window", None)
             if window:
@@ -2126,6 +2129,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             return (heard, "voice") if input_mode == "voice" else (None, "typed")
         finally:
             self._awaiting_text_answer.clear()
+            waiting.__exit__(None, None, None)
             self._notify_js("closeConfirmPrompt()")
             if shown and confirm_reminimize_enabled():
                 self.minimize_window()
@@ -2616,14 +2620,16 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             elif action == "analyze_screen":
                 # Perception action: the DESCRIPTION is the result and must
                 # reach the model. It used to be spoken aloud and discarded.
-                result = self.analyze_screen()
+                with signal_scope(self, "reading"):     # the orb's reading look
+                    result = self.analyze_screen()
                 self.last_result_text = (
                     f"Window: {result['app']} | Open: {result['open_apps']} | "
                     f"{result['description']}"
                 )
                 return True
             elif action == "read_screen_text":
-                self.read_screen_text(param)
+                with signal_scope(self, "reading"):
+                    self.read_screen_text(param)
                 return True
             elif action == "list_apps":
                 self.last_result_text = f"Open apps: {self.list_open_apps()}"

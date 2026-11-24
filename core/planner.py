@@ -66,6 +66,7 @@ from datetime import datetime
 import requests
 
 from . import planner, live_state as events
+from .floating_orb import signal_scope, orb_signal, task_finished
 from .config import (
     describe_api_error,
     confirmation_answer,
@@ -424,11 +425,12 @@ def make_plan(api, goal, model):
     except Exception:
         workspace = "(workspace unavailable)"
     t0 = time.monotonic()
-    raw = _llm(
-        api,
-        _PLAN_PROMPT.format(goal=goal, max_nodes=MAX_NODES, workspace=workspace),
-        model,
-    )
+    with signal_scope(api, "planning"):      # the orb's planning look (orb shown only)
+        raw = _llm(
+            api,
+            _PLAN_PROMPT.format(goal=goal, max_nodes=MAX_NODES, workspace=workspace),
+            model,
+        )
     plan_secs = time.monotonic() - t0
     print(f"[Timing] Planning LLM: {plan_secs:.2f}s mode={call_mode()}")
     agent = getattr(api, "agent", None)
@@ -617,6 +619,17 @@ class PlanRunner:
     # -- Entry points --------------------------------------------------------
 
     def run_goal(self, goal, model, gender, input_mode, on_step):
+        # The orb's started / finished signals, for every task: one-node
+        # plans skip _drive and its task events (no TaskRecord), not these.
+        orb_signal(self.api, "started")
+        result = None
+        try:
+            result = self._run_goal(goal, model, gender, input_mode, on_step)
+            return result
+        finally:
+            task_finished(self.api, result)
+
+    def _run_goal(self, goal, model, gender, input_mode, on_step):
         plan, name = make_plan(self.api, goal, model)
         if len(plan.nodes) <= 1:
             # Exact parity with the pre-DAG behavior for simple tasks:
@@ -626,6 +639,15 @@ class PlanRunner:
         return self._drive(record, plan, model, gender, input_mode, on_step)
 
     def resume(self, record, model, gender, input_mode, on_step):
+        orb_signal(self.api, "started")
+        result = None
+        try:
+            result = self._resume(record, model, gender, input_mode, on_step)
+            return result
+        finally:
+            task_finished(self.api, result)
+
+    def _resume(self, record, model, gender, input_mode, on_step):
         plan = Plan.from_dict(record.plan)
         if not plan.nodes:
             return {"success": False, "error": "Saved task has no plan"}

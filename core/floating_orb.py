@@ -38,35 +38,37 @@
 #   29. FRAME TIMING STATISTICS
 #   30. FRAME STATS LOG LINE
 #   31. ORB WINDOW SETTINGS
-#   32. ORB STATE FROM PYTHON FACTS
-#   33. ORB PAGE BRIDGE
-#   34. HOME PLACEMENT ON THE PRIMARY MONITOR
-#   35. ROUND REGION BOX
-#   36. ORB SIZE PER STATE
-#   37. WIN32 CALLS
-#   38. MOVING AND RESIZING THE WINDOW
-#   39. FRAME PACING
-#   40. TEST FRAME PACER
-#   41. TIMER RESOLUTION BOOST STATE
-#   42. TIMER RESOLUTION BOOST ON
-#   43. TIMER RESOLUTION BOOST OFF
-#   44. FLIGHT PLAYER
-#   45. NO-ACTIVATE MOUSE ANSWER
-#   46. NO-ACTIVATE WINDOW SUBCLASS
-#   47. TASKBAR HIDING
-#   48. WIN32 FAILURE LOGGING
-#   49. ORB WINDOW HARDENING
-#   50. CREATE-TIME CORNER POSITION
-#   51. ORB CONTROLLER
-#   52. TASK PANELS
-#   53. TASK PANEL SETTINGS
-#   54. STEP LABELS
-#   55. TOOL CATEGORY LOOKUP
-#   56. PANEL MODEL
-#   57. PANEL PAGE BRIDGE
-#   58. PANEL WINDOW HARDENING
-#   59. PANEL ROUNDED CORNERS
-#   60. PANEL WINDOWS
+#   32. ORB STATE SIGNALS
+#   33. ORB SIGNAL MODEL
+#   34. ORB STATE FROM PYTHON FACTS
+#   35. ORB PAGE BRIDGE
+#   36. HOME PLACEMENT ON THE PRIMARY MONITOR
+#   37. ROUND REGION BOX
+#   38. ORB SIZE PER STATE
+#   39. WIN32 CALLS
+#   40. MOVING AND RESIZING THE WINDOW
+#   41. FRAME PACING
+#   42. TEST FRAME PACER
+#   43. TIMER RESOLUTION BOOST STATE
+#   44. TIMER RESOLUTION BOOST ON
+#   45. TIMER RESOLUTION BOOST OFF
+#   46. FLIGHT PLAYER
+#   47. NO-ACTIVATE MOUSE ANSWER
+#   48. NO-ACTIVATE WINDOW SUBCLASS
+#   49. TASKBAR HIDING
+#   50. WIN32 FAILURE LOGGING
+#   51. ORB WINDOW HARDENING
+#   52. CREATE-TIME CORNER POSITION
+#   53. ORB CONTROLLER
+#   54. TASK PANELS
+#   55. TASK PANEL SETTINGS
+#   56. STEP LABELS
+#   57. TOOL CATEGORY LOOKUP
+#   58. PANEL MODEL
+#   59. PANEL PAGE BRIDGE
+#   60. PANEL WINDOW HARDENING
+#   61. PANEL ROUNDED CORNERS
+#   62. PANEL WINDOWS
 # ============================================================
 
 """
@@ -858,29 +860,247 @@ FLIGHT_SWITCH_INTERVAL = 0.001     # s, sys.setswitchinterval during a flight
 
 
 # ============================================================
+# ORB STATE SIGNALS
+# ============================================================
+
+# Small content-free signals for the orb and its panels, published on the bus
+# (events.ORB_SIGNAL) from choke points that already exist: PlanRunner
+# (started / finished for every task, one-node ones too; planning around the
+# planning call), the loop (reading around a UIA/vision screen context,
+# waiting around ask_user) and Api (reading around analyze_screen /
+# read_screen_text, waiting around ask_confirmation). Nothing is published
+# unless the floating orb is shown; the open question's text rides along
+# only when Task panels is on (the waiting panel shows it). Never logged.
+
+SIGNALS = ("started", "finished", "planning", "reading", "waiting")
+COMPLETED_S = 2.5          # the completed look, counted from the end of speech
+ERROR_S = 6.0              # the error look and panel, counted from the end of speech
+QUESTION_CHARS = 300
+# finished's reason label -> the error panel's plain-language sentence.
+ERROR_REASONS = {
+    "network": "I couldn't reach the MistAI server.",
+    "declined": "You said no, so I stopped there.",
+    "no_reply": "I didn't get an answer, so I paused.",
+    "no_answer": "I couldn't find the answer on screen.",
+    "stuck": "I kept repeating myself, so I stopped.",
+    "steps": "I ran out of steps before finishing.",
+    "phases": "Some parts of the task didn't finish.",
+    "model": "I couldn't understand my own plan.",
+    "crash": "Something broke inside MistAI.",
+    "failed": "I couldn't finish the task.",
+}
+# The waiting panel's hint per (kind, input mode).
+WAIT_HINTS = {
+    ("confirm", "voice"): "Say yes or no.",
+    ("confirm", "text"): "Click Yes or No in MistAI.",
+    ("ask", "voice"): "Say your answer.",
+    ("ask", "text"): "Type your answer in MistAI.",
+}
+
+
+def _orb_shown(api):
+    try:
+        orb = api.__dict__.get("_orb") if hasattr(api, "__dict__") else None
+        return bool(orb is not None and orb.visible)
+    except Exception:
+        return False
+
+
+def orb_signal(api, signal, on=True, **data):
+    """Publish one signal (only while the floating orb is shown). Never
+    raises, never logs."""
+    try:
+        if signal not in SIGNALS or not _orb_shown(api):
+            return
+        payload = dict(data)
+        payload.update(signal=signal, on=bool(on))
+        api.bus.publish(events.ORB_SIGNAL, payload, "Orb")
+    except Exception:
+        pass
+
+
+class signal_scope:
+    """``with signal_scope(api, "reading"):`` -- on at the start, off at the
+    end, whatever happens inside."""
+
+    def __init__(self, api, signal, **data):
+        self._api, self._signal, self._data = api, signal, data
+
+    def __enter__(self):
+        orb_signal(self._api, self._signal, True, **self._data)
+        return self
+
+    def __exit__(self, *exc):
+        orb_signal(self._api, self._signal, False)
+        return False
+
+
+def waiting_scope(api, kind, input_mode, question):
+    """The waiting signal for an open confirmation (kind "confirm") or
+    ask_user question ("ask"); the question only when Task panels is on."""
+    data = {"kind": "ask" if kind == "ask" else "confirm",
+            "mode": "voice" if input_mode == "voice" else "text"}
+    try:
+        if api.orb_option("orb_panels"):
+            data["question"] = str(question or "")[:QUESTION_CHARS]
+    except Exception:
+        pass
+    return signal_scope(api, "waiting", **data)
+
+
+def task_outcome(result):
+    """(outcome, reason label) of a task's result dict: ("completed", ""),
+    ("stopped", "") for a stop or pause, else ("error", one of ERROR_REASONS)."""
+    if not isinstance(result, dict):
+        return "error", "crash"
+    if result.get("success"):
+        return "completed", ""
+    err = str(result.get("error") or "")
+    low = err.lower()
+    if result.get("paused") or "stopped by user" in low:
+        return "stopped", ""
+    if "couldn't reach my server" in low or low.startswith("agent call failed"):
+        return "error", "network"
+    for needle, reason in (("not confirmed", "declined"), ("declined", "declined"),
+                           ("no response to question", "no_reply"), ("no answer", "no_answer"),
+                           ("max steps", "steps"), ("phase(s) failed", "phases"),
+                           ("parse", "model")):
+        if needle in low:
+            return "error", reason
+    if low == "loop":
+        return "error", "stuck"
+    return "error", "failed"
+
+
+def task_finished(api, result):
+    """The finished signal for a task's result (None: it raised)."""
+    outcome, reason = task_outcome(result)
+    orb_signal(api, "finished", outcome=outcome, reason=reason)
+
+
+# ============================================================
+# ORB SIGNAL MODEL
+# ============================================================
+
+class OrbSignals:
+    """What the signals say right now, fed by the bus (subscribers must be
+    fast). The orb's state reads it through orb_state()."""
+
+    def __init__(self, clock=time.monotonic):
+        self._lock = threading.Lock()
+        self._clock = clock
+        self.reset()
+
+    def reset(self):
+        self.planning = False
+        self.reading = 0            # nested scopes: a count, never below 0
+        self.waiting = None         # {"kind", "mode", "question"?} while a question is open
+        self.acting = False         # an action step is running
+        self.network = False        # this task hit the network sentence
+        self.outcome = None         # "completed" | "error" while its look is held
+        self.reason = ""
+        self.outcome_at = None
+
+    def on_event(self, ev):
+        try:
+            data = ev.data or {}
+            with self._lock:
+                if ev.name == events.ORB_SIGNAL:
+                    sig, on = data.get("signal"), bool(data.get("on"))
+                    if sig == "started":
+                        self.reset()
+                    elif sig == "finished":
+                        outcome, reason = data.get("outcome"), str(data.get("reason") or "")
+                        if outcome == "error" and self.network:
+                            reason = "network"
+                        network = self.network
+                        self.reset()
+                        self.network = network
+                        if outcome in ("completed", "error"):
+                            self.outcome = outcome
+                            self.reason = reason if reason in ERROR_REASONS else (
+                                "failed" if outcome == "error" else "")
+                            self.outcome_at = self._clock()
+                    elif sig == "planning":
+                        self.planning = on
+                    elif sig == "reading":
+                        self.reading = self.reading + 1 if on else max(0, self.reading - 1)
+                    elif sig == "waiting":
+                        self.waiting = ({"kind": data.get("kind", "confirm"),
+                                         "mode": data.get("mode", "text")} if on else None)
+                elif ev.name == events.AGENT_STEP:
+                    action = str(data.get("action", ""))
+                    if action == "failed":
+                        self.network, self.acting = True, False
+                    else:
+                        self.acting = action != "done"
+                elif ev.name in (events.ACTION_EXECUTED, events.ACTION_FAILED):
+                    self.acting = False
+        except Exception:
+            pass
+
+    def held_outcome(self, speaking):
+        """"completed" / "error" while its look is held, else None. Speech
+        holds it (the hold counts from when the voice stops)."""
+        with self._lock:
+            if self.outcome is None:
+                return None
+            now = self._clock()
+            if speaking:
+                self.outcome_at = now
+            hold = COMPLETED_S if self.outcome == "completed" else ERROR_S
+            if now - self.outcome_at > hold:
+                self.outcome, self.reason, self.outcome_at = None, "", None
+                return None
+            return self.outcome
+
+
+# ============================================================
 # ORB STATE FROM PYTHON FACTS
 # ============================================================
 
-def orb_state(api):
-    """The orb's state from Python's own facts, with the page's priority
-    (ui/html.py orbState): the push-to-talk mic, then Mist's voice, then a
-    running task, else idle."""
+STATES = ("idle", "listening", "thinking", "planning", "executing", "reading", "waiting",
+          "speaking", "completed", "error")
+
+
+def orb_state(api, signals=None, docked=False):
+    """The orb's state from Python's own facts and the signals, first match
+    wins: the push-to-talk mic (listening), an open question (waiting), Mist's
+    voice (speaking), a just-finished task (error, completed), then while a
+    task runs: a screen read (reading), the planning call (planning), an
+    action running or a dock beside the task's window (executing), else
+    thinking; idle when nothing is going on. Without signals: the page's
+    old order (ui/html.py orbState): listening, speaking, thinking, idle."""
     try:
         if api._ptt_wants_mic():
             return "listening"
     except Exception:
         pass
     try:
-        if getattr(getattr(api, "tts", None), "speaking", False):
-            return "speaking"
+        busy = bool(api._agent_lock.locked())
     except Exception:
-        pass
+        busy = False
+    if signals is not None and busy and signals.waiting:
+        return "waiting"
     try:
-        if api._agent_lock.locked():
-            return "thinking"
+        speaking = bool(getattr(getattr(api, "tts", None), "speaking", False))
     except Exception:
-        pass
-    return "idle"
+        speaking = False
+    outcome = signals.held_outcome(speaking) if signals is not None else None
+    if speaking:
+        return "speaking"
+    if outcome:
+        return outcome
+    if not busy:
+        return "idle"
+    if signals is not None:
+        if signals.reading:
+            return "reading"
+        if signals.planning:
+            return "planning"
+        if signals.acting or docked:
+            return "executing"
+    return "thinking"
 
 
 # ============================================================
@@ -893,11 +1113,20 @@ class OrbBridge:
 
     _TALK = ("start", "stop", "toggle")
 
-    def __init__(self, api):
+    def __init__(self, api, orb=None):
         self._api = api
+        self._orb = orb           # the FloatingOrb: its signals, dock and animation setting
 
     def orb_state(self):
-        return {"state": orb_state(self._api)}
+        """{"state"}; plus "still": true when Windows animation effects are
+        off (the page then freezes its motion, like prefers-reduced-motion)."""
+        orb = self._orb
+        if orb is None:
+            return {"state": orb_state(self._api)}
+        out = {"state": orb.state()}
+        if not orb.animations_on():
+            out["still"] = True
+        return out
 
     def talk(self, kind):
         """Push-to-talk from the orb: "start" (a hold began; only when not
@@ -951,13 +1180,21 @@ def ellipse_box(width, height):
 # ORB SIZE PER STATE
 # ============================================================
 
+BIG_STATES = ("idle", "listening")
+# Docked beside the task's window the orb is small; these grow it to medium
+# there (a question is open, the screen is being read).
+DOCKED_MEDIUM_STATES = ("waiting", "reading")
+
+
 def size_for(state, docked=False):
     """Logical side for a state: small while docked beside the task's window,
-    medium while thinking or speaking, big when idle or listening."""
+    big when idle or listening, medium for every other state (thinking,
+    planning, reading, waiting, speaking, completed, error, and executing
+    while not docked)."""
     big, medium, small = orb_sizes()
     if docked:
         return small
-    return medium if state in ("thinking", "speaking") else big
+    return big if state in BIG_STATES else medium
 
 
 # -- Win32 (ctypes; tests pass a fake with the same methods) --------------------
@@ -1738,13 +1975,35 @@ class FloatingOrb:
         self._tour = None                  # {"stops": [...], "i", "next_at"} while touring
         self._tour_gen = 0                 # bumped by every step: stale tours are dropped
         self._answer = None                # {"at", "words"} from the final AgentStep
+        self.signals = OrbSignals()        # the state signals (events.ORB_SIGNAL)
+        self._anim = (True, 0.0)           # (Windows animation effects on, read at)
         self._clock = time.monotonic
         self._sleep = time.sleep           # the tour's one re-read (tests: no-op)
 
     TICK_S = 0.25
     DWELL_S = 1.5             # a docked arrival stays put this long
+    ANIM_CHECK_S = 5.0        # re-read the Windows animation setting this often
     FAST_TICK_S = 0.1
     LAUNCH_POLL_S = 2.0
+
+    def state(self):
+        """The orb's state now (orb_state with this orb's signals; docked
+        beside the task's window counts as executing)."""
+        return orb_state(self._api, self.signals,
+                         docked=self.dock not in (None, "answer", "tour"))
+
+    def animations_on(self):
+        """Windows animation effects (SPI_GETCLIENTAREAANIMATION), re-read
+        every ANIM_CHECK_S; True when unknown."""
+        on, at = self._anim
+        now = self._clock()
+        if self._win is not None and (at == 0.0 or now - at > self.ANIM_CHECK_S):
+            try:
+                on = bool(self._win.animations_enabled())
+            except Exception:
+                on = True
+            self._anim = (on, now)
+        return on
 
     def _flight_on(self):
         try:
@@ -1876,7 +2135,7 @@ class FloatingOrb:
             return resize_about_center(x, y, side, round(size_for(state) * self.scale))
         if self.aborted or self._stop_requested():
             self._answer = None
-            return self.home                         # failed, paused or stopped: home now
+            return self._home_for(state)             # failed, paused or stopped: home now
         if self._answer_speaking():
             panel = self.panels.rects.get("answer") if self.panels is not None else None
             medium = round(orb_sizes()[1] * self._here_scale())
@@ -1890,7 +2149,8 @@ class FloatingOrb:
         _big, medium, small_l = orb_sizes()
         if target:
             rect, work, scale = target["rect"], target["work"], target["scale"]
-            small = max(1, round(small_l * scale))
+            small = max(1, round((medium if state in DOCKED_MEDIUM_STATES else small_l)
+                                 * scale))
             if target["inside"]:
                 self.dock = "element" if target["element"] else "inner-edge"
                 pos = dock_inside(rect, work, small, target["element"],
@@ -1902,7 +2162,15 @@ class FloatingOrb:
         if busy or state == "speaking":
             # No target yet (or it left the front): stay where it is.
             return resize_about_center(x, y, side, round(medium * self._here_scale()))
-        return self.home
+        return self._home_for(state)
+
+    def _home_for(self, state):
+        """Home: big, or medium there for a state that is medium (the
+        completed or error look after a task)."""
+        if state not in ("completed", "error") or not self.home:
+            return self.home
+        hx, hy, hs = self.home
+        return resize_about_center(hx, hy, hs, round(size_for(state) * self.scale))
 
     def _answer_speaking(self):
         """Is the final answer being spoken? The TTS's own flag when it has
@@ -1951,7 +2219,9 @@ class FloatingOrb:
                 threading.Thread(target=self._prepare_tour, args=(gen,), daemon=True,
                                  name="OrbTour").start()
             if name in (events.TASK_FAILED, events.TASK_PAUSED) or (
-                    name == events.AGENT_STEP and data.get("action") == "failed"):
+                    name == events.AGENT_STEP and data.get("action") == "failed") or (
+                    name == events.ORB_SIGNAL and data.get("signal") == "finished"
+                    and data.get("outcome") in ("error", "stopped")):
                 self.aborted = True
             self._kick.set()
         except Exception:
@@ -2058,7 +2328,7 @@ class FloatingOrb:
         dest = getattr(tw, "goal", None)
         if not dest:
             return
-        goal = self._goal(orb_state(self._api), from_square=dest)
+        goal = self._goal(self.state(), from_square=dest)
         if max(abs(a - b) for a, b in zip(goal, dest)) <= 2:
             return
         if tw.retarget(goal) and self.dock != self._logged_dock:
@@ -2150,11 +2420,12 @@ class FloatingOrb:
                 return
             if busy and self._tour_step():
                 return                               # touring the results
-            if self._clock() < self._dwell_until and not (self.aborted
+            state = self.state()
+            if self._clock() < self._dwell_until and not (self.aborted or state == "waiting"
                                                           or self._stop_requested()):
                 return                               # minimum dwell at a dock
             self._adopt_drag()
-            goal = self._goal(orb_state(self._api))
+            goal = self._goal(state)
             if self.dock != self._logged_dock:
                 self._logged_dock = self.dock
                 print(f"[FloatingOrb] dock {self.dock or 'none'} size {goal[2]}")
@@ -2194,7 +2465,7 @@ class FloatingOrb:
                     from ui.html import ORB_HTML as html
                 x, y = _corner_position()
                 self.window = self._module().create_window(
-                    "", html=html, js_api=OrbBridge(self._api),
+                    "", html=html, js_api=OrbBridge(self._api, self),
                     width=orb_sizes()[0], height=orb_sizes()[0], x=x, y=y,
                     min_size=MIN_SIZE,
                     resizable=False, frameless=True, easy_drag=True, shadow=False,
@@ -2244,8 +2515,11 @@ class FloatingOrb:
                 try:
                     for name in (events.ACTION_EXECUTED, events.ACTION_FAILED,
                                  events.TASK_FAILED,
-                                 events.TASK_PAUSED, events.AGENT_STEP):
+                                 events.TASK_PAUSED, events.AGENT_STEP, events.ORB_SIGNAL):
                         self._api.bus.subscribe(name, self._on_bus)
+                    for name in (events.ORB_SIGNAL, events.AGENT_STEP,
+                                 events.ACTION_EXECUTED, events.ACTION_FAILED):
+                        self._api.bus.subscribe(name, self.signals.on_event)
                 except Exception:
                     pass
                 threading.Thread(target=self._run, daemon=True, name="OrbControl").start()
@@ -2283,7 +2557,7 @@ class FloatingOrb:
 # core/orb_panels.py — task panels beside the floating orb (Settings "Task
 # panels" / MISTAI_ORB_PANELS, default off; needs the floating orb shown).
 #
-# Three small frameless windows built like the orb (core/floating_orb.py):
+# Up to four small frameless windows built like the orb (core/floating_orb.py):
 # excluded from capture, never activated (WS_EX_NOACTIVATE), untitled, in
 # MistAI's own process (so Open apps and process lookups skip them), listed in
 # the orb's handles() (so the OCR mask blacks them out and input is refused
@@ -2295,6 +2569,10 @@ class FloatingOrb:
 #   completes (the last one is the current step); answer: the final speech.
 #   They close ANSWER_S after the answer, and at once when the task fails, is
 #   paused or stopped, or the network sentence is spoken.
+# - waiting: the open confirmation or ask_user question and a hint ("Say yes
+#   or no."), while it is open; error: a failed task's plain-language reason
+#   (ERROR_REASONS), for ERROR_S after the speech ends. Both display-only:
+#   no buttons (dismiss refuses them), fed by events.ORB_SIGNAL.
 #
 # Content comes from the event bus (events.AGENT_STEP, ACTION_EXECUTED/FAILED)
 # and is never logged; logs carry labels and numbers only.
@@ -2304,7 +2582,12 @@ class FloatingOrb:
 # ============================================================
 
 KINDS = ("steps", "answer")
-SIZES = {"steps": (240, 176), "answer": (280, 140)}   # logical px
+# Display-only status panels (no buttons): the open question with a hint, and
+# a failed task's plain-language reason. Stacked above the task panels.
+STATUS_KINDS = ("waiting", "error")
+ALL_KINDS = STATUS_KINDS + KINDS
+SIZES = {"steps": (240, 176), "answer": (280, 140),
+         "waiting": (280, 92), "error": (260, 76)}   # logical px
 ANSWER_S = 8.0
 MAX_STEPS = 8
 CORNER = 12                  # logical px
@@ -2370,6 +2653,9 @@ class PanelModel:
             self.spoken_until = None  # when Mist last spoke the answer
             self.closed = set()
             self.ended = False        # failed, paused, stopped: close all now
+            self.waiting = None       # {"text", "hint"} while a question is open
+            self.error = ""           # the plain-language reason of a failed task
+            self.error_at = None
 
     def on_event(self, ev):
         try:
@@ -2388,6 +2674,8 @@ class PanelModel:
                         del self.steps[:-MAX_STEPS]
                 elif ev.name in (events.TASK_FAILED, events.TASK_PAUSED):
                     self.ended = True
+                elif ev.name == events.ORB_SIGNAL:
+                    self._on_signal(data)
                 elif ev.name in (events.ACTION_EXECUTED, events.ACTION_FAILED):
                     action = str(data.get("action", ""))
                     for step in reversed(self.steps):
@@ -2397,10 +2685,30 @@ class PanelModel:
         except Exception:
             pass
 
+    def _on_signal(self, data):
+        """events.ORB_SIGNAL (under the lock): waiting opens and closes the
+        waiting panel; a finished task with an error opens the error panel."""
+        sig = data.get("signal")
+        if sig == "waiting":
+            if data.get("on"):
+                self.waiting = {"text": str(data.get("question", "")),
+                                "hint": WAIT_HINTS.get((data.get("kind"), data.get("mode")), "")}
+            else:
+                self.waiting = None
+        elif sig == "finished":
+            self.waiting = None
+            if data.get("outcome") == "error":
+                self.error = ERROR_REASONS.get(str(data.get("reason") or ""),
+                                               ERROR_REASONS["failed"])
+                self.error_at = self._clock()
+
     def mark_speaking(self, speaking):
-        """Panels close ANSWER_S after the answer's speech ENDS."""
+        """Panels close ANSWER_S after the answer's speech ENDS (the error
+        panel ERROR_S after it)."""
         if speaking and self.answer_at is not None:
             self.spoken_until = self._clock()
+        if speaking and self.error_at is not None:
+            self.error_at = self._clock()
 
     def expired(self):
         if self.answer_at is None:
@@ -2410,6 +2718,10 @@ class PanelModel:
 
     def visible(self, kind, busy):
         """Should this panel be on screen now?"""
+        if kind == "waiting":
+            return bool(self.waiting) and not self.ended
+        if kind == "error":
+            return bool(self.error) and self._clock() - self.error_at <= ERROR_S
         if self.ended or kind in self.closed or self.expired():
             return False
         if kind == "answer":
@@ -2421,6 +2733,11 @@ class PanelModel:
             if kind == "steps":
                 return {"kind": kind, "steps": [{"label": s["label"], "state": s["state"]}
                                                 for s in self.steps]}
+            if kind == "waiting":
+                w = self.waiting or {}
+                return {"kind": kind, "text": w.get("text", ""), "hint": w.get("hint", "")}
+            if kind == "error":
+                return {"kind": kind, "text": self.error}
             return {"kind": kind, "text": self.answer}
 
     def close(self, kind):
@@ -2444,6 +2761,9 @@ class PanelBridge:
         return st
 
     def dismiss(self):
+        """The task panels' close button; the status panels have none."""
+        if self._kind in STATUS_KINDS:
+            return {"ok": False}
         self._panels.model.close(self._kind)
         return {"ok": True}
 
@@ -2513,7 +2833,7 @@ class OrbPanels:
         try:
             bus = api.bus
             for name in (events.AGENT_STEP, events.ACTION_EXECUTED, events.ACTION_FAILED,
-                         events.TASK_FAILED, events.TASK_PAUSED):
+                         events.TASK_FAILED, events.TASK_PAUSED, events.ORB_SIGNAL):
                 self._unsubs.append(bus.subscribe(name, self.model.on_event))
         except Exception:
             pass
@@ -2585,7 +2905,7 @@ class OrbPanels:
             self.model.mark_speaking(speaking)
             if self.model.expired() and not busy:
                 self.model.reset()
-            kinds = [k for k in KINDS if self.model.visible(k, busy)]
+            kinds = [k for k in ALL_KINDS if self.model.visible(k, busy)]
             sizes = [tuple(round(v * scale) for v in SIZES[k]) for k in kinds]
             spots, self.side = anchored_panels(sizes, work, panel_anchor(), scale,
                                                target_rect, maximized, orb)
@@ -2607,7 +2927,7 @@ class OrbPanels:
                 if not self.shown.get(kind):
                     print(f"[OrbPanels] show {kind}")
                 self.shown[kind] = True
-            for kind in KINDS:
+            for kind in ALL_KINDS:
                 if kind not in kinds and self.shown.get(kind):
                     if self.hwnds.get(kind):
                         self._win.show(self.hwnds[kind], False)
@@ -2618,7 +2938,7 @@ class OrbPanels:
             print(f"[OrbPanels] update error ({type(e).__name__})")
 
     def hide_all(self):
-        for kind in KINDS:
+        for kind in ALL_KINDS:
             if self.shown.get(kind) and self.hwnds.get(kind):
                 try:
                     self._win.show(self.hwnds[kind], False)

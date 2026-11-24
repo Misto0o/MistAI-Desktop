@@ -111,6 +111,11 @@ ACTION_FAILED = "ActionFailed"
 # for the final answer; {"action": "failed"} when the agent call fails (the network
 # sentence). For the floating orb and its panels only; never logged.
 AGENT_STEP = "AgentStep"
+# core/floating_orb.py orb_signal: {"signal": started|finished|planning|reading|
+# waiting, "on", ...} from PlanRunner, the loop and Api; every task, one-node
+# ones too. Only while the floating orb is shown; for it and its panels only;
+# never logged.
+ORB_SIGNAL = "OrbSignal"
 
 TASK_STARTED = "TaskStarted"
 TASK_PHASE_DONE = "TaskPhaseDone"

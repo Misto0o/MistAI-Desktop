@@ -42,6 +42,7 @@ from .config import (
     vision_gating_enabled,
 )
 from .executor import Executor
+from .floating_orb import signal_scope, waiting_scope
 from .live_state import describe_open_apps
 from .tools import (CLICK_FAMILY, READ_RESULT_CHARS, SPECS, action_entry, action_menu,
                     arg_problem, command_is_mutating)
@@ -1033,12 +1034,17 @@ class AgentLoop:
                             "  [Screen] lazy first read: title + Open apps"
                             + (" + UIA" if lazy_first == 1 else "") + ", no vision"
                         )
-                        screen_context = self._get_screen_context(lazy=lazy_first)
+                        if lazy_first == 1:                   # a UIA summary: the orb reads
+                            with signal_scope(self.api, "reading"):
+                                screen_context = self._get_screen_context(lazy=1)
+                        else:                                 # title + Open apps only
+                            screen_context = self._get_screen_context(lazy=lazy_first)
                     elif skip_now:
                         print("  [Screen] after a verified launch: title + Open apps, no vision")
                         screen_context = self._get_screen_context(lazy=2)
                     else:
-                        screen_context = self._get_screen_context()
+                        with signal_scope(self.api, "reading"):   # vision or UIA
+                            screen_context = self._get_screen_context()
                     first_read = False
                     self.record_time("screen", time.monotonic() - t0, step_times)
                     screen_cache = screen_context
@@ -1480,15 +1486,16 @@ class AgentLoop:
                 question = param or "Can you clarify what you'd like me to do?"
                 print("  [AskUser] asked")             # never the question's text
 
-                if input_mode == "voice":
-                    self.api.speak(question)
-                    while self.api.tts.speaking:
-                        time.sleep(0.05)
-                    profile = confirm_listen_profile()   # MISTAI_CONFIRM_LISTEN A/B
-                    answer = self.api._listen_once(
-                        timeout=10, **({} if profile == "shared" else {"profile": profile}))
-                else:
-                    answer = self.api._get_text_answer(question, timeout=60)
+                with waiting_scope(self.api, "ask", input_mode, question):  # the orb waits
+                    if input_mode == "voice":
+                        self.api.speak(question)
+                        while self.api.tts.speaking:
+                            time.sleep(0.05)
+                        profile = confirm_listen_profile()   # MISTAI_CONFIRM_LISTEN A/B
+                        answer = self.api._listen_once(
+                            timeout=10, **({} if profile == "shared" else {"profile": profile}))
+                    else:
+                        answer = self.api._get_text_answer(question, timeout=60)
 
                 if self.api._stop_requested.is_set():
                     return {"success": False, "error": "Stopped by user"}

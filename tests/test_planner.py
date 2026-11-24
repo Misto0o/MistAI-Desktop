@@ -30,6 +30,9 @@
 #   23. CONVERSATION ROUTER HOTKEY MODELS
 #   24. CONVERSATION ROUTER TESTS (8)
 #   25. ROUTER VIA AGENT MODE
+#   26. ORB SIGNALS FROM THE PLAN RUNNER
+#   27. ORB SIGNALS FROM THE PLAN RUNNER HELPERS
+#   28. ORB SIGNALS FROM THE PLAN RUNNER TESTS
 # ============================================================
 
 """The planner, the tool registry and the conversation router."""
@@ -1316,3 +1319,130 @@ def test_router_flag_is_read_at_call_time(monkeypatch):
     assert router_via_agent() is False and planner.call_mode() == "message"
     monkeypatch.setenv("MISTAI_ROUTER_VIA_AGENT", "1")
     assert router_via_agent() is True and planner.call_mode() == "agent"
+
+# ============================================================
+# ORB SIGNALS FROM THE PLAN RUNNER
+# ============================================================
+
+# PlanRunner publishes the floating orb's started / finished signals
+# (events.ORB_SIGNAL, core/floating_orb.py) for every task, one-node plans
+# too (they still skip _drive's task events), and planning around the
+# planning call. Only while the orb is shown.
+
+
+# ============================================================
+# ORB SIGNALS FROM THE PLAN RUNNER HELPERS
+# ============================================================
+
+def _orb_signal_api(shown=True):
+    api = _final_speech_api()
+    api._orb = SimpleNamespace(visible=shown)
+    return api
+
+
+def _orb_signals(api):
+    sent = []
+    api.bus.subscribe(planner.events.ORB_SIGNAL, lambda ev: sent.append(dict(ev.data)))
+    return sent
+
+
+def _one_node(monkeypatch):
+    monkeypatch.setattr(planner, "make_plan",
+                        lambda *_a, **_k: (planner.Plan([planner.PlanNode("main", "g")]), "N"))
+
+
+# ============================================================
+# ORB SIGNALS FROM THE PLAN RUNNER TESTS
+# ============================================================
+
+def test_a_one_node_task_signals_started_and_finished(monkeypatch):
+    _one_node(monkeypatch)
+    api = _orb_signal_api()
+    sent = _orb_signals(api)
+    agent = _PhaseAgent(api, [(True, "Calculator is open.")])
+    result = planner.PlanRunner(api, agent).run_goal("open calculator", "m", "none", "text", None)
+    assert result == {"success": True, "speech": "Calculator is open.", "steps": 2}
+    assert sent == [{"signal": "started", "on": True},
+                    {"signal": "finished", "on": True, "outcome": "completed", "reason": ""}]
+    assert planner.events.TASK_COMPLETED not in api.bus.names       # still no task events
+    assert planner.events.TASK_STARTED not in api.bus.names
+
+
+def test_a_failed_one_node_task_signals_an_error(monkeypatch):
+    _one_node(monkeypatch)
+    api = _orb_signal_api()
+    sent = _orb_signals(api)
+    agent = _PhaseAgent(api, [(False, "")])
+    planner.PlanRunner(api, agent).run_goal("open calculator", "m", "none", "text", None)
+    assert sent[-1] == {"signal": "finished", "on": True, "outcome": "error", "reason": "failed"}
+
+
+def test_a_crashing_task_still_signals_finished(monkeypatch):
+    _one_node(monkeypatch)
+    api = _orb_signal_api()
+    sent = _orb_signals(api)
+
+    class Boom:
+        def _loop(self, *_a, **_k):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        planner.PlanRunner(api, Boom()).run_goal("open calculator", "m", "none", "text", None)
+    assert [s["signal"] for s in sent] == ["started", "finished"]
+    assert sent[-1]["outcome"] == "error" and sent[-1]["reason"] == "crash"
+
+
+def test_a_multi_phase_task_signals_once_around_its_task_events(monkeypatch):
+    api = _orb_signal_api()
+    sent = _orb_signals(api)
+    plan = planner.Plan([
+        planner.PlanNode("setup", "create the files"),
+        planner.PlanNode("count", "say how many files there are", ["setup"]),
+    ])
+    monkeypatch.setattr(planner, "make_plan", lambda *_a, **_k: (plan, "ProjectSetup"))
+    agent = _PhaseAgent(api, [(True, "Created."), (True, "Three files.")])
+    planner.PlanRunner(api, agent).run_goal("set up and count", "m", "none", "text", None)
+    assert [s["signal"] for s in sent] == ["started", "finished"]
+    assert sent[-1]["outcome"] == "completed"
+    names = api.bus.names
+    assert names.index(planner.events.ORB_SIGNAL) < names.index(planner.events.TASK_STARTED)
+    assert names.index(planner.events.TASK_COMPLETED) < len(names) - 1   # finished comes last
+    assert names[-1] == planner.events.ORB_SIGNAL
+
+
+def test_resume_signals_started_and_finished(monkeypatch):
+    api = _orb_signal_api()
+    sent = _orb_signals(api)
+    plan = planner.Plan([planner.PlanNode("a", "first"), planner.PlanNode("b", "second", ["a"])])
+    record = TaskRecord("t1", "Job", "goal", plan.to_dict())
+    agent = _PhaseAgent(api, [(True, "A."), (False, "")])
+    planner.PlanRunner(api, agent).resume(record, "m", "none", "text", None)
+    assert [s["signal"] for s in sent] == ["started", "finished"]
+    assert sent[-1]["outcome"] == "error" and sent[-1]["reason"] == "phases"
+
+
+def test_planning_is_signalled_only_around_the_planning_call(monkeypatch):
+    api = _orb_signal_api()
+    sent = _orb_signals(api)
+    during = []
+
+    def fake_llm(*_a, **_k):
+        during.append([s["signal"] for s in sent])
+        return '{"task_name": "Site", "nodes": [{"id": "a", "desc": "make it"}]}'
+
+    monkeypatch.setattr(planner, "_llm", fake_llm)
+    planner.make_plan(api, "build a small portfolio site with three pages and a contact form", "m")
+    assert during == [["planning"]]
+    assert sent == [{"signal": "planning", "on": True}, {"signal": "planning", "on": False}]
+    sent.clear()
+    planner.make_plan(api, "what time is it?", "m")               # simple: no planning call
+    assert sent == []
+
+
+def test_no_orb_no_signals(monkeypatch):
+    _one_node(monkeypatch)
+    for api in (_final_speech_api(), _orb_signal_api(shown=False)):
+        sent = _orb_signals(api)
+        agent = _PhaseAgent(api, [(True, "Done.")])
+        planner.PlanRunner(api, agent).run_goal("open calculator", "m", "none", "text", None)
+        assert sent == [] and planner.events.ORB_SIGNAL not in api.bus.names
