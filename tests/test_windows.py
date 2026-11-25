@@ -1484,9 +1484,76 @@ def test_failures_are_logged_once_without_content(capsys):
     ev.check_poll(999)
     assert not ev.stale
     lines = capsys.readouterr().out.splitlines()
-    assert lines == ["[WindowWatch] window event thread stopped -- fixed waits",
-                     "[WindowWatch] window events stopped arriving -- fixed waits",
-                     "[WindowWatch] window events arriving again"]
+    assert lines[0] == "[WindowWatch] window event thread stopped -- fixed waits"
+    assert re.fullmatch(r"\[WindowWatch\] window events stopped arriving -- fixed waits "
+                        r"\(last event \d+\.\ds ago; poll saw the foreground move to another "
+                        r"window with no event, 2 polls\)", lines[1])
+    assert lines[2:] == ["[WindowWatch] window events arriving again"]
+
+
+# -- stale detection: quiet periods, missed changes, recovery ----------------------
+
+def _poll_events():
+    ev = _healthy_events()
+    ev.record("foreground", 50, 2)
+    return ev
+
+
+def test_a_quiet_desktop_never_declares_stale(capsys):
+    ev = _poll_events()
+    ev.last_event_at = ev.last_relevant_at = time.monotonic() - 3600   # an idle hour
+    for _ in range(20):
+        ev.check_poll(50, 2)                      # the poll agrees with the hook
+    assert not ev.stale and ev.healthy()
+    assert "[WindowWatch]" not in capsys.readouterr().out
+
+
+def test_a_change_the_hook_missed_declares_stale_with_numbers(capsys):
+    ev = _poll_events()
+    ev.check_poll(60, 3)
+    assert not ev.stale                          # one poll is not enough
+    ev.check_poll(60, 3)
+    assert ev.stale and not ev.healthy()
+    out = capsys.readouterr().out
+    assert "stopped arriving -- fixed waits (last event " in out
+    assert "move to another process with no event, 2 polls)" in out
+
+
+def test_an_event_between_polls_restarts_the_count():
+    ev = _poll_events()
+    ev.check_poll(60, 2)
+    ev.record("foreground", 61, 2)               # the hook is live (names another hwnd)
+    ev.check_poll(60, 2)
+    assert not ev.stale
+    ev.check_poll(60, 2)                         # then nothing for the change it shows
+    assert ev.stale
+
+
+def test_recovery_needs_an_event_and_does_not_flap(capsys):
+    ev = _poll_events()
+    ev.check_poll(60, 2)
+    ev.check_poll(60, 2)
+    assert ev.stale
+    ev.check_poll(50, 2)                         # back on the last reported window, no event
+    assert ev.stale
+    ev.record("foreground", 70, 2)
+    ev.check_poll(70, 2)
+    assert not ev.stale and ev.healthy()
+    ev.check_poll(70, 2)
+    assert not ev.stale
+    lines = [l for l in capsys.readouterr().out.splitlines() if "[WindowWatch]" in l]
+    assert len(lines) == 2 and lines[1] == "[WindowWatch] window events arriving again"
+
+
+def test_stale_transitions_are_logged_a_bounded_number_of_times(capsys):
+    ev = _poll_events()
+    for i in range(10):
+        ev.check_poll(100 + i)
+        ev.check_poll(100 + i)
+        ev.record("foreground", 100 + i, 2)
+        ev.check_poll(100 + i)
+    lines = [l for l in capsys.readouterr().out.splitlines() if "[WindowWatch]" in l]
+    assert len(lines) == clip.WATCH_STATE_LOGS
 
 
 def test_a_failed_hook_install_falls_back_and_says_so_once(monkeypatch, capsys):

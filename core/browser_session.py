@@ -497,6 +497,27 @@ class BrowserSession:
 
         return self._call(_do, timeout=2)
 
+    @property
+    def running(self):
+        """Started and usable (never starts it)."""
+        return self._context is not None and not self._start_error
+
+    def page_text(self, timeout=2.0):
+        """(page title, body text) of the loaded page, for the per-step screen
+        context; None when the browser is not running (never starts it) or
+        only a blank page is open. Raises on a slow or failed read."""
+        if not self.running:
+            return None
+
+        def _do():
+            url = self._page.url or ""
+            if not url or url == "about:blank":
+                return None
+            return self._page.title(), self._page.inner_text(
+                "body", timeout=int(timeout * 1000))
+
+        return self._call(_do, timeout=timeout + 0.5)
+
     def current_url(self):
         def _do():
             return self._page.url

@@ -751,7 +751,9 @@ def _visible_window_pids():
 # cache reuse, the accessibility-text cache) asks healthy() first and falls
 # back to today's fixed waits and reads when the hook is not installed, its
 # thread died, no event ever arrived, or the 1 s poll sees a foreground the
-# hook never reported (events stopped arriving).
+# hook never reported on two polls with no foreground event between them
+# (events stopped arriving; never declared by time passing alone, cleared
+# only by a new foreground event the poll agrees with).
 
 # ============================================================
 # WINDOW EVENT SETTINGS
@@ -779,7 +781,9 @@ WINDOW_EVENT_RANGES = ((EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
 EVENT_RING = 64
 QUIET_S = 0.15            # no relevant event for this long = quiet
 WAIT_POLL_S = 0.05        # wait_for re-checks its condition at least this often
-STALE_POLLS = 2           # polls in a row whose foreground the hook never reported
+STALE_POLLS = 2           # polls in a row, with no foreground event between them, on
+                          # a foreground the hook never reported
+WATCH_STATE_LOGS = 5      # stopped/again transitions logged per session (then silent)
 TOP_LEVEL_MEMORY = 4096   # top-level hwnds remembered so their destroy counts
 
 
@@ -805,7 +809,11 @@ class WindowEvents:
         self.installed = False
         self.alive = lambda: False   # the hook thread is running (set by the hook)
         self.stale = False           # events stopped arriving (the poll disagrees)
-        self._mismatch = (0, 0)      # (polled hwnd, polls in a row)
+        self._mismatch = (0, 0, -1)  # (polled hwnd, polls in a row, foreground_seq then)
+        self.foreground_seq = 0      # foreground events so far
+        self.last_event_at = None    # any event (own process too)
+        self._stale_seq = -1         # foreground_seq when stale was declared
+        self._state_logs = 0
         self._names = {}             # pid -> process name, looked up lazily
         self._logged = set()
         self.listener = None         # called (fast) on a foreground event
@@ -818,8 +826,10 @@ class WindowEvents:
             self.seq += 1
             self.seen += 1
             self.ring.append((now, kind, int(hwnd or 0), int(pid or 0)))
+            self.last_event_at = now
             if kind == "foreground":
                 self.foreground = (int(hwnd or 0), int(pid or 0))
+                self.foreground_seq += 1
             if pid != self._own_pid:
                 self.relevant_seq += 1
                 self.last_relevant_at = now
@@ -830,29 +840,50 @@ class WindowEvents:
             except Exception:
                 pass
 
-    def check_poll(self, polled_hwnd):
-        """The 1 s poll's foreground. Two polls in a row on the same window
-        the hook never reported as foreground = events stopped arriving
-        (stale, logged once); agreeing again clears it."""
+    def check_poll(self, polled_hwnd, polled_pid=None):
+        """The 1 s poll's foreground, cross-checked against the hook. Never
+        time-based: a quiet desktop (no foreground change) always agrees.
+        Stale ("events stopped arriving") only when the poll sees the
+        foreground on a window the hook never reported, on STALE_POLLS polls
+        in a row with NO foreground event between them (the hook demonstrably
+        missed a change; an event that arrives, even naming another hwnd,
+        restarts the count). Cleared only when the poll agrees AND a
+        foreground event arrived since it was declared (the hook is live
+        again), so agreeing by chance (the user going back to the last
+        reported window) does not flap. Transitions log numbers and labels."""
         polled_hwnd = int(polled_hwnd or 0)
         if not polled_hwnd or not self.installed:
             return
+        line = ""
         with self._cv:
+            now = self._clock()
             if polled_hwnd == self.foreground[0]:
-                self._mismatch = (0, 0)
-                back = self.stale
-                self.stale = False
+                self._mismatch = (0, 0, -1)
+                if self.stale and self.foreground_seq != self._stale_seq:
+                    self.stale = False
+                    line = "[WindowWatch] window events arriving again"
             else:
-                prev, n = self._mismatch
-                n = n + 1 if prev == polled_hwnd else 1
-                self._mismatch = (polled_hwnd, n)
-                back = False
+                prev, n, seq = self._mismatch
+                same = prev == polled_hwnd and seq == self.foreground_seq
+                n = n + 1 if same else 1
+                self._mismatch = (polled_hwnd, n, self.foreground_seq)
                 if n >= STALE_POLLS and not self.stale:
                     self.stale = True
-                    self._log_once("stale", "[WindowWatch] window events stopped arriving "
-                                            "-- fixed waits")
-        if back:
-            self._log_once("back", "[WindowWatch] window events arriving again")
+                    self._stale_seq = self.foreground_seq
+                    since = (f"{now - self.last_event_at:.1f}s" if self.last_event_at is not None
+                             else "never")
+                    what = ("another window of the same process"
+                            if polled_pid and int(polled_pid) == self.foreground[1]
+                            else "another process" if polled_pid else "another window")
+                    line = ("[WindowWatch] window events stopped arriving -- fixed waits "
+                            f"(last event {since} ago; poll saw the foreground move to {what} "
+                            f"with no event, {n} polls)")
+            if line:
+                self._state_logs += 1
+                if self._state_logs > WATCH_STATE_LOGS:
+                    line = ""
+        if line:
+            print(line)
 
     def _log_once(self, key, line):
         if key not in self._logged:
@@ -1069,6 +1100,8 @@ class WinEventHook:
             if kind is None:
                 return
             u = self._user32
+            if kind == "foreground":                 # the top-level window, as polled
+                hwnd = u.GetAncestor(hwnd, GA_ROOT) or hwnd
             if kind == "destroy":                    # a destroyed window has no ancestor
                 if hwnd not in self._top:
                     return
@@ -1275,7 +1308,13 @@ class LiveStateTracker:
             s["own_window_in_front"] = own_in_front
             watched = getattr(self, "window_events", None)
             if watched is not None:
-                watched.check_poll(fg)          # did the hook see this foreground? (the real one)
+                try:
+                    import win32process
+
+                    fg_pid = win32process.GetWindowThreadProcessId(fg)[1] if fg else None
+                except Exception:
+                    fg_pid = None
+                watched.check_poll(fg, fg_pid)  # did the hook see this foreground? (the real one)
             wins = []
 
             def _cb(h, _):

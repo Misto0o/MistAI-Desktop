@@ -54,7 +54,7 @@ from .live_state import describe_open_apps
 from . import live_state as window_events
 from .tools import (CLICK_FAMILY, READ_RESULT_CHARS, SPECS, action_entry, action_menu,
                     arg_problem, command_is_mutating)
-from .screen import text_is_sufficient
+from .screen import TEXT_CAP, is_visual_question, text_is_sufficient
 
 # Sentinel the read_screen_text vision prompt asks for when the answer is not
 # on screen (core/api.py read_screen_text).
@@ -1153,6 +1153,7 @@ class AgentLoop:
         batch_ok = False  # the previous queued step executed cleanly
         batch_note = ""  # steps of the last reply that will not run (observation)
 
+        self._phase_task = task  # a task about looks keeps vision for browser pages
         print(f"\n[AgentLoop] Task: {log_text(task)}")
         if self.api.caption_window and self.api.captions_enabled:
             self.api.caption_window.show_status(
@@ -2139,10 +2140,17 @@ class AgentLoop:
                 "was taken for this read -- call analyze_screen or read_screen_text "
                 "if you need to see the screen.)"
             )
+        # MistAI's own browser in front: its page DOM text, else the window's
+        # accessibility text; vision only when neither is enough (reason logged).
+        page, why = self._browser_page_context()
+        if page:
+            return page
         exact = self._exact_text_context()
         if exact:
             return exact
+        why = why or getattr(self, "_exact_skip", "") or "no text"
         if self.api.vision.ready:
+            print(f"  [Screen] vision read ({why})")
             try:
                 frame = self._vision_frame("screen context")
                 if frame:
@@ -2171,13 +2179,25 @@ class AgentLoop:
         vision call is made; "" otherwise (browsers, MistAI's window, thin or
         cut text, the phase's app not in front). Never raises."""
         get = getattr(self.api, "_exact_ui_text", None)
-        if not callable(get) or not uia_first_enabled():
+        self._exact_skip = ""   # why not (a fixed label for the vision log line)
+        if not uia_first_enabled():
+            self._exact_skip = "UIA first off"
+            return ""
+        if not callable(get):
+            self._exact_skip = "no text reader"
             return ""
         try:
             exact, title, native, kind, _asked = get("", include_browser=False)
-        except Exception:
+        except Exception as e:
+            self._exact_skip = f"text reader error {type(e).__name__}"
             return ""
         if not (native and kind == "exact" and text_is_sufficient(exact, title)):
+            self._exact_skip = (
+                "browser or MistAI window" if not native else
+                "the phase's app not in front" if kind != "exact" else
+                "accessibility text empty" if not str(exact or "").strip() else
+                "accessibility text cut at the cap" if len(str(exact)) >= TEXT_CAP - 3 else
+                "accessibility text is the title only")
             return ""
         snap = self.api.live.snapshot
         fw = snap.get("foreground_window", "Unknown")
@@ -2186,6 +2206,59 @@ class AgentLoop:
         return (f"Window: {fw} | Open apps: {apps} | EXACT UI TEXT: {exact} | (No screenshot "
                 "was taken for this read -- call analyze_screen or read_screen_text if you "
                 "need to see the screen.)")
+
+    PAGE_TEXT_CHARS = 1500   # page text shown in the per-step context
+    PAGE_TEXT_MIN = 40       # fewer readable characters = vision
+    PAGE_TEXT_BUDGET = 2.0   # seconds for the DOM read
+
+    def _browser_page_context(self):
+        """(context, reason). When MistAI's own Playwright browser is the
+        window in front: its page's DOM text (the text browser_get_text reads,
+        cut to PAGE_TEXT_CHARS) when it is non-trivial, so no vision call is
+        made. ("", "") when that browser is not running or not in front (the
+        other readers decide); ("", reason) when the page text is empty, too
+        short or unreadable, or the task is about looks (vision decides).
+        Never raises; logs labels and lengths only."""
+        browser = getattr(self.api, "browser", None)
+        if not uia_first_enabled() or not getattr(browser, "running", False):
+            return "", ""
+        try:
+            in_front = window_events.foreground_for_reading()[0]
+            if not in_front or in_front != window_events.playwright_window():
+                return "", ""
+        except Exception:
+            return "", ""
+        task = str(getattr(self, "_phase_task", "") or "")
+        if task.strip() and is_visual_question(task):
+            return "", "browser page, the task is about looks"
+        try:
+            got = browser.page_text(timeout=self.PAGE_TEXT_BUDGET)
+        except Exception as e:
+            return "", f"browser page text unreadable ({type(e).__name__})"
+        if not got:
+            return "", "browser page blank"
+        title, raw = got
+        lines = [" ".join(ln.split()) for ln in str(raw or "").splitlines()]
+        text = " | ".join(ln for ln in lines if ln)
+        if (len(text) < self.PAGE_TEXT_MIN
+                or not text_is_sufficient(text, title, cap=len(text) + 10)):
+            return "", f"browser page text too short ({len(text)} chars)"
+        shown = text[:self.PAGE_TEXT_CHARS]
+        more = len(text) - len(shown)
+        if more:
+            shown += f" [cut, {more} more chars: browser_get_text reads the whole page]"
+        kinds = injection_flags(shown)
+        note = ""
+        if kinds:
+            print(f"  [Injection] instruction-like text: {', '.join(kinds)}")
+            note = f" | {injection_note(kinds)}"
+        snap = self.api.live.snapshot
+        fw = snap.get("foreground_window", "Unknown")
+        apps = describe_open_apps(snap, limit=10) or "none"
+        print(f"  [Screen] browser page: page text ({len(text)} chars), no vision")
+        return (f"Window: {fw} | Open apps: {apps} | PAGE TEXT (the browser page's DOM "
+                f"text): {shown}{note} | (No screenshot was taken for this read -- call "
+                "analyze_screen if you need to see how the page looks.)"), ""
 
     def _uia_summary_within(self, budget):
         """_uia_summary(), or None if it takes longer than ``budget`` seconds."""
