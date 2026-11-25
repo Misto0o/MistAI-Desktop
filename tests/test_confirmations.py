@@ -75,6 +75,7 @@
 #   68. OWN DIALOG KEYS
 #   69. OWN DIALOG KEYS HELPERS
 #   70. OWN DIALOG KEYS TESTS
+#   71. DECLINE GUARD
 # ============================================================
 
 """Confirmations (typed, spoken, buttons), ask before sending, remembered approvals and quick_message checks."""
@@ -349,8 +350,10 @@ def test_no_is_unchanged(monkeypatch, capsys, mode):
     assert len(rec.asked) == 2                            # no retry after a no
     assert any("User explicitly declined this action" in o for o in _observations(rec))
     assert rec.rows == [("confirm_declined", False)]
-    assert rec.result == {"success": False, "error": "User declined the requested action.",
-                          "speech": "Okay, I won't do that."}
+    assert {k: v for k, v in rec.result.items() if k != "steps"} == {
+        "success": False, "error": "User declined the requested action.",
+        "speech": "I stopped there: you said no twice, so I didn't do what you declined. "
+                  "I didn't change anything."}
     assert "I didn't hear a yes" not in " ".join(rec.spoken)
     assert capsys.readouterr().out.count("[Confirm] answer=no") == 2
 
@@ -2501,3 +2504,57 @@ def test_a_save_file_as_that_closed_its_dialog_leaves_nothing_open(monkeypatch, 
     rec = _save_left_open_run(monkeypatch, tmp_path, [_DOC], answers=["yes", "yes"])
     assert len(rec.asked) == 2
     assert "[DialogKeys]" not in capsys.readouterr().out
+
+
+# ============================================================
+# DECLINE GUARD
+# ============================================================
+
+def test_a_declined_confirmation_is_not_asked_again_even_reworded(monkeypatch):
+    close = {"action": "window_close", "parameter": "Notepad - notes.txt"}
+    again = {"action": "window_close", "parameter": "notepad -  Notes.txt."}   # a light rewording
+    rec = _confirmation_answers_run(monkeypatch, [close, again, CONFIRMATION_ANSWERS_DONE], ["no"],
+                                    mode="text")
+    assert len(rec.asked) == 1 and rec.calls == []                 # never asked twice, never ran
+    assert any("REFUSED: the user already declined 'window_close'" in o for o in _observations(rec))
+    assert rec.result["success"] is True                           # the model's own done
+
+
+def test_a_declined_ask_user_question_is_not_asked_again(monkeypatch):
+    from core.agent import ASK_DECLINED_NOTE, ASK_REPEAT_REFUSAL
+
+    ask = {"action": "ask_user", "parameter": "Should I delete the old drafts folder?"}
+    reworded = {"action": "ask_user", "parameter": "Should I delete the old drafts folder now?"}
+    rec = _confirmation_answers_run(monkeypatch, [ask, reworded, CONFIRMATION_ANSWERS_DONE],
+                                    ["no thanks"], mode="text")
+    assert rec.asked == ["Should I delete the old drafts folder?"]  # the rewording never reached the user
+    sent = [m["content"] for m in rec.requests[-1]["messages"] if m.get("role") == "user"]
+    assert ASK_DECLINED_NOTE in sent and f"[OBSERVATION] {ASK_REPEAT_REFUSAL}" in sent
+    assert rec.result["success"] is True
+
+
+def test_two_declines_end_the_run_with_an_honest_report(monkeypatch, capsys):
+    from core.agent import declined_twice_speech
+
+    ask = {"action": "ask_user", "parameter": "Want me to clear the downloads folder?"}
+    close = {"action": "window_close", "parameter": "Calculator"}
+    rec = _confirmation_answers_run(monkeypatch, [ask, close, CONFIRMATION_ANSWERS_DONE],
+                                    ["no", "no"], mode="text")
+    assert rec.calls == [] and len(rec.asked) == 2
+    assert len(rec.requests) == 2                                   # no model call after the 2nd no
+    assert rec.result["success"] is False
+    assert rec.result["error"] == "User declined the requested action."
+    assert rec.result["speech"] == declined_twice_speech(False)
+    assert "didn't do what you declined" in rec.result["speech"]
+    assert "[Confirm] declined twice; the phase ends" in capsys.readouterr().out
+    assert declined_twice_speech(True).endswith("What I did before that stays as it was.")
+
+
+def test_an_answer_that_says_no_and_more_is_an_answer_not_a_decline():
+    from core.agent import is_decline_answer
+
+    for no in ("no", "Nope.", "no thanks", "No, don't do that", "never mind", "cancel"):
+        assert is_decline_answer(no), no
+    for answer in ("no, use Documents", "not sure, maybe the Downloads one", "yes",
+                   "the blue one", "", None):
+        assert not is_decline_answer(answer), answer

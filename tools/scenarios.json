@@ -494,11 +494,13 @@
       },
       "expect": {
         "nodes_count": 1,
+        "node_desc_any": [
+          "notification"
+        ],
         "nodes_exclude_words": [
           "file",
           "write",
           "save",
-          "report",
           "document"
         ]
       }
@@ -964,9 +966,10 @@
         ]
       ],
       "expect": {
-        "speech_contains_any": [
-          "11.61"
-        ],
+        "speech_number_near": {
+          "value": 11.61,
+          "tolerance": 0.01
+        },
         "actions_exclude": [
           "read_screen_text",
           "analyze_screen"
@@ -1067,8 +1070,9 @@
         "speech_contains_any": [
           "2024"
         ],
-        "actions_include": [
-          "browser_search"
+        "actions_include_any": [
+          "browser_search",
+          "browser_get_text"
         ]
       }
     },

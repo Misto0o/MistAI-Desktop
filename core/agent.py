@@ -132,6 +132,54 @@ NOT_CONFIRMED_ERROR = "not confirmed"
 def unclear_answer_speech(action):
     return f"I didn't hear a yes, so I didn't {CONFIRM_VERBS.get(action, 'do')} that."
 
+
+# Decline guard: a no (to a confirmation or to an ask_user question) is final
+# for that action / question and anything nearly identical to it in the
+# phase; the second no ends the phase with DECLINED_ERROR and an honest line.
+DECLINED_ERROR = "User declined the requested action."
+DECLINE_SIMILARITY = 0.85
+# An ask_user answer is a decline only when it says no and nothing else
+# ("no, use Documents" or "not sure, maybe the Downloads one" are answers).
+_DECLINE_ONLY_WORDS = frozenset(
+    "no nope nah not don't dont do it that this thanks thank you please never mind "
+    "cancel stop skip i i'd rather won't wont just leave now okay ok".split())
+ASK_DECLINED_NOTE = (
+    "[OBSERVATION] The user declined (said no). Do not ask this or a similar question "
+    "again in this phase; choose a different approach, or call done with an honest "
+    "report of what was and wasn't done.")
+ASK_REPEAT_REFUSAL = (
+    "REFUSED: the user already said no to this question in this phase. Do not ask it "
+    "again; choose a different approach, or call done with an honest report of what "
+    "was and wasn't done.")
+
+
+def is_decline_answer(answer):
+    """A plain no to an ask_user question (see _DECLINE_ONLY_WORDS)."""
+    if confirmation_answer(answer) != "no":
+        return False
+    words = re.findall(r"[a-z']+", str(answer or "").lower())
+    return bool(words) and all(w in _DECLINE_ONLY_WORDS for w in words)
+
+
+def _repeat_key(text):
+    return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def near_repeat(a, b):
+    """The same text, or a light rewording of it (spacing, case, punctuation,
+    a word or two): what a declined action or question may not come back as."""
+    import difflib
+
+    a, b = _repeat_key(a), _repeat_key(b)
+    return a == b or difflib.SequenceMatcher(None, a, b).ratio() >= DECLINE_SIMILARITY
+
+
+def declined_twice_speech(anything_ran):
+    """The honest line when the second no ends the phase."""
+    return ("I stopped there: you said no twice, so I didn't do what you declined."
+            + (" What I did before that stays as it was." if anything_ran
+               else " I didn't change anything."))
+
 CREDENTIAL_NOTE = (
     "NOTE: this route needs credentials you don't have (an API key, token or "
     "login). Don't ask the user for one or guess one; get the information "
@@ -489,6 +537,23 @@ class AgentLoop:
         """
         normalized = " ".join(str(parameter or "").split()).casefold()
         return f"{str(action or '').strip().casefold()}|{normalized}"
+
+    @staticmethod
+    def _is_declined(sig, declined_signatures):
+        """sig is a declined signature, or the same action with a nearly
+        identical parameter (near_repeat)."""
+        if sig in declined_signatures:
+            return True
+        action, _, param = sig.partition("|")
+        return any(d.partition("|")[0] == action and near_repeat(d.partition("|")[2], param)
+                   for d in declined_signatures)
+
+    def _declined_end(self, succeeded_actions, steps_taken):
+        """The result when the user said no a second time in this phase."""
+        print("  [Confirm] declined twice; the phase ends")
+        return {"success": False, "error": DECLINED_ERROR,
+                "speech": declined_twice_speech(bool(succeeded_actions)),
+                "steps": steps_taken}
 
     @staticmethod
     def _refusal_for_log(refuse, action, param):
@@ -1057,12 +1122,14 @@ class AgentLoop:
         last_failed_sig = None  # "action|param" of the most recent failure
         consecutive_failures = 0  # how many times in a row that same sig failed
         declined_signatures = set()
+        declined_questions = []   # ask_user questions the user said no to
         cycle_guard = CycleGuard()
         scrub_cache = {}  # text -> scrubbed text, so each text is scanned and logged once
         # Input guards (type_text/press_key/hotkey) only enforce a target that
         # THIS phase opened or switched to.
         try:
             self.api._last_opened_app = None
+            self.api._app_notes_given = set()   # APP_NOTES: once per phase per app
         except Exception:
             pass
         # The first vision read of a phase must not reuse a frame from before
@@ -1465,11 +1532,12 @@ class AgentLoop:
 
             # --- HARD STRUCTURAL CONFIRMATION GATE ---
             decline_sig = self._decline_signature(action, param)
-            if decline_sig in declined_signatures:
+            if self._is_declined(decline_sig, declined_signatures):
                 refuse = (
                     f"REFUSED: the user already declined '{action}' with this "
-                    "exact parameter in this phase. Do not ask again or run it; "
-                    "move on, ask about an unrelated need, or call done."
+                    "(or a nearly identical) parameter in this phase. Do not ask again "
+                    "or run it; choose a different approach, or call done with an "
+                    "honest report of what was and wasn't done."
                 )
                 print(f"  [Refused] {refuse}")
                 if on_step:
@@ -1521,11 +1589,7 @@ class AgentLoop:
 
                 if not confirmed and declined_once:
                     # Second refusal in the same phase -- stop asking entirely.
-                    return {
-                        "success": False,
-                        "error": "User declined the requested action.",
-                        "speech": "Okay, I won't do that.",
-                    }
+                    return self._declined_end(succeeded_actions, steps_taken)
 
                 if not confirmed:
                     declined_once = True
@@ -1635,6 +1699,14 @@ class AgentLoop:
 
             if action == "ask_user":
                 question = param or "Can you clarify what you'd like me to do?"
+                if any(near_repeat(question, q) for q in declined_questions):
+                    print("  [AskUser] refused: the user already said no to it")
+                    if on_step:
+                        on_step(steps_taken, "refused", "", "")
+                    history.append({"role": "assistant", "content": json.dumps(cmd)})
+                    history.append({"role": "user",
+                                    "content": f"[OBSERVATION] {ASK_REPEAT_REFUSAL}"})
+                    continue
                 print("  [AskUser] asked")             # never the question's text
 
                 with waiting_scope(self.api, "ask", input_mode, question):  # the orb waits
@@ -1685,6 +1757,17 @@ class AgentLoop:
                             established = bool(establish_workspace(answer))
                         except Exception:
                             established = False
+                if is_decline_answer(answer):
+                    print("  [AskUser] declined")
+                    self.api.memory.add_action("ask_user", False)
+                    if declined_once:
+                        return self._declined_end(succeeded_actions, steps_taken)
+                    declined_once = True
+                    declined_questions.append(question)
+                    history.append({"role": "assistant", "content": json.dumps(cmd)})
+                    history.append({"role": "user", "content": f"[USER RESPONSE] {answer}"})
+                    history.append({"role": "user", "content": ASK_DECLINED_NOTE})
+                    continue
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append({"role": "user", "content": f"[USER RESPONSE] {answer}"})
                 if established:
@@ -1754,11 +1837,7 @@ class AgentLoop:
                             "speech": speech, "steps": steps_taken}
                 if verdict != "yes":
                     if declined_once:
-                        return {
-                            "success": False,
-                            "error": "User declined the requested action.",
-                            "speech": "Okay, I won't do that.",
-                        }
+                        return self._declined_end(succeeded_actions, steps_taken)
                     declined_once = True
                     declined_signatures.add(decline_sig)
                     history.append({"role": "assistant", "content": json.dumps(cmd)})

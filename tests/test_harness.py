@@ -40,6 +40,7 @@
 #   33. CALCULATOR PROBE TESTS
 #   34. BACKEND WARM-UP AND NEW LOG LINES
 #   35. SCENARIO HARNESS REALISTIC TIER
+#   36. SCENARIO HARNESS LOOSENED CHECKS
 # ============================================================
 
 """tools/live_checks.py, tools/run_scenarios.py and tools/probe_calculator.py."""
@@ -1476,7 +1477,7 @@ def test_new_timing_lines_reach_the_live_checks_summary():
 
 # --tag, the realistic tier, file_contains / file_not_contains, the serve_tmp server and needs.
 
-ORIGINAL_ELEVEN_SHA256 = "885724159440fca97f2fae06f903a9353d4ff82c9e74093440ab426165a660ac"
+ORIGINAL_ELEVEN_SHA256 = "798b2dfe4dea8ce2ca1d232189d6b7039359ee5b74e84e2eca50130b4a61ecd2"  # plan-notifications: "report" allowed, must mention notifications
 ORIGINAL_ELEVEN = ["edge-open", "latest-download", "env-withheld", "notepad-follow-up",
                    "notepad-read-back", "calculator", "bare-app-name", "create-file",
                    "delete-needs-confirmation", "plan-notifications", "plan-research-write"]
@@ -1849,3 +1850,40 @@ def test_notepad_stubs_save_through_save_file_as():
         "file_contains": [{"path": r"{tmp}\groceries.txt", "text": "milk eggs bread",
                            "ignore_case": True}]}
     assert save["answers"] == ["yes", "yes"] and edit["answers"] == ["yes", "yes", "yes"]
+
+
+# ============================================================
+# SCENARIO HARNESS LOOSENED CHECKS
+# ============================================================
+
+def test_plan_notifications_allows_report_but_still_needs_one_notifications_node():
+    by = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)}
+    expect = by["plan-notifications"]["expect"]
+    ok = [{"desc": "Check the user's notifications and report what is new"}]
+    assert rs.check_plan(expect, ok) == []
+    assert rs.check_plan(expect, ok + [{"desc": "Summarize notifications"}])      # two nodes
+    assert rs.check_plan(expect, [{"desc": "Write a report document"}])           # off topic + banned
+    assert rs.check_plan(expect, [{"desc": "Save the notifications to a file"}])  # still banned
+
+
+def test_rt_search_fact_accepts_browser_get_text_but_needs_a_browser_read_and_the_year():
+    by = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)}
+    expect = by["rt-search-fact"]["expect"]
+    right = "Python 3.13 came out in October 2024."
+    assert rs.check_desktop(expect, _outcome("  Step 1: browser_search('python 3.13')\n", right)) == []
+    assert rs.check_desktop(expect, _outcome("  Step 1: browser_get_text('')\n", right)) == []
+    assert rs.check_desktop(expect, _outcome("  Step 1: done('')\n", right))          # never read
+    wrong = "Python 3.13 came out in October 2023."
+    assert rs.check_desktop(expect, _outcome("  Step 1: browser_get_text('')\n", wrong))
+
+
+def test_rt_tip_math_accepts_equivalent_formats_and_still_fails_a_wrong_amount():
+    by = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)}
+    expect = by["rt-tip-math"]["expect"]
+    ran = "  Step 1: run_command('x')\n"
+    for good in ("An 18 percent tip on $64.50 is $11.61.", "That's about 11.6 dollars.",
+                 "The tip comes to $ 11.61", "11 dollars and 61 cents", "Roughly $11.62."):
+        assert rs.check_desktop(expect, _outcome(ran, good)) == [], good
+    for bad in ("An 18 percent tip on $64.50 is $11.70.", "The tip is $1,161.",
+                "The tip is $11.", "I could not work it out.", "Your total is $76.11."):
+        assert rs.check_desktop(expect, _outcome(ran, bad)), bad

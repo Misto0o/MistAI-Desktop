@@ -252,6 +252,9 @@ def _T(name, **kw):
     return name, ToolSpec(name=name, **kw)
 
 
+# open_app / switch_app: their own text plus an APP_NOTES tip (<= 350 chars).
+APP_RESULT_CHARS = 800
+
 SPECS = dict(
     [
         # -- Apps & windows ------------------------------------------------------
@@ -265,6 +268,7 @@ SPECS = dict(
             # process and no window, and verified as a 0.93-confidence success
             # while nothing appeared on screen. See verify._app_visible.
             verifier="app_visible",
+            result_chars=APP_RESULT_CHARS,      # room for an APP_NOTES tip
         ),
         _T(
             "switch_app",
@@ -274,6 +278,7 @@ SPECS = dict(
             categories=("app", "window"),
             fallback_tools=("open_app",),
             verifier="window_focused",
+            result_chars=APP_RESULT_CHARS,
         ),
         _T(
             "open_project_in_vscode",

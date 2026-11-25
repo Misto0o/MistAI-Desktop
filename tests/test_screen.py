@@ -62,6 +62,7 @@
 #   55. SHORT CLICK TARGETS TESTS
 #   56. CLICK MARKER AND UIA ACTIONS
 #   57. CLICK MARKER AND UIA ACTIONS TESTS
+#   58. UIA NAME RANKING
 # ============================================================
 
 """Screen reads (UIA first, vision modes, frame freshness), vision coordinates and clicking."""
@@ -2578,3 +2579,75 @@ def test_uia_click_says_so_when_nothing_changed_and_confidence_drops(monkeypatch
         assert res.method == "UIA" and res.confidence == METHOD_CONFIDENCE["UIA"]
     finally:
         api.tools._conn and api.tools._conn.close()
+
+
+# ============================================================
+# UIA NAME RANKING
+# ============================================================
+
+def _ranked_nav(elements):
+    """A real EnhancedUIANavigator over fake element infos (no UIA walk)."""
+    from core.click_handler import EnhancedUIANavigator
+
+    nav = EnhancedUIANavigator.__new__(EnhancedUIANavigator)
+    infos = []
+    for i, spec in enumerate(elements):
+        name, ctype, *rest = spec if isinstance(spec, tuple) else (spec, "Button")
+        enabled = rest[0] if rest else True
+        infos.append(SimpleNamespace(
+            name=name, control_type=ctype, enabled=enabled, visible=True, offscreen=False,
+            rect=(i * 10, 0, i * 10 + 10, 10), element=SimpleNamespace(name=name, rectangle=lambda: SimpleNamespace(left=0, top=0, right=10, bottom=10))))
+    nav._get_cached_elements = lambda window, *a, **k: infos
+    return nav
+
+
+def test_an_exact_name_beats_a_longer_name_that_contains_it():
+    nav = _ranked_nav(["Clear all memory", "Clear entry", "Clear"])
+    info, label, amb = nav.resolve_by_name("Calculator", "clear")
+    assert info.name == "Clear" and label == "exact" and amb == []
+    # Whole word beats prefix beats substring.
+    nav = _ranked_nav(["Unclearable", "Clearance", "Memory clear"])
+    assert nav.resolve_by_name("w", "Clear")[0].name == "Memory clear"
+    nav = _ranked_nav(["Unclearable", "Clearance"])
+    assert nav.resolve_by_name("w", "Clear")[0].name == "Clearance"
+
+
+def test_a_tie_at_the_best_rank_is_reported_as_ambiguous_not_picked():
+    nav = _ranked_nav(["Clear all memory", "Clear entry"])
+    info, label, amb = nav.resolve_by_name("Calculator", "Clear")
+    assert info is None and label == "word"
+    assert amb == ["Clear all memory (Button)", "Clear entry (Button)"]
+    assert nav.find_element_by_name("Calculator", "Clear") is None
+    # A disabled twin, or a plain Text label beside the button, breaks the tie.
+    nav = _ranked_nav([("Clear entry", "Button", False), "Clear all memory"])
+    assert nav.resolve_by_name("w", "Clear")[0].name == "Clear all memory"
+    nav = _ranked_nav([("Clear", "Text"), ("Clear", "Button")])
+    assert nav.resolve_by_name("w", "Clear")[0].control_type == "Button"
+
+
+def test_a_single_substring_match_still_works_and_exact_only_stays_exact():
+    nav = _ranked_nav(["Display is 37", "Memory recall"])
+    assert nav.resolve_by_name("w", "recal")[0].name == "Memory recall"
+    assert nav.resolve_by_name("w", "recal", partial=False) == (None, "", [])
+    assert nav.resolve_by_name("w", "Nothing") == (None, "", [])
+
+
+def test_uia_click_fails_with_the_names_when_ambiguous_and_clicks_the_exact_one(monkeypatch):
+    from core import caption
+    from core.api import Api
+
+    monkeypatch.setattr(caption, "get_indicator", lambda: SimpleNamespace(show=lambda *a, **k: None))
+    clicked = []
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(snapshot={"foreground_window": "Calculator"})
+    api.uia_nav = _ranked_nav(["Clear all memory", "Clear entry"])
+    api.uia_nav.window_signature = lambda w, fresh=True: None
+    api.uia_nav.activate_element = lambda el: clicked.append(el.name) or "invoke"
+    api.last_result_text = ""
+    assert api._act_uia_click("Clear") is False and clicked == []
+    assert api.last_result_text.startswith(
+        "ambiguous: 'Clear' matches Clear all memory (Button), Clear entry (Button)")
+    api.uia_nav = _ranked_nav(["Clear all memory", "Clear entry", "Clear"])
+    api.uia_nav.window_signature = lambda w, fresh=True: None
+    api.uia_nav.activate_element = lambda el: clicked.append(el.name) or "invoke"
+    assert api._act_uia_click("Clear") is True and clicked == ["Clear"]

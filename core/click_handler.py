@@ -1235,16 +1235,64 @@ class EnhancedUIANavigator:
         except Exception:
             return []
 
-    def find_element_by_name(self, window_title, element_name, partial=True):
-        """Returns the raw pywinauto element (for backward compat with
-        click_element). Uses the cache."""
+    # Name-match ranks, best first: the whole name, a whole-word run inside
+    # it ("Clear" in "Clear entry"), a prefix, any substring.
+    NAME_RANKS = ("exact", "word", "prefix", "substring")
+    ACTIONABLE_TYPES = frozenset({
+        "Button", "SplitButton", "MenuItem", "ListItem", "CheckBox", "RadioButton",
+        "Hyperlink", "TabItem", "TreeItem", "ComboBox", "DataItem"})
+
+    @staticmethod
+    def name_match_rank(name, query):
+        """0 exact (case and spacing ignored), 1 whole words, 2 prefix,
+        3 substring, None for no match."""
+        n = " ".join(str(name or "").lower().split())
+        q = " ".join(str(query or "").lower().split())
+        if not q or q not in n:
+            return None
+        if n == q:
+            return 0
+        if re.search(rf"(?<!\w){re.escape(q)}(?!\w)", n):
+            return 1
+        return 2 if n.startswith(q) else 3
+
+    @staticmethod
+    def _usable(info):
+        return info.enabled is not False and info.visible is not False and info.offscreen is not True
+
+    def resolve_by_name(self, window_title, element_name, partial=True):
+        """The best UIAElementInfo for a name, as (info, rank_label, ambiguous):
+        the best rank wins (exact only when not ``partial``); a tie keeps the
+        visible and enabled ones, then the actionable control types, then one
+        element exposed twice at the same rect. A tie that is still open is
+        (None, label, [names...]) -- never one picked silently. No match is
+        (None, "", [])."""
         elements = self._get_cached_elements(window_title)
-        en_lower = element_name.lower()
+        ranked = []
         for info in elements:
-            nl = info.name.lower()
-            if (partial and en_lower in nl) or (not partial and en_lower == nl):
-                return info.element
-        return None
+            r = self.name_match_rank(info.name, element_name)
+            if r is not None and (partial or r == 0):
+                ranked.append((r, info))
+        if not ranked:
+            return None, "", []
+        best = min(r for r, _ in ranked)
+        tied = [i for r, i in ranked if r == best]
+        for keep in (self._usable, lambda i: i.control_type in self.ACTIONABLE_TYPES):
+            narrowed = [i for i in tied if keep(i)]
+            if narrowed:
+                tied = narrowed
+        if len({i.rect for i in tied}) == 1 and tied[0].rect is not None:
+            tied = tied[:1]
+        label = self.NAME_RANKS[best]
+        if len(tied) == 1:
+            return tied[0], label, []
+        return None, label, [f"{i.name} ({i.control_type})" for i in tied]
+
+    def find_element_by_name(self, window_title, element_name, partial=True):
+        """The raw pywinauto element of ``resolve_by_name`` (for click_element),
+        or None (also when the best match is ambiguous). Uses the cache."""
+        info, _label, _ambiguous = self.resolve_by_name(window_title, element_name, partial)
+        return info.element if info else None
     
     def find_text_input(self, window_title):
         """Find the most likely text INPUT field in a window -- prefers

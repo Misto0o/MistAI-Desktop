@@ -1717,7 +1717,8 @@ def test_read_tools_have_large_result_limits_and_others_keep_default():
         assert SPECS[name].result_chars == 4000, name
     assert SPECS["browser_navigate"].result_chars == 1200
     assert SPECS["browser_search"].result_chars == 1200
-    assert SPECS["open_app"].result_chars == 300
+    assert SPECS["press_key"].result_chars == 300
+    assert SPECS["open_app"].result_chars == SPECS["switch_app"].result_chars == 800  # APP_NOTES room
 
 
 # -- AgentLoop truncation and READ shrinking ---------------------------------
@@ -1811,12 +1812,12 @@ def _observations(messages):
 def test_result_is_cut_to_the_tool_limit_with_a_truncation_marker(monkeypatch):
     sent = _loop_with_outputs(
         monkeypatch,
-        [("run_command", "big", "R" * 5000), ("open_app", "notepad", "N" * 500)],
+        [("run_command", "big", "R" * 5000), ("open_app", "notepad", "N" * 1000)],
     )
     obs = _observations(sent[-1])
     assert "R" * 4000 + " [truncated, 1000 more chars]" in obs[0]
     assert "R" * 4001 not in obs[0]
-    assert "N" * 300 + " [truncated, 200 more chars]" in obs[1]
+    assert "N" * 800 + " [truncated, 200 more chars]" in obs[1]
 
 
 def test_only_the_two_newest_read_results_stay_full(monkeypatch):

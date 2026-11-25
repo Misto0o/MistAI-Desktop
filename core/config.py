@@ -1095,6 +1095,35 @@ APP_PROCESS_ALIASES = {
 
 
 # ============================================================
+# APP NOTES
+# ============================================================
+
+# App-specific tips, appended to a successful open_app / switch_app result
+# once per phase per app (Api._with_app_note), never to the system prompt.
+# Key: the name as Api._normalize_app_name leaves it; value: (aliases in the
+# same form, note). Keep each note under APP_NOTE_MAX_CHARS.
+APP_NOTE_MAX_CHARS = 350
+APP_NOTES = {
+    "calculator": (
+        ("calc", "calculatorapp", "windowscalculator"),
+        "Calculator: type the whole expression with type_text (digits and operators "
+        "together, e.g. 37*23), then press_key enter, then read_screen_text. Do not click "
+        "digits. Only if typing fails, use uia_click by control name ('Multiply by', "
+        "'Plus', 'Minus', 'Divide by', 'Equals', 'Clear entry').",
+    ),
+}
+
+
+def app_note(normalized_name):
+    """(key, note) for a normalized app name or one of its aliases, else ("", "")."""
+    name = str(normalized_name or "")
+    for key, (aliases, note) in APP_NOTES.items():
+        if name == key or name in aliases:
+            return key, note
+    return "", ""
+
+
+# ============================================================
 # PROCESS NAME NORMALIZATION
 # ============================================================
 

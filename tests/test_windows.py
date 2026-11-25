@@ -418,6 +418,39 @@ def test_no_target_appends_and_never_clears(monkeypatch):
     assert "appended; nothing was cleared" in api.last_result_text
 
 
+def test_type_text_right_after_ctrl_a_says_it_replaced_the_selection(monkeypatch):
+    api, events = _no_target_api(monkeypatch, 20)
+    api.tools = SimpleNamespace(get=lambda n: SimpleNamespace(
+        categories=["perception"] if n == "read_screen_text" else ["input"]))
+    api._ensure_input_target = lambda what: (f"The {what} went to 'Untitled - Notepad'.", True)
+    api._act_read_screen_text = lambda p: True
+    monkeypatch.setattr(api, "_act_type_text", lambda p: Api._act_type_text(api, p), raising=False)
+    assert api._exec_sync("hotkey", "ctrl+a") is True
+    assert api._exec_sync("type_text", "hello") is True
+    assert "replaced the selected text" in api.last_result_text
+    assert "appended" not in api.last_result_text
+    assert events == [("ctrl", "a"), ("ctrl", "v")]     # still no Delete of its own
+    # A read between keeps the selection; any other action ends it.
+    api._exec_sync("hotkey", "ctrl+a")
+    api._exec_sync("read_screen_text", "")
+    api._exec_sync("type_text", "again")
+    assert "replaced the selected text" in api.last_result_text
+    api._exec_sync("hotkey", "ctrl+a")
+    api._exec_sync("press_key", "end")
+    api._exec_sync("type_text", "more")
+    assert "appended; nothing was cleared" in api.last_result_text
+
+
+def test_ctrl_a_in_another_window_still_reports_append(monkeypatch):
+    api, events = _no_target_api(monkeypatch, 20)
+    api._selection_before = 999                     # the select-all went to another window
+    assert Api._act_type_text(api, "hello") is True
+    assert "appended; nothing was cleared" in api.last_result_text
+    api._selection_before = None                    # nothing was selected
+    assert Api._act_type_text(api, "hello") is True
+    assert "appended; nothing was cleared" in api.last_result_text
+
+
 @pytest.mark.parametrize("fg, console", [(30, 0), (31, 0), (32, 32)])
 @pytest.mark.parametrize("action, param", [("type_text", "Get-ChildItem"),
                                            ("press_key", "enter"), ("hotkey", "ctrl+v")])

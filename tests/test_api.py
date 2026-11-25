@@ -46,6 +46,7 @@
 #   39. API MANAGER CONTRACT TESTS
 #   40. CRASH LOG
 #   41. CRASH LOG TESTS
+#   42. APP NOTES
 # ============================================================
 
 """Api structure, runtime smoke paths, the API manager contract and the UI page."""
@@ -1651,3 +1652,94 @@ def test_the_app_and_the_harness_enable_the_crash_log_at_start():
     # Never inside main(): tests call it and pytest owns faulthandler.
     body = harness.split("def main(", 1)[1].split('if __name__ == "__main__":', 1)[0]
     assert "enable_crash_log" not in body
+
+
+# ============================================================
+# APP NOTES
+# ============================================================
+
+def _app_notes_api(monkeypatch, tmp_path):
+    from core.api import Api
+    from core.executor import Executor
+    from core.tools import ToolRegistry
+
+    api = Api.__new__(Api)
+    api.last_result_text = ""
+    api.live = SimpleNamespace(snapshot={})
+
+    def opened(p):
+        api.last_result_text = f"Opened '{p}' (window '{p.title()}')"
+        return True
+
+    api._act_open_app = opened
+    api.switch_to_app = lambda p: setattr(api, "last_result_text", f"Switched to '{p}'") or True
+    api.tools = ToolRegistry(db_path=str(tmp_path / "t.db"))
+    api.bus, api.memory, api.task_memory = None, SimpleNamespace(add_action=lambda *a: None), None
+    api.screen = SimpleNamespace(mark_action=lambda: None)
+    monkeypatch.setattr("core.executor.settle_after", lambda *a, **k: None)
+    monkeypatch.setattr("core.executor.verify.run", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(Executor, "_in_browser", lambda self: False)
+    monkeypatch.setattr(Executor, "_finalize", lambda self, res, spec: None)
+    monkeypatch.setattr("core.api.time.sleep", lambda _s: None)
+    return api, Executor
+
+
+def test_the_calculator_note_comes_once_per_phase_on_success_only(monkeypatch, tmp_path, capsys):
+    from core.config import APP_NOTES
+
+    note = APP_NOTES["calculator"][1]
+    api, Executor = _app_notes_api(monkeypatch, tmp_path)
+    try:
+        first = Executor(api).run("open_app", "Calculator")
+        assert first.detail.startswith("Opened 'Calculator'") and first.detail.endswith(note)
+        again = Executor(api).run("switch_app", "calculator")
+        assert note not in again.detail and again.detail == "Switched to 'calculator'"
+        assert capsys.readouterr().out.count("[AppNotes] note added") == 1
+        # A new phase (the agent resets the set) gets it again.
+        api._app_notes_given = set()
+        assert Executor(api).run("switch_app", "Calculator").detail.endswith(note)
+        # A failed open never carries it, and does not use up the one note.
+        api._app_notes_given = set()
+        api._act_open_app = lambda p: setattr(api, "last_result_text", "not found") or False
+        assert note not in Executor(api).run("open_app", "Calculator").detail
+        assert "calculator" not in api._app_notes_given
+    finally:
+        api.tools._conn and api.tools._conn.close()
+
+
+def test_no_note_for_an_app_without_an_entry_and_aliases_match(monkeypatch, tmp_path):
+    from core.config import APP_NOTE_MAX_CHARS, APP_NOTES, app_note
+
+    note = APP_NOTES["calculator"][1]
+    api, Executor = _app_notes_api(monkeypatch, tmp_path)
+    try:
+        assert Executor(api).run("open_app", "Notepad").detail == "Opened 'Notepad' (window 'Notepad')"
+        assert Executor(api).run("open_app", "calc").detail.endswith(note)
+    finally:
+        api.tools._conn and api.tools._conn.close()
+    for alias in ("calc", "calculatorapp", "windowscalculator", "calculator"):
+        assert app_note(alias) == ("calculator", note)
+    assert app_note("calculus") == ("", "") and app_note("") == ("", "")
+    assert all(len(n) <= APP_NOTE_MAX_CHARS for _a, n in APP_NOTES.values())
+
+
+def test_the_note_changes_no_other_result_field(monkeypatch, tmp_path):
+    import dataclasses
+
+    api, Executor = _app_notes_api(monkeypatch, tmp_path)
+    try:
+        with_note = Executor(api).run("open_app", "Calculator")
+        api._app_notes_given = {"calculator"}          # already given: the plain result
+        plain = Executor(api).run("open_app", "Calculator")
+    finally:
+        api.tools._conn and api.tools._conn.close()
+    a, b = dataclasses.asdict(with_note), dataclasses.asdict(plain)
+    for key in ("detail", "duration", "elapsed", "timing"):
+        a.pop(key, None), b.pop(key, None)
+    assert a == b and with_note.confidence == plain.confidence
+    assert with_note.verified == plain.verified and with_note.success is True
+    # The observation cut leaves room for the note.
+    from core.tools import APP_RESULT_CHARS, SPECS
+
+    assert SPECS["open_app"].result_chars == SPECS["switch_app"].result_chars == APP_RESULT_CHARS
+    assert len(with_note.detail) < APP_RESULT_CHARS

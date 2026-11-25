@@ -50,6 +50,7 @@ import speech_recognition as sr
 
 from .agent import NOT_VISIBLE_ON_SCREEN, AgentLoop
 from .config import (
+    app_note,
     SAVE_BOX_POLL_S,
     SAVE_NAME_BOX_WAIT_S,
     spelled_key_name,
@@ -2894,10 +2895,11 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         param = str(parameter) if not isinstance(parameter, str) else parameter
         shown = repr(param[:80]) if verbose_logs() else step_param_for_log(action, param)
         print(f"[Exec] {action}({shown})")
+        self._track_selection(action)
 
         try:
             if action == "open_app":
-                return self._act_open_app(param)
+                return self._with_app_note(param, self._act_open_app(param))
             elif action == "type_text":
                 return self._act_type_text(param)
             elif action == "type_search":
@@ -3019,7 +3021,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 # The app the model wants input to go to, even if the switch
                 # fails -- type_text/keys then warn instead of a silent ok.
                 self._last_opened_app = param.lower().strip()
-                return self.switch_to_app(param)
+                return self._with_app_note(param, self.switch_to_app(param))
             elif action == "uia_find_input":
                 return self._act_uia_find_input(param)
             elif action == "save_file_as":
@@ -3636,13 +3638,22 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
 
         # One or two characters: the whole name, never a substring ("7" is in
         # "Display is 37"); then, for a key, its spelled-out name ("Seven").
+        # Longer names: the best rank wins (exact > whole word > prefix >
+        # substring), so "Clear" never lands on "Clear all memory"; a tie
+        # that stays open fails and lists the names.
         short = len(str(param or "").strip()) <= 2
-        element = self.uia_nav.find_element_by_name(fw, param, partial=not short)
-        spelled = "" if element else spelled_key_name(param)
+        element, ambiguous = self._uia_lookup(fw, param, partial=not short)
+        spelled = "" if element or ambiguous else spelled_key_name(param)
         if spelled:
-            element = self.uia_nav.find_element_by_name(fw, spelled, partial=False)
+            element, ambiguous = self._uia_lookup(fw, spelled, partial=False)
             print(f"[UIA] retried with the spelled-out key name: "
                   f"{'found' if element else 'not found'}")
+        if ambiguous:
+            self.last_result_text = (
+                f"ambiguous: '{param}' matches {', '.join(ambiguous[:6])}"
+                + (f" and {len(ambiguous) - 6} more" if len(ambiguous) > 6 else "")
+                + " -- nothing was clicked; use the full name of the one you mean.")
+            return False
         if element:
             # What the window's tree says now (the walk the lookup just made),
             # to tell afterwards whether the action changed anything.
@@ -3694,6 +3705,19 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
 
         self.last_result_text = f"'{param}' not found in the UIA element tree of '{fw}'"
         return False
+
+    def _uia_lookup(self, window, name, partial):
+        """(element or None, ambiguous names) through the navigator's ranked
+        ``resolve_by_name``; a navigator without it (an older fake) falls back
+        to ``find_element_by_name``. Logs only the rank label."""
+        resolve = getattr(self.uia_nav, "resolve_by_name", None)
+        if not callable(resolve):
+            return self.uia_nav.find_element_by_name(window, name, partial=partial), []
+        info, label, ambiguous = resolve(window, name, partial=partial)
+        if label:
+            print(f"[UIA] name match: {label}"
+                  + (f", ambiguous ({len(ambiguous)})" if ambiguous else ""))
+        return (info.element if info else None), list(ambiguous or [])
 
     def _act_uia_find_input(self, param=""):
         fw = self.live.snapshot.get("foreground_window", "")
@@ -4021,6 +4045,45 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         self.last_result_text = f"{text} {dst} now contains {self._folder_listing(dst)}"
         return not failed
 
+    def _with_app_note(self, app, ok):
+        """open_app / switch_app: on success, the app's APP_NOTES tip is
+        appended to the result text, once per phase per app (the agent resets
+        ``_app_notes_given`` at phase start). Returns ok unchanged; nothing
+        else about the result changes. Logs a fixed label only."""
+        if not ok:
+            return ok
+        key, note = app_note(self._normalize_app_name(app))
+        given = self.__dict__.setdefault("_app_notes_given", set())
+        if note and key not in given:
+            given.add(key)
+            text = str(getattr(self, "last_result_text", "") or "").rstrip()
+            self.last_result_text = f"{text} {note}" if text else note
+            print("[AppNotes] note added")
+        return ok
+
+    def _track_selection(self, action):
+        """A select-all (hotkey ctrl+a) is remembered as the window it went to
+        until the next action that is not a read (perception/info): the
+        action right after it sees it in ``_selection_before`` (type_text then
+        says the selection was replaced), anything later does not."""
+        mark = self.__dict__.pop("_select_all_mark", None)
+        self._selection_before = mark
+        try:
+            cats = set(self.tools.get(action).categories)
+        except Exception:
+            cats = set()
+        if mark is not None and cats & {"perception", "info"}:
+            self._select_all_mark = mark          # a read changes no selection
+
+    @staticmethod
+    def _foreground_hwnd():
+        try:
+            import win32gui
+
+            return win32gui.GetForegroundWindow() or None
+        except Exception:
+            return None
+
     def _act_type_text(self, param):
         """Type into whatever app was last opened via open_app. Focuses it
         first, then clears the field and pastes via clipboard instead of
@@ -4035,8 +4098,15 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         # Replace the field only in an app this phase opened/switched to;
         # anywhere else, never select-all + delete someone's content.
         replace = bool(getattr(self, "_last_opened_app", None))
+        selected = getattr(self, "_selection_before", None)
         if not replace:
-            report += " No app was opened or switched to, so the text was appended; nothing was cleared."
+            if selected is not None and selected == self._foreground_hwnd():
+                # hotkey ctrl+a went to this same window right before: the
+                # paste replaces that selection.
+                report += " It replaced the selected text (the ctrl+a selection just before)."
+            else:
+                report += (" No app was opened or switched to, so the text was appended; "
+                           "nothing was cleared.")
         prev_clipboard = None
         clipboard_staged = False
         # One lock across read, stage, paste and restore: MistAI's own watcher
@@ -4565,6 +4635,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 return False
             pyautogui.hotkey(*keys)
             time.sleep(0.3)
+            if sorted(keys) == ["a", "ctrl"]:
+                self._select_all_mark = self._foreground_hwnd()
             return True
         except Exception as e:
             print(f"[Hotkey] Error with {param}: {e if verbose_logs() else type(e).__name__}")

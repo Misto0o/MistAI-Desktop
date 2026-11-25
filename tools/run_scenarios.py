@@ -300,6 +300,13 @@ def check_desktop(expect, outcome):
     any_of = expect.get("speech_contains_any")
     if any_of and not any(_norm(w) in speech for w in any_of):
         fails.append(f"speech {outcome['speech']!r} has none of {any_of}")
+    near = expect.get("speech_number_near")
+    if near and not _speech_has_number_near(outcome["speech"], near):
+        fails.append(f"speech {outcome['speech']!r} states no amount within "
+                     f"{near.get('tolerance', 0.01)} of {near['value']}")
+    include_any = expect.get("actions_include_any")
+    if include_any and not any(a in parsed["actions"] for a in include_any):
+        fails.append(f"none of {include_any} ran (ran: {parsed['actions']})")
     for a in expect.get("actions_include", []):
         if a not in parsed["actions"]:
             fails.append(f"action {a} never ran (ran: {parsed['actions']})")
@@ -352,6 +359,27 @@ def check_desktop(expect, outcome):
         if all(alt_fails):
             fails.append("no alternative held: " + " | ".join("; ".join(f) for f in alt_fails))
     return fails
+
+
+_AMOUNT_RX = re.compile(r"(?<![\d.])\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
+_DOLLARS_CENTS_RX = re.compile(r"(\d+)\s*dollars?\s*(?:and\s*)?(\d{1,2})\s*cents?", re.I)
+
+
+def _speech_amounts(speech):
+    """Every number the speech states: 11.61, $11.61, 1,234.5, "11 dollars and 61 cents"."""
+    text = str(speech or "")
+    found = [int(d) + int(c) / 100 for d, c in _DOLLARS_CENTS_RX.findall(text)]
+    for whole, frac in _AMOUNT_RX.findall(text):
+        found.append(float(whole.replace(",", "") + ("." + frac if frac else "")))
+    return found
+
+
+def _speech_has_number_near(speech, near):
+    """speech_number_near {value, tolerance?}: some stated number is within the
+    tolerance (default one cent) of value. Other numbers in the speech (the
+    inputs) don't matter; a wrong result still fails."""
+    tol = float(near.get("tolerance", 0.01)) + 1e-9
+    return any(abs(n - float(near["value"])) <= tol for n in _speech_amounts(speech))
 
 
 def _file_text_failure(want, key="file_contains"):
