@@ -1334,4 +1334,8 @@ def main(argv=None, api_factory=None):
 
 
 if __name__ == "__main__":
+    # Only here, never in main(): tests call main() and pytest owns its own
+    # faulthandler. A native crash leaves every thread's stack in crash.log.
+    from core.config import enable_crash_log
+    enable_crash_log()
     raise SystemExit(main())

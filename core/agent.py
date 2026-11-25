@@ -29,6 +29,10 @@ from .config import (
     BATCHABLE_ACTIONS,
     batch_steps_enabled,
     opens_dialog,
+    normalized_keys,
+    DIALOG_WINDOW_CLASS,
+    FILE_DIALOG_KEYS,
+    OWN_DIALOG_KEYS,
     confirm_listen_profile,
     confirmation_answer,
     credential_failure_reason,
@@ -70,6 +74,12 @@ EMPTY_ANSWER_READS = frozenset(
 OBSERVE_ACTIONS = frozenset({"run_command", "inspect_file", "find_file"})
 # Spoken when such a done still has no answer after its one reminder.
 NO_ANSWER_SPEECH = "I couldn't read the answer."
+# A done whose saved file is still missing after its one FILE CHECK reminder.
+FILE_NOT_SAVED_SPEECH = ("I couldn't confirm the file was saved where you asked, "
+                         "so I'm not reporting it as done.")
+# Actions that may legitimately take a saved file away from its path: after
+# one (or a state-changing run_command) the done-time file check is dropped.
+FILE_MOVING_ACTIONS = frozenset({"move_files", "organize_desktop"})
 # The agent call failed at the network level (error and speech of the result).
 NETWORK_FAILURE_SPEECH = "I couldn't reach my server, so I stopped. Please try again in a moment."
 
@@ -573,6 +583,79 @@ class AgentLoop:
         except Exception:
             return False
 
+    @staticmethod
+    def _window_facts(hwnd):
+        """(pid, class name, thread id) of a window; zeros when unknown."""
+        try:
+            import win32gui
+            import win32process
+
+            thread, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return pid, win32gui.GetClassName(hwnd), thread
+        except Exception:
+            return 0, "", 0
+
+    def _opened_file_dialog(self, keys, before, via_save=False):
+        """After a successful dialog key (or any save_file_as call, via_save):
+        the hwnd of the window now in front if it is a file dialog
+        (FILE_DIALOG_KEYS, the dialog window class) of the same process as the
+        window before it -- the dialog this phase opened itself, even when
+        save_file_as stopped with it still open. Else 0. Logs a fixed label."""
+        if not via_save and normalized_keys(keys) not in FILE_DIALOG_KEYS:
+            return 0
+        hwnd = self._current_foreground_key()[0]
+        if not hwnd or hwnd == before[0]:
+            return 0
+        pid, cls, _ = self._window_facts(hwnd)
+        if not pid or pid != self._window_facts(before[0])[0]:
+            print("  [DialogKeys] the new window is not counted (another process)")
+            return 0
+        if cls != DIALOG_WINDOW_CLASS:
+            print("  [DialogKeys] the new window is not counted (not a dialog window)")
+            return 0
+        print("  [DialogKeys] the dialog this phase opened is in front")
+        return hwnd
+
+    def _saved_path(self, action, param):
+        """The absolute path a save_file_as / write_file call saved to, for the
+        done-time file check; '' for anything else or a relative path."""
+        if action == "save_file_as":
+            raw = str(param or "").strip().strip('"').strip()
+        elif action == "write_file" and "|||" in str(param or ""):
+            raw = str(param).split("|||", 1)[0].strip()
+        else:
+            return ""
+        resolve = getattr(self.api, "_resolve_path_placeholders", None)
+        try:
+            path = resolve(raw) if callable(resolve) and raw else raw
+            path = os.path.expandvars(os.path.expanduser(str(path or "")))
+        except Exception:
+            return ""
+        return os.path.normpath(path) if path and os.path.isabs(path) else ""
+
+    def _own_dialog_key(self, action, param, own_dialog):
+        """press_key Enter/Escape (and Delete while typing in one of its edit
+        boxes) inside the file dialog this phase opened: part of that flow,
+        no confirmation. Anything else -- another window, the replace prompt,
+        Delete in the dialog's file list -- keeps the usual gate."""
+        key = str(param or "").strip().lower()
+        if action != "press_key" or not own_dialog or key not in OWN_DIALOG_KEYS:
+            return False
+        if self._current_foreground_key()[0] != own_dialog:
+            return False
+        if key in ("delete", "del"):
+            try:
+                import win32gui
+
+                focus = win32gui.GetGUIThreadInfo(self._window_facts(own_dialog)[2])[2]
+                if not focus or win32gui.GetClassName(focus) != "Edit":
+                    return False
+            except Exception:
+                return False
+        if key not in ("escape", "esc"):        # Escape never asks anyway
+            print("  [Confirm] not asked: a key inside the dialog this phase opened")
+        return True
+
     def _vision_frame(self, label):
         screen = self.api.screen
         get = getattr(screen, "frame_for_read", None)
@@ -782,6 +865,9 @@ class AgentLoop:
                     f"This will replace one exact inspected source fragment in '{path}' "
                     "while preserving the rest of the file. Proceed?"
                 )
+        if action == "save_file_as":
+            path = self.api._resolve_path_placeholders(str(parameter).strip().strip('"').strip())
+            return f"'{path}' already exists. Save over it and replace it?"
         return f"This will run: {action}({parameter}) -- this can't easily be undone. Proceed?"
 
     def run(
@@ -985,6 +1071,9 @@ class AgentLoop:
         if callable(mark):
             mark()
         input_streak = (None, None, 0)  # (sig, foreground key, count) of identical inputs
+        own_dialog = 0  # hwnd of the file dialog this phase's own dialog key opened
+        save_targets = {}  # path -> action, for the done-time file check
+        file_reminded = False
         route_notes = []  # off-target input, cross-category fallbacks (for the done check)
         last_read = None  # result of the phase's last read_screen_text
         unconfirmed_click = None  # a vision-resolved click no screen read followed yet
@@ -1394,6 +1483,7 @@ class AgentLoop:
                 param,
                 resolve_path=self.api._resolve_path_placeholders,
                 enter_safe=self._enter_safe(action, param),
+                dialog_key_safe=self._own_dialog_key(action, param, own_dialog),
             )
             # quick_message only: the ask-before-sending setting may skip the
             # question or move it into the action (deferred_send), where the
@@ -1474,6 +1564,31 @@ class AgentLoop:
             # before dispatch.  Check again at the last safe boundary.
             if self.api._stop_requested.is_set():
                 return {"success": False, "error": "Stopped by user"}
+
+            # --- DONE-TIME FILE CHECK -------------------------------------------
+            # A path this phase saved to (save_file_as / write_file) that holds
+            # no file: one reminder, then the phase ends as not done.
+            missing = ([p for p in save_targets if not os.path.isfile(p)]
+                       if action == "done" else [])
+            if missing and not file_reminded and steps_taken < self.MAX_STEPS:
+                file_reminded = True
+                print(f"  [DoneCheck] file check: {len(missing)} saved path(s) missing")
+                history.append({"role": "assistant", "content": json.dumps(cmd)})
+                history.append({"role": "user", "content": (
+                    "[OBSERVATION] FILE CHECK: no file exists at "
+                    + ", ".join(f"'{p}'" for p in missing[:3])
+                    + f", where you saved with {save_targets[missing[0]]}. It was NOT saved "
+                    "there. Save it to that full path (save_file_as) and check it, or call "
+                    "done saying plainly that it was not saved.")})
+                continue
+            if missing:
+                print("  [DoneCheck] file still missing; not reported as done")
+                self.api.speak(FILE_NOT_SAVED_SPEECH)
+                if self.api.caption_window and self.api.captions_enabled:
+                    self.api.caption_window.show_speech(FILE_NOT_SAVED_SPEECH, 6)
+                self._print_step_times(steps_taken, step_times)
+                return {"success": False, "error": "file not saved",
+                        "speech": FILE_NOT_SAVED_SPEECH, "steps": steps_taken}
 
             # --- DONE-TIME CHECK (once per phase) ------------------------------
             # One extra model turn, only when the draft speech states numbers
@@ -1611,7 +1726,8 @@ class AgentLoop:
             self._publish_step(action)
             # A key that usually opens a dialog: the window in front before it,
             # for the WINDOW CHECK in its observation.
-            fg_before = self._current_foreground_key() if opens_dialog(action, param) else None
+            fg_before = (self._current_foreground_key()
+                         if opens_dialog(action, param) or action == "save_file_as" else None)
             t0 = time.monotonic()
             if deferred_send is not None:
                 self.api._send_confirm = deferred_send["hook"]
@@ -1769,6 +1885,11 @@ class AgentLoop:
                 window_check = self._window_check(fg_before)
                 if window_check:
                     obs += f" {window_check}"
+                own_dialog = self._opened_file_dialog(executed_param, fg_before)
+            if fg_before and executed_action == "save_file_as":
+                # A dialog save_file_as opened and left open (it stopped) is
+                # this phase's own dialog too.
+                own_dialog = self._opened_file_dialog("", fg_before, via_save=True) or own_dialog
             if format_note:
                 obs += f" {format_note}"
             if action in SPECS and arg_problem(action, param):
@@ -1835,6 +1956,14 @@ class AgentLoop:
                 unobserved_command = True
             elif success and executed_action in OBSERVE_ACTIONS:
                 unobserved_command = False
+            # Where this phase saved a file (checked at done), until something
+            # may have moved it away.
+            saved = self._saved_path(executed_action, executed_param)
+            if saved:
+                save_targets[saved] = executed_action
+            elif executed_action in FILE_MOVING_ACTIONS or (
+                    executed_action == "run_command" and command_is_mutating(executed_param)):
+                save_targets.clear()
 
             # Repetition guard: without this the model re-ran clicks it had
             # already landed (each 'maybe it didn't work' costs a step and, on
@@ -2120,8 +2249,7 @@ class AgentLoop:
             "- You work in a LOOP. Each iteration, analyze the screen and decide exactly ONE "
             f"action. Observe the result before proceeding. After {dialog_keys}"
         ) + (", read the screen; type into a dialog only once an observation says one "
-             "appeared, never a file path into the document; to save under a name the user "
-             "gave, prefer the dialog's file-name box.")
+             "appeared, never a file path into the document.")
         submit_hint = " (both in one steps reply)" if batching else ""
         response_format = (
             '{"thinking":"one short sentence","action":"...","parameter":"...","speech":""}'
@@ -2156,7 +2284,7 @@ OPERATING RULES:
 - minimize_all hides your target app too: only when the user asks to clear the desktop, never to focus an app. If switch_app fails, the app isn't running: use open_app, never force window activation via PowerShell.
 - BROWSER: for any web search or lookup use browser_search, then browser_get_text or browser_click/browser_navigate on a result; never open the user's browser app or type into an address bar to search (open one only when the user asks to open or use it, or for a specific signed-in site). For a known website use browser_navigate with its URL (e.g. "youtube.com"), not a search; get to content by URL, never by clicking through pages.
 - The browser_* actions control ONLY MistAI's own Playwright browser, a SEPARATE window from the user's everyday Firefox, even when that one is in front. If the user explicitly asks to use their REAL/daily browser, use open_url to open a link there and click_on_text/read_screen_text (OCR/Vision) to work in it.
-- PATHS AND FILES: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables ($env:USERPROFILE and $env:TEMP are real). Move or copy files and folders with move_files / copy_files, not run_command (they create the folder, never overwrite and list the result). Before writing into a folder, make sure it exists (create it first); never add overwrite flags such as -Force unless the user asked to overwrite. After any other command that changes files or folders, list the source and destination with a separate read-only command and report only what that listing shows; if it contradicts what you meant to do, say so and fix it.
+- PATHS AND FILES: For standard folders use the {{desktop}}, {{documents}}, {{downloads}}, {{home}} placeholders or the Known folders paths (OneDrive can redirect them). Never invent environment variables ($env:USERPROFILE and $env:TEMP are real). Move or copy files and folders with move_files / copy_files, not run_command. To save a document from an app, use save_file_as with the full path instead of typing into its dialog. To change text in an open editor, hotkey ctrl+a, then type_text replaces the selection; never press delete first. Before writing into a folder, make sure it exists (create it first); never add overwrite flags such as -Force unless the user asked to overwrite. After any other command that changes files or folders, list the source and destination with a separate read-only command and report only what that listing shows; if it contradicts what you meant to do, say so and fix it.
 - "done" is the ONLY way to end a task (there is no "none" action). Its speech is the only thing the user hears or sees: when the task asked for information it must contain the answer; leave it empty only for a pure action.
 
 DO NOT SECOND-GUESS COMPLETED ACTIONS:

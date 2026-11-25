@@ -44,6 +44,8 @@
 #   37. RUNTIME SMOKE PATHS TESTS (3)
 #   38. API MANAGER CONTRACT
 #   39. API MANAGER CONTRACT TESTS
+#   40. CRASH LOG
+#   41. CRASH LOG TESTS
 # ============================================================
 
 """Api structure, runtime smoke paths, the API manager contract and the UI page."""
@@ -1423,6 +1425,7 @@ def test_set_clipboard_closes_the_clipboard_when_setting_fails(monkeypatch):
                            SetClipboardData=fail, CF_UNICODETEXT=13,
                            CloseClipboard=lambda: calls.append("close"))
     monkeypatch.setitem(sys.modules, "win32clipboard", fake)
+    monkeypatch.setattr("core.live_state._write_unicode", lambda text: fake.SetClipboardData(13, text))
     assert Api.set_clipboard(Api.__new__(Api), "x") is False
     assert calls == ["open", "empty", "close"]
 
@@ -1582,3 +1585,69 @@ def test_environment_can_explicitly_select_direct_mode(monkeypatch):
 
     assert manager.get_api_url() == manager._primary_api
     assert manager.get_fallback_url() == manager._fallback_api
+
+
+# ============================================================
+# CRASH LOG
+# ============================================================
+
+# A native crash (0xC0000374 in type_text) killed the process with no trace.
+# enable_crash_log points faulthandler (every thread, frames only) at
+# <logs>/crash.log. The real faulthandler is never touched here: pytest owns it.
+
+
+def _crash_log_fake(monkeypatch):
+    import sys as _sys
+
+    from core import config as _config
+
+    calls = []
+    monkeypatch.setitem(_sys.modules, "faulthandler", SimpleNamespace(
+        enable=lambda file=None, all_threads=False: calls.append((file, all_threads))))
+    monkeypatch.setattr(_config, "_crash_log_file", None)
+    return _config, calls
+
+
+# ============================================================
+# CRASH LOG TESTS
+# ============================================================
+
+def test_crash_log_enables_faulthandler_on_one_open_file(monkeypatch, tmp_path):
+    config_mod, calls = _crash_log_fake(monkeypatch)
+    folder = tmp_path / "logs" / "deeper"                      # created when missing
+    path = config_mod.enable_crash_log(str(folder))
+    try:
+        assert path == str(folder / "crash.log")
+        (f, all_threads), = calls
+        assert all_threads is True and f.name == path and not f.closed and f.mode == "a"
+        assert config_mod.enable_crash_log(str(folder)) == path    # the same handle, kept open
+        assert calls[1][0] is f
+        line = open(path, encoding="utf-8").read()
+        assert line.startswith("--- process ") and line.count("\n") == 1   # no content
+    finally:
+        config_mod._crash_log_file.close()
+
+
+def test_crash_log_never_raises_when_the_logs_folder_is_unavailable(monkeypatch, tmp_path, capsys):
+    config_mod, calls = _crash_log_fake(monkeypatch)
+    blocker = tmp_path / "a-file"
+    blocker.write_text("x")
+    assert config_mod.enable_crash_log(str(blocker / "logs")) == ""  # a file is in the way
+    assert calls == []
+    assert capsys.readouterr().out.strip().startswith("[CrashLog] not enabled (")
+
+
+def test_the_app_and_the_harness_enable_the_crash_log_at_start():
+    import ast
+
+    app = open(os.path.join(REPO, "assistant.py"), encoding="utf-8").read()
+    main = next(n for n in ast.parse(app).body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    first = main.body[0]
+    assert isinstance(first, ast.Expr) and ast.unparse(first) == "enable_crash_log()"
+    harness = open(os.path.join(REPO, "tools", "run_scenarios.py"), encoding="utf-8").read()
+    tail = harness.split('if __name__ == "__main__":', 1)[1]
+    assert ("enable_crash_log()" in tail
+            and tail.index("enable_crash_log()") < tail.index("SystemExit(main())"))
+    # Never inside main(): tests call it and pytest owns faulthandler.
+    body = harness.split("def main(", 1)[1].split('if __name__ == "__main__":', 1)[0]
+    assert "enable_crash_log" not in body

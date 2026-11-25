@@ -42,6 +42,7 @@
 #   33. STATE WATCHER
 #   34. FILE EVENT HANDLER
 #   35. FILE WATCHER
+#   36. WINDOW IN FRONT FOR READING
 # ============================================================
 
 """
@@ -277,11 +278,63 @@ _cache = ""                  # last text seen or set (first 300 chars)
 _cache_seq = None            # sequence number that `_cache` belongs to
 
 RETRY_BUDGET_S = 1.5         # total waiting time while another app holds it
+# OpenClipboard inside one helper: another process can hold the clipboard for
+# a few ms (clipboard history, a viewer reacting to our last write), so the
+# open is tried again after these short waits before the call reports busy.
+OPEN_RETRY_DELAYS = (0.01, 0.02, 0.04)
+
+_user32_typed = None
+
+
+def _user32():
+    """A private user32 with explicit 64-bit types for the clipboard helpers.
+    Private (not ctypes.windll.user32, which every library shares and may
+    retype): HWND/HANDLE results are pointer-sized, never the default c_int."""
+    global _user32_typed
+    if _user32_typed is None:
+        from ctypes import wintypes
+
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetClipboardSequenceNumber.argtypes = []
+        u.GetClipboardSequenceNumber.restype = wintypes.DWORD
+        u.GetOpenClipboardWindow.argtypes = []
+        u.GetOpenClipboardWindow.restype = wintypes.HWND
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        u.SetClipboardData.restype = wintypes.HANDLE
+        _user32_typed = u
+    return _user32_typed
+
+
+_kernel32_typed = None
+
+
+def _kernel32():
+    """A private kernel32 with explicit 64-bit types for the clipboard write.
+    Private for the same reason as _user32: pyreadline3 (imported through
+    pyautogui -> pyrect -> doctest -> pdb -> rlcompleter -> readline) retypes
+    the SHARED ctypes.windll.kernel32.GlobalUnlock to take a 32-bit int."""
+    global _kernel32_typed
+    if _kernel32_typed is None:
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        k.GlobalAlloc.restype = wintypes.HGLOBAL
+        k.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        k.GlobalLock.restype = wintypes.LPVOID
+        k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        k.GlobalUnlock.restype = wintypes.BOOL
+        k.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        k.GlobalFree.restype = wintypes.HGLOBAL
+        _kernel32_typed = k
+    return _kernel32_typed
 
 
 def _seq():
     try:
-        return ctypes.windll.user32.GetClipboardSequenceNumber()
+        return _user32().GetClipboardSequenceNumber()
     except Exception:
         return None
 
@@ -295,11 +348,14 @@ def holder():
     if _ours_open > 0:
         return "self"
     try:
-        hwnd = ctypes.windll.user32.GetOpenClipboardWindow()
+        from ctypes import wintypes
+
+        u = _user32()
+        hwnd = u.GetOpenClipboardWindow()
         if not hwnd:
             return "unknown"      # not open, or opened with no window handle
-        pid = ctypes.c_ulong(0)
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        pid = wintypes.DWORD(0)
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         return "self" if pid.value == os.getpid() else "other"
     except Exception:
         return "unknown"
@@ -325,12 +381,28 @@ def retry_delays(budget=RETRY_BUDGET_S):
 # OPENING THE CLIPBOARD
 # ============================================================
 
+def _open(win32clipboard):
+    """OpenClipboard, tried again after OPEN_RETRY_DELAYS while another
+    process holds it; raises the last error if it never opens."""
+    for delay in OPEN_RETRY_DELAYS + (None,):
+        try:
+            win32clipboard.OpenClipboard()
+            return
+        except Exception:
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+
 def _open_and(fn):
-    """Open, run fn(win32clipboard), always close. Raises if it can't open."""
+    """Open (with a short retry), run fn(win32clipboard), always close.
+    Raises if it can't open. The memory behind SetClipboardData is pywin32's:
+    it allocates the moveable global block and the clipboard owns it once
+    the set succeeds; nothing here allocates or frees Windows memory."""
     global _ours_open
     import win32clipboard
     with lock:
-        win32clipboard.OpenClipboard()
+        _open(win32clipboard)
         _ours_open += 1
         try:
             return fn(win32clipboard)
@@ -368,6 +440,44 @@ def read_text():
 # CLIPBOARD WRITE
 # ============================================================
 
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
+def _write_unicode(text):
+    """SetClipboardData(CF_UNICODETEXT) with our own memory block; the
+    clipboard must be open (and emptied) by this thread.
+
+    Never pywin32's SetClipboardData with a str: pywin32 311 takes a str that
+    int() accepts ("37", "3", " 007") as a HANDLE number, so typing digits
+    (Calculator) handed Windows a bogus handle that the next write freed --
+    heap corruption 0xC0000374 in _set ("12", "-5": 'The handle is invalid').
+
+    Ownership: a moveable block of (UTF-16 units + 1) * 2 bytes, NUL
+    included; unlocked before SetClipboardData; the system owns it once that
+    succeeds (never freed then), freed here on any failure."""
+    data = str(text or "").encode("utf-16-le") + b"\x00\x00"
+    k, u = _kernel32(), _user32()
+    handle = k.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    owned_by_clipboard = False
+    try:
+        ptr = k.GlobalLock(handle)
+        if not ptr:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            ctypes.memmove(ptr, data, len(data))
+        finally:
+            k.GlobalUnlock(handle)
+        if not u.SetClipboardData(CF_UNICODETEXT, handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        owned_by_clipboard = True
+    finally:
+        if not owned_by_clipboard:
+            k.GlobalFree(handle)
+
+
 def set_text(text):
     """Put text on the clipboard. False if it could not be opened or set;
     logs `[TypeText] clipboard busy holder=...` on failure."""
@@ -378,7 +488,7 @@ def set_text(text):
     def _set(w):
         opened.append(True)
         w.EmptyClipboard()
-        w.SetClipboardData(w.CF_UNICODETEXT, text)
+        _write_unicode(text)
 
     try:
         _open_and(_set)
@@ -1157,11 +1267,15 @@ class LiveStateTracker:
         try:
             import win32gui
             fg = win32gui.GetForegroundWindow()
-            s["foreground_hwnd"] = fg
-            s["foreground_window"] = win32gui.GetWindowText(fg) or "Unknown"
+            # For reading: MistAI's own windows (overlays, orb, main window)
+            # are never "the window in front"; the one below them is.
+            hwnd, title, own_in_front = foreground_for_reading()
+            s["foreground_hwnd"] = hwnd
+            s["foreground_window"] = title or "Unknown"
+            s["own_window_in_front"] = own_in_front
             watched = getattr(self, "window_events", None)
             if watched is not None:
-                watched.check_poll(fg)          # did the hook see this foreground?
+                watched.check_poll(fg)          # did the hook see this foreground? (the real one)
             wins = []
 
             def _cb(h, _):
@@ -1464,3 +1578,63 @@ class FileWatcher:
                 self._observer.stop()
             except Exception:
                 pass
+
+
+# ============================================================
+# WINDOW IN FRONT FOR READING
+# ============================================================
+
+# What "the window in front" means for searching and reading (the snapshot's
+# foreground title, UIA searches, screen text, screen-change identity): the
+# foreground window, unless it is one of MistAI's own (this process: the main
+# window, a Tk overlay, the orb, a panel) -- then the first visible, titled,
+# non-tool window of another process below it in z-order, i.e. the window the
+# user or the agent was working in. Input guards do NOT use this: keys go to
+# the real foreground, so they keep refusing when MistAI itself is in front.
+GW_HWNDNEXT = 2
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
+Z_ORDER_LIMIT = 512
+
+
+def _window_pid(win32gui, win32process, hwnd):
+    try:
+        return win32process.GetWindowThreadProcessId(hwnd)[1]
+    except Exception:
+        return None
+
+
+def foreground_for_reading(own_pid=None):
+    """(hwnd, title, own_in_front) -- see above. own_in_front: the real
+    foreground was MistAI's. Falls back to the raw foreground when anything
+    can't be read; (0, "", False) when there is none."""
+    own = os.getpid() if own_pid is None else own_pid
+    try:
+        import win32gui
+        import win32process
+
+        fg = win32gui.GetForegroundWindow()
+    except Exception:
+        return 0, "", False
+    if not fg:
+        return 0, "", False
+    if _window_pid(win32gui, win32process, fg) != own:
+        return fg, win32gui.GetWindowText(fg), False
+    h = fg
+    try:
+        for _ in range(Z_ORDER_LIMIT):
+            h = win32gui.GetWindow(h, GW_HWNDNEXT)
+            if not h:
+                break
+            if not win32gui.IsWindowVisible(h) or win32gui.IsIconic(h):
+                continue
+            if _window_pid(win32gui, win32process, h) in (own, None):
+                continue
+            if win32gui.GetWindowLong(h, _GWL_EXSTYLE) & _WS_EX_TOOLWINDOW:
+                continue
+            title = win32gui.GetWindowText(h)
+            if title.strip():
+                return h, title, True
+    except Exception:
+        pass
+    return 0, "", True

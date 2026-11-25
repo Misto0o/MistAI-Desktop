@@ -1228,18 +1228,8 @@
             "speech": ""
           },
           {
-            "action": "hotkey",
-            "parameter": "ctrl+s",
-            "speech": ""
-          },
-          {
-            "action": "type_text",
+            "action": "save_file_as",
             "parameter": "{tmp}\\groceries.txt",
-            "speech": ""
-          },
-          {
-            "action": "press_key",
-            "parameter": "enter",
             "speech": ""
           },
           {
@@ -1337,18 +1327,8 @@
             "speech": ""
           },
           {
-            "action": "hotkey",
-            "parameter": "ctrl+s",
-            "speech": ""
-          },
-          {
-            "action": "type_text",
+            "action": "save_file_as",
             "parameter": "{tmp}\\reminder.txt",
-            "speech": ""
-          },
-          {
-            "action": "press_key",
-            "parameter": "enter",
             "speech": ""
           },
           {

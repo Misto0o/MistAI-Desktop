@@ -10,13 +10,14 @@
 #   2. TK THREAD
 #   3. STARTING THE TK ROOT
 #   4. TK ROOT ACCESS
-#   5. CAPTION OVERLAY
-#   6. SPLASH SCREEN
-#   7. CLICK INDICATOR
-#   8. MARKER COLORS AND TIMING
-#   9. CLICK MARKER OVERLAY
-#   10. MARKER SINGLETON STATE
-#   11. MARKER SINGLETON
+#   5. INERT OVERLAY WINDOWS
+#   6. CAPTION OVERLAY
+#   7. SPLASH SCREEN
+#   8. CLICK INDICATOR
+#   9. MARKER COLORS AND TIMING
+#   10. CLICK MARKER OVERLAY
+#   11. MARKER SINGLETON STATE
+#   12. MARKER SINGLETON
 # ============================================================
 
 """
@@ -74,6 +75,49 @@ def get_tk_root():
 
 
 # ============================================================
+# INERT OVERLAY WINDOWS
+# ============================================================
+
+# The overlays only show things. A Tk toplevel is otherwise an ordinary
+# window: a click on any painted pixel lands on it and activates MistAI (the
+# click marker's centre dot sat exactly on the click point, so Calculator
+# never got the click). These extended styles make it inert: never
+# activated, never the foreground, no taskbar button, and every mouse event
+# passes through all of its surface to the window below.
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+WS_EX_LAYERED = 0x00080000
+WS_EX_NOACTIVATE = 0x08000000
+INERT_EX_STYLES = WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+GWL_EXSTYLE = -20
+SWP_INERT = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020   # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+
+
+def tk_frame_hwnd(win):
+    """The Win32 wrapper window (class TkTopLevel) of a Tk toplevel."""
+    return int(win.wm_frame(), 16)
+
+
+def make_inert(hwnd):
+    """Add INERT_EX_STYLES to a window (keeping the rest, dropping
+    WS_EX_APPWINDOW); the resulting extended style, or None on failure.
+    Call it while the window is still hidden, so it is never shown active.
+    WS_EX_LAYERED needs layered attributes: Tk's -alpha / -transparentcolor
+    set them, so apply those first."""
+    try:
+        import win32gui
+
+        ex = win32gui.GetWindowLong(hwnd, GWL_EXSTYLE)
+        win32gui.SetWindowLong(hwnd, GWL_EXSTYLE, (ex | INERT_EX_STYLES) & ~WS_EX_APPWINDOW)
+        win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_INERT)
+        return win32gui.GetWindowLong(hwnd, GWL_EXSTYLE)
+    except Exception as e:
+        print(f"[Overlay] could not make the window inert ({type(e).__name__})")
+        return None
+
+
+# ============================================================
 # CAPTION OVERLAY
 # ============================================================
 
@@ -104,10 +148,14 @@ class CaptionWindow:
                 x = (sw - w) // 2
                 y = sh - 150
                 self._window = tk.Toplevel(_tk_root)
+                self._window.withdraw()            # never shown before it is inert
                 self._window.overrideredirect(True)
                 self._window.attributes("-topmost", True)
                 self._window.attributes("-alpha", 0.0)
                 self._window.geometry(f"{w}x90+{x}+{y}")
+                self._window.update_idletasks()
+                make_inert(tk_frame_hwnd(self._window))
+                self._window.deiconify()
                 BG = "#111827"
                 self._window.configure(bg=BG)
 
@@ -292,13 +340,17 @@ def show_splash(get_resource_path):
 # (115, 873)" don't tell you whether that's actually ON the button -- seeing a
 # dot land next to it instead of on it is immediate, unambiguous ground truth.
 #
-# Pure debug aid. Two hard guarantees:
+# Pure debug aid. Three hard guarantees:
 #   1. NEVER blocks or slows down the real click -- rendering happens on its
-#      own Tk thread; every other thread only ever pushes onto a Queue.
-#   2. NEVER intercepts the real click -- the overlay window is fully
-#      click-through (Windows -transparentcolor), so even if a marker is
-#      sitting exactly on top of the target pixel when pyautogui clicks, the
-#      click still reaches whatever's underneath.
+#      own Tk thread; every other thread only ever pushes onto a Queue, and
+#      callers request the marker only AFTER the click was sent.
+#   2. NEVER intercepts the real click -- one marker window, made inert
+#      (make_inert: no activation, every pixel click-through) while still
+#      hidden. -transparentcolor alone left the painted dot clickable: real
+#      runs showed the click landing on MistAI's Tk window, which then took
+#      the foreground while Calculator's display stayed 0.
+#   3. NEVER takes the foreground -- the window is shown once, off screen,
+#      already inert; a flash only moves it (no new windows, no re-show).
 # If Tk isn't available (headless box, remote session, whatever), every call
 # silently becomes a no-op. Automation must never depend on this working.
 
@@ -316,6 +368,8 @@ METHOD_COLORS = {
 TRANSPARENT_KEY = "#010101"   # near-black -- unlikely to collide with real UI
 FLASH_MS = 700
 RING_STEPS = 10
+MARKER_SIZE = 70
+OFFSCREEN = -32000                  # where the marker waits between flashes
 
 
 # ============================================================
@@ -332,6 +386,10 @@ class ClickIndicator:
         self._available = True
         self._tk = None
         self.root = None
+        self.marker = None          # the one marker toplevel
+        self.hwnd = 0               # its Win32 wrapper window
+        self.ex_style = None        # its extended style after make_inert
+        self._flash_id = 0          # a newer flash stops an older pulse
         threading.Thread(target=self._run, daemon=True).start()
         self._ready.wait(timeout=2.0)
 
@@ -354,6 +412,7 @@ class ClickIndicator:
             self.root = tk.Tk()
             self.root.withdraw()
             self.root.attributes("-topmost", True)
+            self._build_marker()
         except Exception as e:
             print(f"[ClickIndicator] Overlay unavailable ({e}) -- debug dots disabled")
             self._available = False
@@ -381,31 +440,56 @@ class ClickIndicator:
         except Exception:
             pass
 
-    def _flash(self, x, y, method, label):
+    def _build_marker(self):
+        """The one marker window: withdrawn, made inert, then shown off screen
+        (so its first show is already non-activating and click-through)."""
         tk = self._tk
-        color = METHOD_COLORS.get(method, METHOD_COLORS["direct"])
-        size = 70
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
         try:
-            win = tk.Toplevel(self.root)
-            win.overrideredirect(True)
-            win.attributes("-topmost", True)
-            try:
-                win.attributes("-transparentcolor", TRANSPARENT_KEY)
-            except Exception:
-                pass  # non-Windows Tk build -- still shows, just not click-through
-            win.geometry(f"{size}x{size}+{int(x - size / 2)}+{int(y - size / 2)}")
-            canvas = tk.Canvas(win, width=size, height=size,
-                               bg=TRANSPARENT_KEY, highlightthickness=0)
-            canvas.pack()
+            win.attributes("-transparentcolor", TRANSPARENT_KEY)
+        except Exception:
+            pass  # non-Windows Tk build
+        win.geometry(f"{MARKER_SIZE}x{MARKER_SIZE}+{OFFSCREEN}+{OFFSCREEN}")
+        self.canvas = tk.Canvas(win, width=MARKER_SIZE, height=MARKER_SIZE,
+                                bg=TRANSPARENT_KEY, highlightthickness=0)
+        self.canvas.pack()
+        win.update_idletasks()
+        self.hwnd = tk_frame_hwnd(win)
+        self.ex_style = make_inert(self.hwnd)
+        win.deiconify()
+        self.marker = win
+
+    def _flash(self, x, y, method, label):
+        color = METHOD_COLORS.get(method, METHOD_COLORS["direct"])
+        size = MARKER_SIZE
+        canvas, win = self.canvas, self.marker
+        self._flash_id += 1
+        flash_id = self._flash_id
+        try:
+            canvas.delete("all")
             cx = cy = size / 2
             tag_text = method + (f" '{label[:14]}'" if label else "")
             canvas.create_text(cx, size - 8, text=tag_text, fill=color,
                                font=("Segoe UI", 7))
+            win.geometry(f"{size}x{size}+{int(x - size / 2)}+{int(y - size / 2)}")
         except Exception as e:
-            print(f"[ClickIndicator] Flash render failed: {e}")
+            print(f"[ClickIndicator] Flash render failed: {type(e).__name__}")
             return
 
+        def park():
+            if flash_id == self._flash_id:
+                try:
+                    canvas.delete("all")
+                    win.geometry(f"{size}x{size}+{OFFSCREEN}+{OFFSCREEN}")
+                except Exception:
+                    pass
+
         def pulse(step=0):
+            if flash_id != self._flash_id:
+                return                       # a newer flash took the marker
             try:
                 canvas.delete("ring")
                 r = 6 + step * 3
@@ -417,12 +501,9 @@ class ClickIndicator:
                 if step < RING_STEPS:
                     win.after(FLASH_MS // RING_STEPS, pulse, step + 1)
                 else:
-                    win.after(150, win.destroy)
+                    win.after(150, park)
             except Exception:
-                try:
-                    win.destroy()
-                except Exception:
-                    pass
+                park()
 
         pulse()
 

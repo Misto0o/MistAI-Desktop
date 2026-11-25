@@ -47,10 +47,13 @@ import webview  # noqa: E402  (must come after stderr filtering / env setup)
 from core.api import Api  # noqa: E402
 from core.caption import show_splash, start_tk_root  # noqa: E402
 from ui.html import HTML  # noqa: E402
-from core.config import VERSION, get_resource_path, setup_tesseract  # noqa: E402
+from core.config import VERSION, enable_crash_log, get_resource_path, setup_tesseract  # noqa: E402
 
 
 def main():
+    # A native crash leaves every thread's stack in ~/MistAI/logs/crash.log
+    # (frames only, no content); works frozen, where there is no stderr.
+    enable_crash_log()
     print(f"[MistAI v{VERSION}] Starting...")
     start_tk_root()
     show_splash(get_resource_path)

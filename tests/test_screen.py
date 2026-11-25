@@ -58,6 +58,10 @@
 #   51. ACCESSIBILITY TEXT SNAPSHOT
 #   52. ACCESSIBILITY TEXT SNAPSHOT HELPERS
 #   53. ACCESSIBILITY TEXT SNAPSHOT TESTS
+#   54. SHORT CLICK TARGETS
+#   55. SHORT CLICK TARGETS TESTS
+#   56. CLICK MARKER AND UIA ACTIONS
+#   57. CLICK MARKER AND UIA ACTIONS TESTS
 # ============================================================
 
 """Screen reads (UIA first, vision modes, frame freshness), vision coordinates and clicking."""
@@ -2204,3 +2208,373 @@ def test_the_ui_text_read_goes_through_the_snapshot():
     src = inspect.getsource(Api._exact_ui_text)
     assert "self._uia_text_cached(hwnd, foreground_uia_text)" in src
     assert "foreground_uia_text(hwnd)" not in src
+
+
+# ============================================================
+# SHORT CLICK TARGETS
+# ============================================================
+
+# Calculator runs: click_on_text('2') clicked OCR's '52' (fuzzy 66 >= 65), and
+# uia_click('3') found nothing because the button is named "Three". A 1-2
+# character target needs an exact OCR word; uia_click matches it whole and
+# then tries its spelled-out key name once.
+
+
+# ============================================================
+# SHORT CLICK TARGETS TESTS
+# ============================================================
+
+@pytest.mark.parametrize("word, query, score", [
+    ("2", "2", 100), ("(2)", "2", 100), ("2,", "2", 100), ("ok", "ok", 100),
+    ("52", "2", 0), ("x2", "2", 0), ("2x", "2", 0), ("two", "2", 0), ("22", "2", 0),
+    ("+4", "+4", 100), ("4", "+4", 0), ("m+", "m+", 100), ("m-", "m+", 0),
+    ("subscribed", "subscribe", 90), ("subscribers", "subscribe", 0),    # 3+ chars: as before
+])
+def test_short_ocr_targets_need_the_whole_word(word, query, score):
+    assert ch._ocr_score(word, query) == score
+    if len(query) > ch.SHORT_TARGET_MAX:
+        assert ch._ocr_score(word, query) == ch._match_score(word, query)
+
+
+def test_a_one_digit_target_never_clicks_a_longer_ocr_word(ocr_compact_match_handler, monkeypatch):
+    h = ocr_compact_match_handler
+    _ocr_sees(monkeypatch, [("52", 572, 348, 20, 20, 1, 1), ("x2", 194, 348, 20, 20, 1, 2)])
+    assert h.click_on_text("2") is False and h.clicks == []     # falls through (UIA, vision)
+    _ocr_sees(monkeypatch, [("52", 572, 348, 20, 20, 1, 1), ("2", 300, 500, 10, 20, 2, 1)])
+    assert h.click_on_text("2") is True and h.clicks == [(305, 510)]
+
+
+def _uia_click_api(monkeypatch, names):
+    """Api with a fake navigator over elements with these names."""
+    from core import caption
+    from core.api import Api
+
+    monkeypatch.setattr(caption, "get_indicator", lambda: SimpleNamespace(show=lambda *a, **k: None))
+    looked, clicked = [], []
+
+    def find(window, name, partial=True):
+        looked.append((name, partial))
+        for n in names:
+            if (name.lower() in n.lower()) if partial else name.lower() == n.lower():
+                return SimpleNamespace(name=n, rectangle=lambda: SimpleNamespace(
+                    left=0, top=0, right=10, bottom=10))
+        return None
+
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(snapshot={"foreground_window": "Calculator"})
+    api.uia_nav = SimpleNamespace(find_element_by_name=find,
+                                  click_element=lambda el: clicked.append(el.name) or True)
+    api.last_result_text = ""
+    return api, looked, clicked
+
+
+CALCULATOR = ["Display is 37", "Seven", "Three", "Two", "Plus", "Equals", "Clear"]
+
+
+def test_uia_click_tries_the_spelled_out_key_name_once(monkeypatch, capsys):
+    api, looked, clicked = _uia_click_api(monkeypatch, CALCULATOR)
+    assert api._act_uia_click("2") is True
+    assert looked == [("2", False), ("Two", False)] and clicked == ["Two"]
+    # The fake navigator has no UIA patterns: a mouse click, not checked.
+    assert api.last_result_text == ("Clicked '2' (the button named 'Two') via a mouse click "
+                                    "(no UIA pattern).")
+    assert capsys.readouterr().out.splitlines()[0] == (
+        "[UIA] retried with the spelled-out key name: found")
+    api, looked, clicked = _uia_click_api(monkeypatch, CALCULATOR)
+    assert api._act_uia_click("+") is True and clicked == ["Plus"]
+
+
+def test_a_short_target_is_matched_whole_never_inside_other_text(monkeypatch):
+    # "7" is inside "Display is 37": the display is never clicked for it.
+    api, looked, clicked = _uia_click_api(monkeypatch, CALCULATOR)
+    assert api._act_uia_click("7") is True and clicked == ["Seven"]
+    assert looked[0] == ("7", False)
+
+
+def test_the_spelled_name_is_only_tried_when_the_first_lookup_fails(monkeypatch, capsys):
+    api, looked, clicked = _uia_click_api(monkeypatch, ["3", "Three"])   # a button named "3"
+    assert api._act_uia_click("3") is True and clicked == ["3"] and looked == [("3", False)]
+    api, looked, clicked = _uia_click_api(monkeypatch, ["Save", "Open"])  # no such key
+    assert api._act_uia_click("4") is False and looked == [("4", False), ("Four", False)]
+    assert "not found in the UIA element tree" in api.last_result_text
+    api, looked, clicked = _uia_click_api(monkeypatch, ["Save", "Open"])  # not a key
+    assert api._act_uia_click("Q") is False and looked == [("Q", False)]
+    api, looked, clicked = _uia_click_api(monkeypatch, ["Save As", "Open"])  # longer: partial
+    assert api._act_uia_click("Save") is True and looked == [("Save", True)]
+    out = capsys.readouterr().out
+    assert out.count("[UIA] retried with the spelled-out key name") == 1
+
+
+# ============================================================
+# CLICK MARKER AND UIA ACTIONS
+# ============================================================
+
+# Real runs: the click marker's dot sat on the click point, so uia_click('7')
+# landed on MistAI's own Tk window (display stayed 0, the 'tk' window took
+# the foreground, the next search walked 'tk'). Now: the marker is inert and
+# shown after the click; MistAI's own windows are never "the window in front"
+# for reading; uia_click acts through UIA patterns and says when nothing
+# changed.
+
+
+# ============================================================
+# CLICK MARKER AND UIA ACTIONS TESTS
+# ============================================================
+
+def test_make_inert_sets_the_four_extended_styles_without_activating(monkeypatch):
+    from core import caption
+
+    calls = []
+    state = {"ex": caption.WS_EX_APPWINDOW | 0x100}
+
+    def set_long(h, idx, v):
+        calls.append(("set", h, idx))
+        state["ex"] = v
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        GetWindowLong=lambda h, idx: state["ex"], SetWindowLong=set_long,
+        SetWindowPos=lambda *a: calls.append(("pos",) + a)))
+    ex = caption.make_inert(0x1234)
+    for style in (caption.WS_EX_NOACTIVATE, caption.WS_EX_TRANSPARENT,
+                  caption.WS_EX_TOOLWINDOW, caption.WS_EX_LAYERED):
+        assert ex & style
+    assert not ex & caption.WS_EX_APPWINDOW and ex & 0x100           # the rest is kept
+    pos = next(c for c in calls if c[0] == "pos")
+    assert pos[1] == 0x1234 and pos[-1] & 0x0010                     # SWP_NOACTIVATE
+    assert caption.INERT_EX_STYLES == 0x08000000 | 0x20 | 0x80 | 0x80000
+
+
+def test_the_marker_is_made_inert_before_it_is_ever_shown(monkeypatch):
+    from core import caption
+
+    order = []
+
+    class Win:
+        def __init__(self, *_a):
+            order.append("create")
+
+        def __getattr__(self, name):
+            return lambda *a, **k: order.append(name)
+
+        def wm_frame(self):
+            return "0x77"
+
+    fake_tk = SimpleNamespace(Toplevel=Win, Canvas=lambda *a, **k: SimpleNamespace(
+        pack=lambda: None))
+    monkeypatch.setattr(caption, "make_inert", lambda h: order.append(("inert", h)) or 0x080800a8)
+    ind = caption.ClickIndicator.__new__(caption.ClickIndicator)
+    ind._tk, ind.root = fake_tk, object()
+    ind._build_marker()
+    assert order.index("withdraw") < order.index(("inert", 0x77)) < order.index("deiconify")
+    assert ind.hwnd == 0x77 and ind.ex_style == 0x080800a8
+
+
+def test_a_flash_moves_the_one_marker_and_never_creates_a_window(monkeypatch):
+    from core import caption
+
+    moves, created = [], []
+    win = SimpleNamespace(geometry=moves.append, after=lambda *a: None)
+    canvas = SimpleNamespace(delete=lambda *a: None, create_text=lambda *a, **k: None,
+                             create_oval=lambda *a, **k: None)
+    ind = caption.ClickIndicator.__new__(caption.ClickIndicator)
+    ind._tk = SimpleNamespace(Toplevel=lambda *a: created.append(1))
+    ind.marker, ind.canvas, ind._flash_id = win, canvas, 0
+    ind._flash(500, 400, "UIA", "7")
+    ind._flash(100, 100, "OCR", "")
+    assert created == [] and moves == ["70x70+465+365", "70x70+65+65"]
+
+
+def _click_order(monkeypatch, module):
+    events = []
+    monkeypatch.setattr(module.pyautogui, "moveTo", lambda *a, **k: events.append("move"))
+    monkeypatch.setattr(module.pyautogui, "click", lambda *a, **k: events.append("click"))
+    from core import caption
+    monkeypatch.setattr(caption, "get_indicator", lambda: SimpleNamespace(
+        show=lambda *a, **k: events.append("marker")))
+    return events
+
+
+def test_click_on_text_and_click_nth_show_the_marker_after_the_click(monkeypatch):
+    events = _click_order(monkeypatch, ch)
+    monkeypatch.setattr(ch.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(ch.pyautogui, "size", lambda: (1920, 1080))
+    h = ch.ImprovedClickHandler.__new__(ch.ImprovedClickHandler)
+    h.last_method, h.last_query, h._refused, h.last_refusal = "OCR", "7", False, ""
+    h.outside_target = lambda *a: ""
+    assert h._execute_click((500, 400)) is True
+    assert events == ["move", "click", "marker"]
+
+
+def test_click_coords_shows_the_marker_after_the_click(monkeypatch):
+    import core.api as api_mod
+    from core.api import Api
+
+    events = _click_order(monkeypatch, api_mod)
+    monkeypatch.setattr(api_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(api_mod.pyautogui, "size", lambda: (1920, 1080))
+    api = Api.__new__(Api)
+    api.click_handler = SimpleNamespace(outside_target=lambda *a: "", last_query="")
+    assert api._act_click_coords("500,400") is True
+    assert events == ["move", "click", "marker"]
+
+
+def _filter_world(monkeypatch, fg, windows):
+    """windows: z-order list of (hwnd, pid, title, visible, ex_style)."""
+    by = {w[0]: w for w in windows}
+    order = [w[0] for w in windows]
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        GetForegroundWindow=lambda: fg,
+        GetWindowText=lambda h: by[h][2],
+        GetWindow=lambda h, cmd: order[order.index(h) + 1] if order.index(h) + 1 < len(order) else 0,
+        IsWindowVisible=lambda h: by[h][3], IsIconic=lambda h: False,
+        GetWindowLong=lambda h, idx: by[h][4]))
+    monkeypatch.setitem(sys.modules, "win32process", SimpleNamespace(
+        GetWindowThreadProcessId=lambda h: (0, by[h][1])))
+
+
+_MARKER_OWN_PID = 4242
+_MARKER_Z_ORDER = [(1, _MARKER_OWN_PID, "tk", True, 0x080800a8),          # the click marker (ours, in front)
+           (2, _MARKER_OWN_PID, "MistAI v3", True, 0),            # MistAI's main window
+           (3, 77, "", True, 0),                      # untitled
+           (4, 78, "Hidden", False, 0),               # invisible
+           (5, 79, "A tool window", True, 0x80),      # WS_EX_TOOLWINDOW
+           (6, 80, "Calculator", True, 0),            # the app the task works in
+           (7, 81, "Notepad", True, 0)]
+
+
+def test_mistais_own_windows_are_never_the_window_in_front_for_reading(monkeypatch):
+    from core import live_state
+
+    _filter_world(monkeypatch, 1, _MARKER_Z_ORDER)
+    assert live_state.foreground_for_reading(own_pid=_MARKER_OWN_PID) == (6, "Calculator", True)
+    _filter_world(monkeypatch, 7, _MARKER_Z_ORDER)                       # another app in front: itself
+    assert live_state.foreground_for_reading(own_pid=_MARKER_OWN_PID) == (7, "Notepad", False)
+    _filter_world(monkeypatch, 1, _MARKER_Z_ORDER[:2])                   # nothing else: none
+    assert live_state.foreground_for_reading(own_pid=_MARKER_OWN_PID) == (0, "", True)
+
+
+def test_the_snapshot_title_skips_own_windows_but_the_hook_check_sees_the_real_one(monkeypatch):
+    from core import live_state
+
+    _filter_world(monkeypatch, 1, _MARKER_Z_ORDER)
+    sys.modules["win32gui"].EnumWindows = lambda cb, x: None
+    monkeypatch.setattr(live_state.os, "getpid", lambda: _MARKER_OWN_PID)
+    monkeypatch.setattr(live_state, "_visible_window_pids", lambda: set())
+    monkeypatch.setattr(live_state, "_uwp_frame_apps", lambda: [])
+    monkeypatch.setattr(live_state.psutil, "process_iter", lambda _a: [])
+    polled = []
+    tracker = live_state.LiveStateTracker.__new__(live_state.LiveStateTracker)
+    tracker._state, tracker._lock = {}, threading.Lock()
+    tracker.window_events = SimpleNamespace(check_poll=polled.append)
+    tracker._update()
+    snap = tracker._state
+    assert (snap["foreground_hwnd"], snap["foreground_window"]) == (6, "Calculator")
+    assert snap["own_window_in_front"] is True and polled == [1]
+
+
+class _Element:
+    """A UIA element stand-in: ``patterns`` it supports; records calls."""
+
+    def __init__(self, patterns, ctype="Button", fail=None):
+        self.calls, self.fail = [], fail
+        self.element_info = SimpleNamespace(control_type=ctype)
+        for iface, call in (("iface_invoke", "Invoke"), ("iface_toggle", "Toggle"),
+                            ("iface_selection_item", "Select")):
+            if iface in patterns:
+                setattr(self, iface, SimpleNamespace(**{call: self._recorder(call)}))
+
+    def _recorder(self, call):
+        def run():
+            self.calls.append(call)
+            if call == self.fail:
+                raise RuntimeError("COM error")
+        return run
+
+    def __getattr__(self, name):
+        if name.startswith("iface_"):
+            raise RuntimeError("NoPatternInterfaceError")
+        raise AttributeError(name)
+
+    def rectangle(self):
+        return SimpleNamespace(left=0, top=0, right=10, bottom=10)
+
+
+@pytest.mark.parametrize("patterns, ctype, how, calls", [
+    (("iface_invoke", "iface_toggle"), "Button", "invoke", ["Invoke"]),
+    (("iface_toggle",), "CheckBox", "toggle", ["Toggle"]),
+    (("iface_invoke", "iface_selection_item"), "ListItem", "select", ["Select"]),  # select, not open
+    ((), "Button", "click", []),                                   # no pattern: the mouse
+])
+def test_uia_actions_prefer_the_elements_pattern_over_a_mouse_click(patterns, ctype, how, calls):
+    nav = ch.EnhancedUIANavigator.__new__(ch.EnhancedUIANavigator)
+    clicked = []
+    nav.click_element = lambda el: clicked.append(el) or True
+    el = _Element(patterns, ctype)
+    assert nav.activate_element(el) == how
+    assert el.calls == calls and clicked == ([el] if how == "click" else [])
+
+
+def test_a_pattern_that_fails_is_never_retried_another_way(capsys):
+    nav = ch.EnhancedUIANavigator.__new__(ch.EnhancedUIANavigator)
+    clicked = []
+    nav.click_element = lambda el: clicked.append(el) or True
+    el = _Element(("iface_invoke", "iface_toggle"), fail="Invoke")
+    assert nav.activate_element(el) == "" and el.calls == ["Invoke"] and clicked == []
+    assert "[UIA] invoke failed (RuntimeError)" in capsys.readouterr().out
+
+
+def _uia_effect_api(monkeypatch, signatures, how="invoke"):
+    from core import caption
+    from core.api import Api
+
+    marker = []
+    monkeypatch.setattr(caption, "get_indicator", lambda: SimpleNamespace(
+        show=lambda *a, **k: marker.append("marker")))
+    import core.api as api_mod
+    monkeypatch.setattr(api_mod.time, "sleep", lambda _s: None)
+    sigs = list(signatures)
+    order = []
+    api = Api.__new__(Api)
+    api.live = SimpleNamespace(snapshot={"foreground_window": "Calculator"})
+    api.uia_nav = SimpleNamespace(
+        find_element_by_name=lambda w, n, partial=True: _Element(("iface_invoke",)),
+        window_signature=lambda w, fresh=True: sigs.pop(0) if len(sigs) > 1 else sigs[0],
+        activate_element=lambda el: order.append("act") or how,
+        click_element=lambda el: True)
+    api.last_result_text = ""
+    return api, marker, order
+
+
+def test_uia_click_reports_a_change_and_keeps_full_confidence(monkeypatch, capsys):
+    api, marker, order = _uia_effect_api(monkeypatch, [{"0"}, {"7"}])
+    assert api._act_uia_click("Seven") is True and api.last_uia_effect is True
+    assert api.last_result_text == "Clicked 'Seven' via UIA Invoke; the window's accessibility text changed."
+    assert order == ["act"] and marker == ["marker"]               # the marker after the action
+    assert capsys.readouterr().out.strip() == "[UIA] invoke; window text changed"
+
+
+def test_uia_click_says_so_when_nothing_changed_and_confidence_drops(monkeypatch, tmp_path):
+    from core.executor import Executor, METHOD_CONFIDENCE
+    from core.tools import ToolRegistry
+
+    api, marker, order = _uia_effect_api(monkeypatch, [{"0"}])    # the same tree every read
+    assert api._act_uia_click("Seven") is True and api.last_uia_effect is False
+    assert "NOTHING in the window's accessibility text changed" in api.last_result_text
+    # Through the Executor: still a success (no fallback click), lower confidence.
+    api.tools = ToolRegistry(db_path=str(tmp_path / "t.db"))
+    api._exec_sync = lambda a, p: api._act_uia_click(p)
+    api.bus, api.memory = None, SimpleNamespace(add_action=lambda *a: None)
+    api.screen = SimpleNamespace(mark_action=lambda: None)
+    api.task_memory = None
+    try:
+        monkeypatch.setattr("core.executor.settle_after", lambda *a, **k: None)
+        monkeypatch.setattr(Executor, "_in_browser", lambda self: False)
+        monkeypatch.setattr(Executor, "_finalize", lambda self, res, spec: None)
+        res = Executor(api).run("uia_click", "Seven")
+        assert res.success and res.method == "UIA-unchanged"
+        assert res.confidence == METHOD_CONFIDENCE["UIA-unchanged"] < METHOD_CONFIDENCE["UIA"]
+        assert "showed no change" in res.reliability_note() and not res.escalate_to_user
+        api.uia_nav.window_signature = lambda w, fresh=True: {"0"} if not fresh else {"7"}
+        res = Executor(api).run("uia_click", "Seven")
+        assert res.method == "UIA" and res.confidence == METHOD_CONFIDENCE["UIA"]
+    finally:
+        api.tools._conn and api.tools._conn.close()

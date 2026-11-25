@@ -18,7 +18,8 @@
 #   8. SYSTEM ACTION HANDLERS
 #   9. WINDOW ACTIONS
 #   10. WINDOW ACTION HANDLERS
-#   11. API CLASS
+#   11. SAVE AS DIALOG HANDLER
+#   12. API CLASS
 # ============================================================
 
 """
@@ -49,6 +50,9 @@ import speech_recognition as sr
 
 from .agent import NOT_VISIBLE_ON_SCREEN, AgentLoop
 from .config import (
+    SAVE_BOX_POLL_S,
+    SAVE_NAME_BOX_WAIT_S,
+    spelled_key_name,
     APIKeyManager,
     describe_api_error,
     model_chain,
@@ -651,6 +655,351 @@ class WindowActionsMixin:
         )
         self.speak(self.last_result_text)
         return ok
+
+# ============================================================
+# SAVE AS DIALOG HANDLER
+# ============================================================
+
+    # save_file_as(path): the keyboard route through the foreground app's Save
+    # As dialog, one fixed sequence: Ctrl+S, a new window of the same process,
+    # the file-name box found through UIA by role and name prefix (walked by
+    # the dialog's handle), select all, the full path typed once, Enter, a
+    # replace prompt answered from the agent's confirmation, the file checked
+    # on disk. It stops (and says where) at the first step that does not hold;
+    # it never types a path when no dialog appeared. Logs: fixed labels only.
+    SAVE_DIALOG_WAIT_S = 3.0      # Ctrl+S -> the dialog in front
+    SAVE_CLOSE_WAIT_S = 6.0       # Enter -> the dialog gone (or a prompt)
+    SAVE_FILE_WAIT_S = 2.0        # the dialog gone -> the file on disk
+    SAVE_TITLE_WAIT_S = 1.0       # ... and the document's title updated
+    SAVE_NAME_BOX_WAIT_S = SAVE_NAME_BOX_WAIT_S   # the dialog in front -> its file-name box
+    SAVE_POLL_S = 0.1
+    SAVE_PATH_MAX = 260
+    SAVE_NAME_PREFIX = "file name"    # the file-name box: an Edit named "File name:"
+    SAVE_NAME_ID = "1001"             # its AutomationId in the common file dialog
+    SAVE_DIALOG_CLASS = "#32770"
+
+    def _save_path_problem(self, path):
+        """Why ``path`` cannot be a save target, or ''."""
+        if not path:
+            return "no path was given (save_file_as needs the full path with the file name)."
+        if "\n" in path or "\r" in path or len(path) > self.SAVE_PATH_MAX:
+            return "the path is not one line of at most 260 characters."
+        if not os.path.isabs(path) or not os.path.basename(path):
+            return "the path must be a full path that ends with the file name."
+        if os.path.isdir(path):
+            return "that path is a folder; add the file name."
+        if not os.path.isdir(os.path.dirname(path)):
+            return "its folder does not exist (create it first)."
+        return ""
+
+    @staticmethod
+    def _save_window(hwnd):
+        """(hwnd, pid, title, class) of a window; zeros when it is gone."""
+        try:
+            import win32gui
+            import win32process
+
+            if not hwnd or not win32gui.IsWindow(hwnd):
+                return (0, 0, "", "")
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            return (hwnd, pid, win32gui.GetWindowText(hwnd), win32gui.GetClassName(hwnd))
+        except Exception:
+            return (0, 0, "", "")
+
+    def _save_foreground(self):
+        try:
+            import win32gui
+
+            return self._save_window(win32gui.GetForegroundWindow())
+        except Exception:
+            return (0, 0, "", "")
+
+    @staticmethod
+    def _save_window_shown(hwnd):
+        try:
+            import win32gui
+
+            return bool(hwnd) and bool(win32gui.IsWindow(hwnd)) and bool(
+                win32gui.IsWindowVisible(hwnd))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _save_owner(hwnd):
+        """The window that owns a dialog (the document window), or 0."""
+        try:
+            import win32con
+            import win32gui
+
+            return win32gui.GetWindow(hwnd, win32con.GW_OWNER) or 0
+        except Exception:
+            return 0
+
+    def _save_wait(self, condition, timeout):
+        """Wait for ``condition()``: woken by window events when they are
+        healthy, else polled; True when it held within ``timeout`` s."""
+        watched = getattr(getattr(self, "live", None), "window_events", None)
+        if isinstance(watched, clip.WindowEvents) and watched.healthy():
+            return watched.wait_for(condition, timeout, poll=self.SAVE_POLL_S)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if condition():
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.SAVE_POLL_S)
+
+    def _save_name_box(self, hwnd):
+        """(element info, how) of the dialog's file-name box, or (None, '')."""
+        nav = getattr(self, "uia_nav", None)
+        find = getattr(nav, "find_in_window", None)
+        if not callable(find):
+            return None, ""
+        return find(hwnd, "Edit", self.SAVE_NAME_PREFIX, self.SAVE_NAME_ID)
+
+    @staticmethod
+    def _save_field_value(element):
+        """The text in an edit box through UIA (ValuePattern), or None."""
+        for read in (lambda: element.get_value(),
+                     lambda: element.iface_value.CurrentValue,
+                     lambda: element.legacy_properties()["Value"]):
+            try:
+                value = read()
+            except Exception:
+                continue
+            if value is not None:
+                return str(value)
+        return None
+
+    def _save_press_button(self, hwnd, name):
+        """Invoke the button named ``name`` (prefix) in window ``hwnd``."""
+        nav = getattr(self, "uia_nav", None)
+        find = getattr(nav, "find_in_window", None)
+        if not callable(find):
+            return False
+        info, _how = find(hwnd, "Button", name)
+        if info is None:
+            return False
+        try:
+            info.element.invoke()
+            return True
+        except Exception:
+            return bool(nav.click_element(info.element))
+
+    def _save_wait_name_box(self, hwnd):
+        """(element info, how, seconds waited, looks): the file-name box looked
+        for again every SAVE_BOX_POLL_S (woken early by window events when they
+        are healthy) until it is in the tree or SAVE_NAME_BOX_WAIT_S passed.
+        The first look costs no wait."""
+        started = time.monotonic()
+        found = {"box": (None, ""), "looks": 0}
+
+        def ready():
+            found["looks"] += 1
+            found["box"] = self._save_name_box(hwnd)
+            return found["box"][0] is not None
+
+        if not ready():
+            watched = getattr(getattr(self, "live", None), "window_events", None)
+            if isinstance(watched, clip.WindowEvents) and watched.healthy():
+                # Re-checked on every window event and at least every poll.
+                watched.wait_for(ready, self.SAVE_NAME_BOX_WAIT_S, poll=SAVE_BOX_POLL_S)
+            else:
+                deadline = started + self.SAVE_NAME_BOX_WAIT_S
+                while time.monotonic() < deadline:
+                    time.sleep(min(SAVE_BOX_POLL_S, max(0.0, deadline - time.monotonic())))
+                    if ready():
+                        break
+        box, how = found["box"]
+        return box, how, time.monotonic() - started, found["looks"]
+
+    def _save_stop(self, label, text):
+        print(f"[SaveAs] stopped: {label}")
+        self.last_result_text = f"NOT SAVED: {text}"
+        return False
+
+    def _act_save_file_as(self, param):
+        raw = str(param or "").strip().strip('"').strip()
+        resolve = getattr(self, "_resolve_path_placeholders", None)
+        path = raw
+        if raw and callable(resolve):
+            path = resolve(raw)
+        path = os.path.expandvars(os.path.expanduser(path)) if path else ""
+        problem = self._save_path_problem(path)
+        if problem:
+            return self._save_stop("bad path", problem + " Nothing was pressed.")
+        path = os.path.normpath(path)
+        name = os.path.basename(path)
+
+        report, on_target = self._ensure_input_target("save shortcut")
+        if not on_target:
+            print(f"[SaveAs] {self._input_report_for_log(report, False)}")
+            self.last_result_text = report
+            return False
+
+        existed = os.path.isfile(path)     # True only after the user approved replacing it
+        started = time.time()
+        front = self._save_foreground()
+        if not front[0]:
+            return self._save_stop("no window", "no window is in front. Nothing was pressed.")
+
+        # 1. The dialog: already open (an earlier Ctrl+S), else Ctrl+S opens it.
+        dialog, doc_hwnd = None, 0
+        if front[3] == self.SAVE_DIALOG_CLASS and self._save_name_box(front[0])[0] is not None:
+            dialog, doc_hwnd = front, self._save_owner(front[0])
+            doc_title = self._save_window(doc_hwnd)[2] if doc_hwnd else ""
+            print("[SaveAs] a Save As dialog was already in front")
+        else:
+            doc_hwnd, doc_title = front[0], front[2]
+            pyautogui.hotkey("ctrl", "s")
+            seen = {}
+
+            def appeared():
+                now = self._save_foreground()
+                if now[0] and now[0] != front[0]:
+                    seen["w"] = now
+                    return True
+                return False
+
+            self._save_wait(appeared, self.SAVE_DIALOG_WAIT_S)
+            new = seen.get("w")
+            if new is None:
+                after = self._save_window(front[0])
+                saved_in_place = bool(after[0]) and after[2] != front[2]
+                return self._save_stop(
+                    "no dialog",
+                    "no Save As dialog appeared after Ctrl+S, so nothing was typed."
+                    + (" The window title changed, so the document was probably saved in place "
+                       "under its existing name." if saved_in_place else "")
+                    + " To save under this path, open the app's Save As (for example hotkey "
+                      "ctrl+shift+s) and call save_file_as again; it uses an open dialog.")
+            if new[1] != front[1]:
+                return self._save_stop(
+                    "other app",
+                    "after Ctrl+S a window of another app came to the front instead of a Save As "
+                    "dialog. Nothing was typed.")
+            dialog = new
+            print("[SaveAs] dialog appeared")
+
+        # 2. The file-name box: by role and name prefix (never with its value).
+        # A new dialog can be in front before its box is in the tree: look again.
+        box, how, waited, looks = self._save_wait_name_box(dialog[0])
+        if box is None:
+            return self._save_stop(
+                f"no file-name box (waited {waited:.2f}s, {looks} looks)",
+                "a dialog opened, but no file-name box was found in it through the "
+                "accessibility tree. Nothing was typed; the dialog is still open.")
+        if looks > 1:
+            print(f"[SaveAs] file-name box ready after {waited:.2f}s ({looks} looks)")
+        print(f"[SaveAs] file-name box found by {how}")
+
+        # 3. Replace its content: focus, select all, the full path typed once.
+        try:
+            box.element.set_focus()
+        except Exception:
+            return self._save_stop("focus failed",
+                                   "the file-name box could not be focused. Nothing was typed; "
+                                   "the dialog is still open.")
+        time.sleep(0.1)
+        if self._save_foreground()[0] != dialog[0]:
+            return self._save_stop("dialog not in front",
+                                   "the dialog is no longer in front. Nothing was typed.")
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.05)
+        if not clip.send_unicode(path):
+            return self._save_stop("typing failed",
+                                   "typing the path into the file-name box failed; Enter was not "
+                                   "pressed and the dialog is still open.")
+        time.sleep(0.15)
+        value = self._save_field_value(box.element)
+        match = (None if value is None
+                 else os.path.normcase(value.strip()) == os.path.normcase(path))
+        print(f"[SaveAs] typed {len(path)} chars, read back: "
+              + {None: "unreadable", True: "match", False: "mismatch"}[match])
+        if match is False:
+            return self._save_stop(
+                "field mismatch",
+                "after typing, the file-name box does not hold exactly the path (an "
+                "autocomplete?). Enter was not pressed; the dialog is still open.")
+
+        # 4. Enter; then the dialog closes, or a prompt of the same app appears.
+        pyautogui.press("enter")
+        outcome = {}
+
+        def settled():
+            if not self._save_window_shown(dialog[0]):
+                outcome["k"] = "closed"
+                return True
+            now = self._save_foreground()
+            if now[0] and now[0] not in (dialog[0], doc_hwnd) and now[1] == dialog[1]:
+                outcome["k"], outcome["w"] = "prompt", now
+                return True
+            return False
+
+        self._save_wait(settled, self.SAVE_CLOSE_WAIT_S)
+        if outcome.get("k") == "prompt":
+            prompt = outcome["w"]
+            nav = getattr(self, "uia_nav", None)
+            find = getattr(nav, "find_in_window", None)
+            has_yes = callable(find) and find(prompt[0], "Button", "yes")[0] is not None
+            if not has_yes:
+                return self._save_stop(
+                    "message",
+                    "after Enter the app showed a message instead of saving (it was left open; "
+                    "read it). The Save As dialog is still open.")
+            if not existed:
+                pressed = self._save_press_button(prompt[0], "no")
+                if not pressed:
+                    pyautogui.press("escape")
+                print("[SaveAs] replace prompt: not approved, answered no")
+                return self._save_stop(
+                    "not replaced",
+                    f"a file named '{name}' already exists there and replacing it was not "
+                    "approved, so it was NOT replaced and nothing was overwritten. The Save As "
+                    "dialog is still open.")
+            print("[SaveAs] replace prompt: approved, answered yes")
+            if not self._save_press_button(prompt[0], "yes"):
+                return self._save_stop(
+                    "replace prompt",
+                    "the replace prompt's Yes button could not be pressed; nothing was replaced "
+                    "and the prompt is still open.")
+            self._save_wait(lambda: not self._save_window_shown(dialog[0]),
+                            self.SAVE_CLOSE_WAIT_S)
+            if self._save_window_shown(dialog[0]):
+                return self._save_stop("dialog still open",
+                                       "the Save As dialog is still open after Yes.")
+        elif outcome.get("k") != "closed":
+            return self._save_stop(
+                "dialog still open",
+                "the Save As dialog is still open after Enter. Read it before trying again.")
+
+        # 5. Verify: the file on disk, written now; the document's title.
+        def written():
+            try:
+                return os.path.isfile(path) and os.path.getmtime(path) >= started - 2
+            except OSError:
+                return False
+
+        if not self._save_wait(written, self.SAVE_FILE_WAIT_S):
+            return self._save_stop(
+                "file missing",
+                f"the dialog closed, but no file was written at {path}. Do not report it "
+                "as saved.")
+        renamed = self._save_wait(
+            lambda: self._save_window(doc_hwnd)[2] not in ("", doc_title),
+            self.SAVE_TITLE_WAIT_S) if doc_hwnd else False
+        title = self._save_window(doc_hwnd)[2][:60] if doc_hwnd else ""
+        size = os.path.getsize(path)
+        print(f"[SaveAs] saved (file checked, title changed: {'yes' if renamed else 'no'})")
+        self.last_result_text = (
+            f"Saved to {path} (checked on disk: {size} bytes"
+            + (f"; the window title is now '{title}'" if renamed
+               else "; the window title did not change")
+            + ")." + (" It replaced the existing file, as approved." if existed else ""))
+        return True
 
 
 # ============================================================
@@ -2673,6 +3022,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 return self.switch_to_app(param)
             elif action == "uia_find_input":
                 return self._act_uia_find_input(param)
+            elif action == "save_file_as":
+                return self._act_save_file_as(param)
             elif action == "window_list":
                 return self._act_window_list()
             elif action == "window_activate":
@@ -3268,6 +3619,11 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             time.sleep(0.4)
         return False
 
+    # After a uia_click: re-read the window's tree after each of these waits
+    # until it differs from before (a changed display, a checked box...).
+    UIA_EFFECT_WAITS = (0.15, 0.25, 0.35)
+    last_uia_effect = None      # True changed | False unchanged | None not checked
+
     def _act_uia_click(self, param):
         """Find and click an element by its accessible name using UIA --
         reads the real UI tree instead of guessing pixel coordinates from a
@@ -3278,27 +3634,63 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             self.last_result_text = "No foreground window to search."
             return False
 
-        element = self.uia_nav.find_element_by_name(fw, param, partial=True)
+        # One or two characters: the whole name, never a substring ("7" is in
+        # "Display is 37"); then, for a key, its spelled-out name ("Seven").
+        short = len(str(param or "").strip()) <= 2
+        element = self.uia_nav.find_element_by_name(fw, param, partial=not short)
+        spelled = "" if element else spelled_key_name(param)
+        if spelled:
+            element = self.uia_nav.find_element_by_name(fw, spelled, partial=False)
+            print(f"[UIA] retried with the spelled-out key name: "
+                  f"{'found' if element else 'not found'}")
         if element:
-            try:
-                rect = element.rectangle()
-                from .caption import get_indicator
+            # What the window's tree says now (the walk the lookup just made),
+            # to tell afterwards whether the action changed anything.
+            sig = getattr(self.uia_nav, "window_signature", None)
+            before = sig(fw, fresh=False) if callable(sig) else None
+            activate = getattr(self.uia_nav, "activate_element", None)
+            how = activate(element) if callable(activate) else (
+                "click" if self.uia_nav.click_element(element) else "")
+            if how:
+                try:
+                    rect = element.rectangle()
+                    from .caption import get_indicator
 
-                get_indicator().show(
-                    (rect.left + rect.right) // 2,
-                    (rect.top + rect.bottom) // 2,
-                    method="UIA",
-                    label=param,
-                )
-            except Exception:
-                pass  # debug-only; never block the real click
-            ok = self.uia_nav.click_element(element)
-            self.last_result_text = (
-                f"Clicked '{param}' via UIA"
-                if ok
-                else f"Found '{param}' but click failed"
-            )
-            return ok
+                    get_indicator().show(            # after the action, never before
+                        (rect.left + rect.right) // 2,
+                        (rect.top + rect.bottom) // 2,
+                        method="UIA",
+                        label=param,
+                    )
+                except Exception:
+                    pass  # debug-only; never block the real click
+            name = f"'{param}'" + (f" (the button named '{spelled}')" if spelled else "")
+            if not how:
+                self.last_uia_effect = None
+                self.last_result_text = f"Found {name} but the UIA action failed"
+                return False
+            changed = None
+            if before is not None:
+                changed = False
+                for wait in self.UIA_EFFECT_WAITS:
+                    time.sleep(wait)
+                    after = sig(fw, fresh=True)
+                    if after is None:
+                        changed = None
+                        break
+                    if after != before:
+                        changed = True
+                        break
+            self.last_uia_effect = changed
+            route = {"invoke": "UIA Invoke", "toggle": "UIA Toggle", "select": "UIA Select",
+                     "click": "a mouse click (no UIA pattern)"}.get(how, how)
+            print(f"[UIA] {how}; window text {'changed' if changed else 'unchanged' if changed is False else 'not checked'}")
+            self.last_result_text = f"Clicked {name} via {route}" + (
+                "; the window's accessibility text changed." if changed
+                else "; but NOTHING in the window's accessibility text changed afterwards, so it "
+                     "may not have taken effect -- check the result before relying on it."
+                if changed is False else ".")
+            return True
 
         self.last_result_text = f"'{param}' not found in the UIA element tree of '{fw}'"
         return False
@@ -3969,15 +4361,15 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     if refusal:
                         self.last_result_text = refusal
                         return False
-                    try:
-                        from .caption import get_indicator
-
-                        get_indicator().show(x, y, method="coords")
-                    except Exception:
-                        pass  # debug-only; never block the real click
                     pyautogui.moveTo(x, y, duration=0.2)
                     time.sleep(0.08)
                     pyautogui.click()
+                    try:
+                        from .caption import get_indicator
+
+                        get_indicator().show(x, y, method="coords")   # after the click
+                    except Exception:
+                        pass  # debug-only; never block the real click
                     time.sleep(0.3)
                     return True
             return False
@@ -4605,7 +4997,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             import win32gui
             import win32process
 
-            hwnd, kind = win32gui.GetForegroundWindow(), "exact"
+            # The window in front for reading: never MistAI's own overlays.
+            hwnd, kind = clip.foreground_for_reading()[0], "exact"
             if asked and not self._window_belongs_to(hwnd, asked):
                 other = self._find_hwnd_by_process_name(asked)
                 hwnd, kind = (other, "background") if other else (hwnd, "other")

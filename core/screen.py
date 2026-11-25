@@ -72,10 +72,9 @@ def _frame_digest(img):
 def _foreground_identity():
     """(hwnd, title hash) of the window in front; the title stays in memory."""
     try:
-        import win32gui
+        from .live_state import foreground_for_reading
 
-        hwnd = win32gui.GetForegroundWindow()
-        title = win32gui.GetWindowText(hwnd) if hwnd else ""
+        hwnd, title, _own = foreground_for_reading()   # never MistAI's own overlays
     except Exception:
         return None
     return int(hwnd or 0), hashlib.blake2b(title.encode("utf-8", "replace"),
@@ -673,7 +672,10 @@ def foreground_uia_text(hwnd=None, budget=1.5, cap=TEXT_CAP):
     try:
         import win32gui
 
-        hwnd = hwnd or win32gui.GetForegroundWindow()
+        if not hwnd:
+            from .live_state import foreground_for_reading
+
+            hwnd = foreground_for_reading()[0]      # never MistAI's own overlays
         title = win32gui.GetWindowText(hwnd)
     except Exception:
         return "", title

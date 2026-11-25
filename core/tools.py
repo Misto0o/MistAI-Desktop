@@ -362,6 +362,16 @@ SPECS = dict(
             categories=("type",),
         ),
         _T("hotkey", settle=0.2, base_confidence=0.9, categories=("type",)),
+        # The keyboard route through a Save As dialog; it checks the file on
+        # disk itself. An existing target file asks first (is_destructive).
+        _T(
+            "save_file_as",
+            requires_focus=True,
+            expected_runtime=3.0,
+            settle=0.3,
+            base_confidence=0.95,
+            categories=("type", "file"),
+        ),
         _T("press_key", settle=0.2, base_confidence=0.95, categories=("type",)),
         _T("scroll", settle=0.2, base_confidence=0.9, categories=("navigation",)),
         _T(
@@ -625,10 +635,17 @@ _PLAYBOOK = {
         "it only appends). It does NOT submit: follow it with press_key('enter'){submit_hint}",
         "text",
         "For a command, expression, or form, submit it with press_key('enter') or end the "
-        "text with the app's submit key."),
+        "text with the app's submit key. After hotkey ctrl+a it types over the selection, "
+        "so no Delete is needed."),
     "type_search": ("Type text and press Enter", "text"),
     "hotkey": ("Press a key combo", "ctrl+t"),
     "press_key": ("Press one key (a combo is hotkey)", "key"),
+    "save_file_as": (
+        "Save the document in front via its Save As dialog (checked on disk)", "full file path",
+        "Types the path once into the dialog's file-name box, never into the document; uses a "
+        "Save As dialog that is already open; stops and says where when no dialog appears. "
+        "Replacing an existing file asks the user first.",
+        "{documents}\\notes.txt"),
     "scroll": ("Scroll the window", "up or down"),
     "quick_message": (
         "Send a message to a named person (try this first)", "app|recipient|message",
@@ -871,18 +888,23 @@ class ToolRegistry:
     def fallbacks(self, name):
         return self.get(name).fallback_tools
 
-    def is_destructive(self, action, parameter="", resolve_path=None, enter_safe=False):
+    def is_destructive(self, action, parameter="", resolve_path=None, enter_safe=False,
+                       dialog_key_safe=False):
         """Single source of truth for the confirmation gate. Mirrors (and
         can replace) AgentLoop._is_destructive. enter_safe: press_key Enter
         goes to an app this phase opened, in front, outside the
-        browser/messaging/mail/terminal categories (Api.enter_target_is_safe)."""
+        browser/messaging/mail/terminal categories (Api.enter_target_is_safe).
+        dialog_key_safe: press_key Enter/Delete inside the file dialog this
+        phase's own dialog key opened (AgentLoop._own_dialog_key)."""
         if action == "run_command":
             return command_is_mutating(parameter)
-        if action in ("write_file", "patch_json", "patch_file"):
+        if action in ("write_file", "patch_json", "patch_file", "save_file_as"):
             # Writing a NEW file is harmless; silently replacing an existing
             # one is not, and nothing else in the system checks this.
             try:
                 path = str(parameter or "").split("|||", 1)[0].strip()
+                if action == "save_file_as":
+                    path = path.strip('"').strip()
                 if not path:
                     return False
                 if callable(resolve_path):
@@ -898,6 +920,9 @@ class ToolRegistry:
         if action in ("press_key", "browser_press_key"):
             if action == "press_key" and enter_safe and normalized_key in {"enter", "return"}:
                 return False
+            if action == "press_key" and dialog_key_safe and normalized_key in {
+                    "enter", "return", "delete"}:
+                return False
             return normalized_key in {"enter", "return", "delete"}
         if action == "click_coords":
             # Raw pixels provide no semantic label from which to distinguish
@@ -911,7 +936,8 @@ class ToolRegistry:
             return bool(_DANGEROUS_CLICK_TEXT_RX.search(text))
         return self.get(action).destructive
 
-    def requires_confirmation(self, action, parameter="", resolve_path=None, enter_safe=False):
+    def requires_confirmation(self, action, parameter="", resolve_path=None, enter_safe=False,
+                              dialog_key_safe=False):
         """Whether AgentLoop must ask before running this action.
 
         Most confirmation-worthy operations are destructive dynamically (for
@@ -921,7 +947,8 @@ class ToolRegistry:
         """
         spec = self.get(action)
         return spec.requires_confirmation or self.is_destructive(
-            action, parameter, resolve_path=resolve_path, enter_safe=enter_safe
+            action, parameter, resolve_path=resolve_path, enter_safe=enter_safe,
+            dialog_key_safe=dialog_key_safe,
         )
 
     # -- Learned reliability (design doc #7: statistics, not ML) -------------

@@ -12,13 +12,14 @@
 #   4. COORDINATE VALIDATION
 #   5. WORD SUFFIXES
 #   6. TEXT MATCH SCORE
-#   7. COMPACT TEXT FORM
-#   8. COMPACT MATCH SCORE
-#   9. CLICK HANDLER CLASS
-#   10. UIA NAVIGATION
-#   11. OPTIONAL UIA LIBRARY
-#   12. UIA ELEMENT INFO
-#   13. UIA NAVIGATOR
+#   7. SHORT OCR TARGETS
+#   8. COMPACT TEXT FORM
+#   9. COMPACT MATCH SCORE
+#   10. CLICK HANDLER CLASS
+#   11. UIA NAVIGATION
+#   12. OPTIONAL UIA LIBRARY
+#   13. UIA ELEMENT INFO
+#   14. UIA NAVIGATOR
 # ============================================================
 
 """
@@ -166,6 +167,26 @@ def _match_score(candidate_lower: str, query_lower: str) -> int:
     if abs(len(candidate_lower) - len(query_lower)) > 1:
         return 0  # too different in length to plausibly be the same word
     return int(difflib.SequenceMatcher(None, candidate_lower, query_lower).ratio() * 100)
+
+
+# ============================================================
+# SHORT OCR TARGETS
+# ============================================================
+
+# A 1-2 character target ("2", "+4", "OK") only matches an OCR word that IS
+# it (case-insensitive; surrounding punctuation such as "(2)" or "2," is
+# ignored). Fuzzy scoring let "52" and "x2" pass as "2" (ratio 66 >= 65); with
+# no exact word the click falls through to UIA or vision as before.
+SHORT_TARGET_MAX = 2
+
+
+def _ocr_score(word_lower: str, query_lower: str) -> int:
+    """_match_score for OCR words, exact whole-word only for short targets."""
+    query_lower = query_lower.strip()
+    if len(query_lower) <= SHORT_TARGET_MAX:
+        word_lower = word_lower.strip()
+        return 100 if query_lower in (word_lower, re.sub(r"^[\W_]+|[\W_]+$", "", word_lower)) else 0
+    return _match_score(word_lower, query_lower)
 
 
 # ============================================================
@@ -590,7 +611,9 @@ class ImprovedClickHandler:
         best_match, best_word, best_score = None, "", 0
         seen_words = []
         for i, word in enumerate(data["text"]):
-            if not word.strip() or len(word) < 2:
+            # One-character words are noise, except the exact one-character
+            # target itself ("2" for a keypad digit).
+            if not word.strip() or (len(word) < 2 and word.strip().lower() != ql.strip()):
                 continue
             try:
                 conf = int(data["conf"][i])
@@ -602,7 +625,7 @@ class ImprovedClickHandler:
             y = data["top"][i] + data["height"][i] // 2
             seen_words.append((word, x, y))
             wl = word.lower()
-            score = _match_score(wl, ql)
+            score = _ocr_score(wl, ql)
             if score >= OCR_MATCH_SCORE and score > best_score:
                 best_score = score
                 best_word = word
@@ -774,7 +797,7 @@ class ImprovedClickHandler:
             ).strip()
             if not text or len(text) < 2:
                 continue
-            score = _match_score(text.lower(), query.lower())
+            score = _ocr_score(text.lower(), query.lower())
             if score > best_score:
                 best_score = score
                 best_word = text
@@ -947,20 +970,22 @@ class ImprovedClickHandler:
                 self.last_refusal = refusal
                 return False
 
-            self._show_debug_marker(x, y)
             # The floating orb docks beside what the task touches (a point here).
             self.last_element_rect = ((x, y), time.monotonic())
 
             pyautogui.moveTo(x, y, duration=0.2)
             time.sleep(0.1)
             pyautogui.click()
+            # The debug marker only AFTER the click was sent: it never sits
+            # between the pointer and the target.
+            self._show_debug_marker(x, y)
             time.sleep(0.5)
             return True
         except Exception:
             return False
 
     def _show_debug_marker(self, x, y):
-        """Flash a color-coded dot at the exact pixel about to be clicked --
+        """Flash a color-coded dot at the exact pixel just clicked --
         green=OCR, blue=UIA, orange=Vision. Lets you SEE a mis-resolved
         coordinate (a Vision guess landing next to the real button, say)
         instead of having to infer it from logs after the fact.
@@ -1238,7 +1263,40 @@ class EnhancedUIANavigator:
         # boxes are conventionally docked at the bottom of the window.
         candidates.sort(key=lambda info: info.rect[3] if info.rect else 0, reverse=True)
         return candidates[0].element
-    
+
+    @staticmethod
+    def name_has_prefix(name, prefix):
+        """'File name:' has the prefix 'file name' (case, spaces and a
+        trailing colon ignored). The prefix never carries a field's value."""
+        def norm(text):
+            return " ".join(str(text or "").lower().split()).rstrip(":").strip()
+        want = norm(prefix)
+        return bool(want) and norm(name).startswith(want)
+
+    def find_in_window(self, hwnd, control_type, name_prefix="", automation_id=""):
+        """The first element of ``control_type`` in the window with this
+        handle whose name has ``name_prefix`` (else whose AutomationId is
+        ``automation_id``), as (UIAElementInfo, "name"|"automation id"), or
+        (None, ""). Walks the window by HANDLE, never cached: an owned dialog
+        (a Save As box) is not among the top-level windows the title lookup
+        searches, so that lookup finds nothing in it."""
+        if not self.available or not hwnd:
+            return None, ""
+        try:
+            win = Desktop(backend="uia").window(handle=int(hwnd)).wrapper_object()
+            found = [UIAElementInfo(el) for el in win.descendants(control_type=control_type)]
+        except Exception as e:
+            print(f"[UIANav] window walk failed: {type(e).__name__}")
+            return None, ""
+        usable = [i for i in found if i.enabled is not False]
+        for info in usable:
+            if name_prefix and self.name_has_prefix(info.name, name_prefix):
+                return info, "name"
+        for info in usable:
+            if automation_id and info.automation_id == automation_id:
+                return info, "automation id"
+        return None, ""
+
 
     def find_element_info(self, window_title, element_name, partial=True):
         """Returns the full UIAElementInfo (name, AutomationId, control type,
@@ -1295,6 +1353,56 @@ class EnhancedUIANavigator:
         return lines
 
     # -- Interaction --------------------------------------------------------
+
+    # Items whose Invoke usually means "open" while a click means "select".
+    SELECT_FIRST_TYPES = ("ListItem", "TreeItem", "TabItem", "DataItem")
+
+    def activate_element(self, element):
+        """Act on an element through its UIA pattern -- Invoke, Toggle or
+        SelectionItem.Select, whichever it supports (items: Select first) --
+        and only without any of them by a mouse click. Returns "invoke" |
+        "toggle" | "select" | "click", or "" when it failed. A pattern that
+        exists but fails is a failure (never retried another way: the
+        action may have half-run). No pointer move, no focus needed."""
+        if element is None:
+            return ""
+        try:
+            ctype = getattr(element.element_info, "control_type", "") or ""
+        except Exception:
+            ctype = ""
+        routes = [("invoke", "iface_invoke", "Invoke"), ("toggle", "iface_toggle", "Toggle"),
+                  ("select", "iface_selection_item", "Select")]
+        if ctype in self.SELECT_FIRST_TYPES:
+            routes = [routes[2], routes[0], routes[1]]
+        for how, iface_name, call in routes:
+            try:
+                iface = getattr(element, iface_name)
+            except Exception:
+                continue                      # pattern not supported: next route
+            if iface is None:
+                continue
+            try:
+                getattr(iface, call)()
+            except Exception as e:
+                print(f"[UIA] {how} failed ({type(e).__name__})")
+                return ""
+            try:
+                r = element.rectangle()
+                self.last_element_rect = ((r.left, r.top, r.right, r.bottom), time.monotonic())
+            except Exception:
+                pass
+            return how
+        return "click" if self.click_element(element) else ""
+
+    def window_signature(self, window_title, fresh=True):
+        """What a window's accessibility tree says (control type, name and
+        value of each element), to tell whether an action changed anything.
+        fresh=False reuses the walk the last lookup made. None when the
+        window has no readable tree."""
+        elements = self._get_cached_elements(window_title, force_refresh=fresh)
+        if not elements:
+            return None
+        return frozenset((i.control_type, i.name, i.value) for i in elements)
 
     def click_element(self, element):
         if element is None:

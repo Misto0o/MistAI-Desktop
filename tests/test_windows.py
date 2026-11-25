@@ -39,6 +39,14 @@
 #   32. WINDOW EVENTS
 #   33. WINDOW EVENTS HELPERS
 #   34. WINDOW EVENTS TESTS
+#   35. SAVE AS DIALOG
+#   36. SAVE AS DIALOG HELPERS
+#   37. SAVE AS DIALOG TESTS
+#   38. CLIPBOARD WIN32 CALLS
+#   39. CLIPBOARD WIN32 CALLS TESTS
+#   40. CLIPBOARD WRITE BLOCK
+#   41. CLIPBOARD WRITE BLOCK HELPERS
+#   42. CLIPBOARD WRITE BLOCK TESTS
 # ============================================================
 
 """Windows and input targets, restore after a task, clipboard reliability."""
@@ -1151,6 +1159,10 @@ def _fake_win32(monkeypatch, fail_open=False):
                            IsClipboardFormatAvailable=lambda f: True,
                            GetClipboardData=lambda f: "clip text", CF_UNICODETEXT=13)
     monkeypatch.setitem(sys.modules, "win32clipboard", fake)
+    # The write is our own ctypes block now; the fake's SetClipboardData
+    # (looked up per call, so a test can replace it) stands in for it.
+    monkeypatch.setattr(clip, "_write_unicode", lambda text: sys.modules["win32clipboard"]
+                        .SetClipboardData(13, text))
     return calls
 
 
@@ -1599,3 +1611,659 @@ def test_the_real_hook_installs_and_stops_without_hanging():
     hook._thread.join(3.0)
     assert not hook._thread.is_alive() and time.monotonic() - t0 < 3.0
     assert not ev.installed and not ev.healthy()
+
+
+# ============================================================
+# SAVE AS DIALOG
+# ============================================================
+
+# save_file_as: the keyboard route through a Save As dialog, against a fake
+# desktop (windows, keys, the UIA tree walked by handle) and a real file.
+
+
+# ============================================================
+# SAVE AS DIALOG HELPERS
+# ============================================================
+
+from core.click_handler import EnhancedUIANavigator
+
+
+class _SaveWorld:
+    """Notepad (hwnd 1, pid 50) and what Ctrl+S / Enter / the prompt's
+    buttons do. ``name_box``: (name, automation id) of the file-name Edit."""
+
+    DOC, DIALOG, PROMPT, OTHER = 1, 7, 9, 30
+
+    def __init__(self, path, dialog_on_save=True, prompt=False, other_app=False,
+                 name_box=("File name:", "1001"), autocomplete="", content="milk eggs bread",
+                 box_after=0):
+        self.path, self.content = path, content
+        # The file-name box joins the UIA tree only after this many looks at it.
+        self.box_after, self.box_looks = box_after, 0
+        self.dialog_on_save, self.prompt, self.other_app = dialog_on_save, prompt, other_app
+        self.name_box, self.autocomplete = name_box, autocomplete
+        self.windows = {self.DOC: [50, "Notepad", "*Untitled - Notepad", True]}
+        self.fg = self.DOC
+        self.field, self.selected = "Untitled.txt", False
+        self.keys, self.typed, self.invoked = [], [], []
+
+    # -- the app's behaviour ------------------------------------------------------
+    def open(self, hwnd, pid, cls, title):
+        self.windows[hwnd] = [pid, cls, title, True]
+        self.fg = hwnd
+
+    def close(self, hwnd):
+        self.windows.pop(hwnd, None)
+
+    def save(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(self.content)
+        self.close(self.DIALOG)
+        self.windows[self.DOC][2] = os.path.basename(self.path) + " - Notepad"
+        self.fg = self.DOC
+
+    def hotkey(self, *keys):
+        self.keys.append("+".join(keys))
+        if keys == ("ctrl", "s") and self.other_app:
+            self.open(self.OTHER, 77, "Chrome_WidgetWin_1", "Something else")
+        elif keys == ("ctrl", "s") and self.dialog_on_save:
+            self.open(self.DIALOG, 50, "#32770", "Save as")
+        elif keys == ("ctrl", "a"):
+            self.selected = True
+
+    def press(self, key):
+        self.keys.append(key)
+        if key == "enter" and self.fg == self.DIALOG:
+            if self.prompt:
+                self.open(self.PROMPT, 50, "#32770", "Confirm Save As")
+            else:
+                self.save()
+        elif key == "escape" and self.fg == self.PROMPT:
+            self.close(self.PROMPT)
+            self.fg = self.DIALOG
+
+    def type(self, text):
+        self.typed.append(text)
+        self.field = (text if self.selected else self.field + text) + self.autocomplete
+        self.selected = False
+        return True
+
+    # -- the UIA tree -------------------------------------------------------------
+    def element(self, ctype, name, aid, on_invoke=None):
+        world = self
+
+        def invoke():
+            world.invoked.append(name)
+            if on_invoke:
+                on_invoke()
+
+        return SimpleNamespace(
+            window_text=lambda: name,
+            element_info=SimpleNamespace(automation_id=aid, control_type=ctype),
+            is_enabled=lambda: True,
+            set_focus=lambda: None,
+            get_value=lambda: world.field,
+            invoke=invoke,
+        )
+
+    def descendants(self, hwnd, control_type):
+        if hwnd not in self.windows:
+            raise RuntimeError("gone")
+        if hwnd == self.DIALOG:
+            if control_type == "Edit":
+                self.box_looks += 1
+            items = [self.element("Edit", "Search", ""),
+                     self.element("Button", "Save", "1")]
+            if self.box_looks > self.box_after:
+                items.insert(1, self.element("Edit", *self.name_box))
+        elif hwnd == self.PROMPT:
+            def yes():
+                self.close(self.PROMPT)
+                self.save()
+
+            def no():
+                self.close(self.PROMPT)
+                self.fg = self.DIALOG
+            items = [self.element("Button", "Yes", "6", yes),
+                     self.element("Button", "No", "7", no)]
+        else:
+            items = []
+        return [e for e in items if e.element_info.control_type == control_type]
+
+
+def _save_api(monkeypatch, world, on_target=True, events=None):
+    win = world.windows
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        IsWindow=lambda h: h in win,
+        IsWindowVisible=lambda h: h in win and win[h][3],
+        GetWindowText=lambda h: win[h][2],
+        GetClassName=lambda h: win[h][1],
+        GetForegroundWindow=lambda: world.fg,
+        GetWindow=lambda h, cmd: world.DOC if h in (world.DIALOG, world.PROMPT) else 0,
+    ))
+    monkeypatch.setitem(sys.modules, "win32process", SimpleNamespace(
+        GetWindowThreadProcessId=lambda h: (0, win[h][0])))
+    monkeypatch.setattr(api_mod, "pyautogui", SimpleNamespace(hotkey=world.hotkey, press=world.press))
+    monkeypatch.setattr(clip, "send_unicode", world.type)
+    monkeypatch.setattr("core.api.time.sleep", lambda _s: None)
+
+    class FakeDesktop:
+        def __init__(self, backend):
+            assert backend == "uia"
+
+        def window(self, handle):
+            return SimpleNamespace(wrapper_object=lambda: SimpleNamespace(
+                descendants=lambda control_type: world.descendants(handle, control_type)))
+
+    monkeypatch.setattr("core.click_handler.Desktop", FakeDesktop, raising=False)
+    nav = EnhancedUIANavigator.__new__(EnhancedUIANavigator)
+    nav.available = True
+    nav.click_element = lambda el: False
+    api = Api.__new__(Api)
+    api.uia_nav = nav
+    api.live = SimpleNamespace(window_events=events, snapshot={})
+    api._last_opened_app = "notepad"
+    api._resolve_path_placeholders = lambda p: p
+    api.last_result_text = ""
+
+    def ensure(what):
+        if on_target:
+            return f"The {what} went to 'x'.", True
+        return f"NOT SENT: the {what} was not sent because notepad is not in front.", False
+
+    api._ensure_input_target = ensure
+    for name in ("SAVE_DIALOG_WAIT_S", "SAVE_CLOSE_WAIT_S", "SAVE_FILE_WAIT_S", "SAVE_TITLE_WAIT_S",
+                 "SAVE_NAME_BOX_WAIT_S"):
+        setattr(api, name, 0.05)
+    return api
+
+
+# ============================================================
+# SAVE AS DIALOG TESTS
+# ============================================================
+
+def test_save_file_as_runs_the_dialog_flow_and_checks_the_file(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path)
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is True
+    # Ctrl+S, select all in the name box, the path typed ONCE, Enter -- nothing else.
+    assert world.keys == ["ctrl+s", "ctrl+a", "enter"]
+    assert world.typed == [path] and world.field == path       # replaced, not appended
+    assert open(path, encoding="utf-8").read() == "milk eggs bread"
+    assert api.last_result_text.startswith(f"Saved to {path} (checked on disk: 15 bytes")
+    assert "the window title is now 'groceries.txt - Notepad'" in api.last_result_text
+    log = capsys.readouterr().out
+    assert log.splitlines() == [
+        "[SaveAs] dialog appeared",
+        "[SaveAs] file-name box found by name",
+        f"[SaveAs] typed {len(path)} chars, read back: match",
+        "[SaveAs] saved (file checked, title changed: yes)",
+    ]
+    for content in ("groceries", str(tmp_path), "Notepad", "Save as", "Untitled"):
+        assert content not in log                                 # content-free
+
+
+def test_save_file_as_finds_the_name_box_by_prefix_never_by_its_value():
+    nav = EnhancedUIANavigator
+    assert nav.name_has_prefix("File name:", "file name")
+    assert nav.name_has_prefix("  File  Name : ", "File name:")
+    # The real runs asked for 'File name: reminder.txt': that never matches.
+    assert not nav.name_has_prefix("File name:", "File name: reminder.txt")
+    assert not nav.name_has_prefix("Save as type:", "file name")
+    assert not nav.name_has_prefix("anything", "")
+
+
+def test_save_file_as_falls_back_to_the_automation_id(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "notes.txt")
+    world = _SaveWorld(path, name_box=("Dateiname:", "1001"))   # a localized name
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is True
+    assert "[SaveAs] file-name box found by automation id" in capsys.readouterr().out
+
+
+def test_save_file_as_stops_when_no_dialog_appears(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, dialog_on_save=False)
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is False
+    assert world.keys == ["ctrl+s"] and world.typed == []       # never types into the document
+    assert not os.path.exists(path)
+    assert api.last_result_text.startswith(
+        "NOT SAVED: no Save As dialog appeared after Ctrl+S, so nothing was typed.")
+    assert "call save_file_as again" in api.last_result_text
+    assert capsys.readouterr().out.splitlines() == ["[SaveAs] stopped: no dialog"]
+
+
+def test_save_file_as_stops_when_another_app_comes_to_the_front(monkeypatch, tmp_path):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, other_app=True)
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is False
+    assert world.typed == [] and world.keys == ["ctrl+s"]
+    assert "a window of another app came to the front" in api.last_result_text
+
+
+def test_save_file_as_uses_a_dialog_that_is_already_open(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path)
+    world.open(world.DIALOG, 50, "#32770", "Save as")             # an earlier Ctrl+S
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is True
+    assert world.keys == ["ctrl+a", "enter"] and world.typed == [path]
+    assert "title changed: yes" in capsys.readouterr().out
+
+
+def test_save_file_as_never_presses_enter_on_a_field_it_could_not_set(monkeypatch, tmp_path):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, autocomplete=".bak")                 # the box holds something else
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is False
+    assert world.keys == ["ctrl+s", "ctrl+a"] and world.typed == [path]
+    assert "Enter was not pressed" in api.last_result_text and not os.path.exists(path)
+
+
+def test_save_file_as_without_a_name_box_types_nothing(monkeypatch, tmp_path):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, name_box=("Search", "x"))
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is False
+    assert world.typed == [] and world.keys == ["ctrl+s"]
+    assert "no file-name box was found" in api.last_result_text
+
+
+def test_save_file_as_answers_no_to_an_unapproved_replace_prompt(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, prompt=True)                         # the file was not there before
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(path) is False
+    assert world.invoked == ["No"] and not os.path.exists(path)
+    assert "it was NOT replaced and nothing was overwritten" in api.last_result_text
+    log = capsys.readouterr().out
+    assert "[SaveAs] replace prompt: not approved, answered no" in log
+    assert "[SaveAs] stopped: not replaced" in log
+
+
+def test_save_file_as_replaces_only_a_file_the_user_approved(monkeypatch, tmp_path, capsys):
+    from core.tools import ToolRegistry
+
+    path = tmp_path / "groceries.txt"
+    path.write_text("old", encoding="utf-8")
+    world = _SaveWorld(str(path), prompt=True)
+    api = _save_api(monkeypatch, world)
+    # An existing target asks first: the agent's confirmation gate.
+    reg = ToolRegistry(db_path=str(tmp_path / "t.db"))
+    assert reg.requires_confirmation("save_file_as", str(path))
+    assert reg.requires_confirmation("save_file_as", f'"{path}"')
+    assert not reg.requires_confirmation("save_file_as", str(tmp_path / "new.txt"))
+    reg._conn and reg._conn.close()
+    assert api._act_save_file_as(str(path)) is True              # runs only after a yes
+    assert world.invoked == ["Yes"] and path.read_text(encoding="utf-8") == "milk eggs bread"
+    assert "It replaced the existing file, as approved." in api.last_result_text
+    assert "[SaveAs] replace prompt: approved, answered yes" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("param, says", [
+    ("", "no path was given"),
+    ("groceries.txt", "must be a full path"),
+    ("{tmp}", "that path is a folder"),
+    ("{tmp}\\missing\\g.txt", "its folder does not exist"),
+    ("{tmp}\\a\nb.txt", "not one line"),
+])
+def test_save_file_as_refuses_a_bad_path_before_pressing_anything(monkeypatch, tmp_path, param, says):
+    world = _SaveWorld(str(tmp_path / "g.txt"))
+    api = _save_api(monkeypatch, world)
+    assert api._act_save_file_as(param.replace("{tmp}", str(tmp_path))) is False
+    assert says in api.last_result_text and "Nothing was pressed." in api.last_result_text
+    assert world.keys == [] and world.typed == []
+
+
+def test_save_file_as_sends_nothing_when_the_app_is_not_in_front(monkeypatch, tmp_path):
+    world = _SaveWorld(str(tmp_path / "g.txt"))
+    api = _save_api(monkeypatch, world, on_target=False)
+    assert api._act_save_file_as(str(tmp_path / "g.txt")) is False
+    assert api.last_result_text.startswith("NOT SENT")
+    assert world.keys == [] and world.typed == []
+
+
+def test_save_file_as_waits_on_window_events_when_they_are_healthy(monkeypatch, tmp_path):
+    ev = _healthy_events()
+    waits = []
+    real = ev.wait_for
+
+    def spy(condition, timeout, poll=0.05):
+        waits.append(timeout)
+        return real(condition, timeout, poll)
+
+    monkeypatch.setattr(ev, "wait_for", spy)
+    path = str(tmp_path / "g.txt")
+    world = _SaveWorld(path)
+    api = _save_api(monkeypatch, world, events=ev)
+    assert api._act_save_file_as(path) is True
+    assert len(waits) >= 2                                        # the dialog, then its close
+
+
+def test_save_file_as_is_registered_dispatched_and_on_the_menu():
+    from core.tools import SPECS, action_menu
+
+    spec = SPECS["save_file_as"]
+    assert spec.args == "full file path" and "file" in spec.categories
+    assert ("- save_file_as <full file path>: Save the document in front via its Save As "
+            "dialog (checked on disk)") in action_menu()
+    src = inspect.getsource(Api._exec_sync)
+    assert 'elif action == "save_file_as":' in src and "self._act_save_file_as(param)" in src
+
+
+def _save_clock(monkeypatch):
+    """A fake clock for core.api: sleep advances it (no real waiting)."""
+    clock = {"now": 1000.0, "sleeps": []}
+
+    def sleep(s):
+        clock["sleeps"].append(s)
+        clock["now"] += s
+
+    monkeypatch.setattr(api_mod, "time", SimpleNamespace(
+        time=time.time, sleep=sleep, monotonic=lambda: clock["now"]))
+    return clock
+
+
+def test_save_file_as_waits_for_a_name_box_that_joins_the_tree_late(monkeypatch, tmp_path, capsys):
+    # Real runs: "dialog appeared", then "no file-name box" on the one look.
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, box_after=2)
+    api = _save_api(monkeypatch, world)
+    clock = _save_clock(monkeypatch)
+    api.SAVE_NAME_BOX_WAIT_S = config.SAVE_NAME_BOX_WAIT_S        # the default, 3.0 s
+    assert api._act_save_file_as(path) is True
+    assert world.box_looks == 3 and world.typed == [path]
+    assert clock["sleeps"][:2] == [config.SAVE_BOX_POLL_S] * 2     # short sleeps between looks
+    log = capsys.readouterr().out.splitlines()
+    assert log[:3] == ["[SaveAs] dialog appeared",
+                       "[SaveAs] file-name box ready after 0.20s (3 looks)",
+                       "[SaveAs] file-name box found by name"]
+
+
+def test_save_file_as_gives_up_on_the_name_box_after_the_timeout(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path, box_after=10 ** 6)                     # never appears
+    api = _save_api(monkeypatch, world)
+    clock = _save_clock(monkeypatch)
+    api.SAVE_NAME_BOX_WAIT_S = config.SAVE_NAME_BOX_WAIT_S
+    t0 = clock["now"]
+    assert api._act_save_file_as(path) is False
+    waited = clock["now"] - t0
+    assert config.SAVE_NAME_BOX_WAIT_S <= waited <= config.SAVE_NAME_BOX_WAIT_S + 0.2  # bounded
+    assert 25 <= world.box_looks <= 35 and max(clock["sleeps"]) <= config.SAVE_BOX_POLL_S
+    assert world.typed == [] and world.keys == ["ctrl+s"]
+    assert api.last_result_text.startswith("NOT SAVED: a dialog opened, but no file-name box")
+    (line,) = [l for l in capsys.readouterr().out.splitlines() if "stopped" in l]
+    assert re.fullmatch(r"\[SaveAs\] stopped: no file-name box \(waited 3\.\d\ds, \d+ looks\)", line)
+
+
+def test_save_file_as_adds_no_wait_when_the_box_is_there_at_once(monkeypatch, tmp_path, capsys):
+    path = str(tmp_path / "groceries.txt")
+    world = _SaveWorld(path)
+    api = _save_api(monkeypatch, world)
+    clock = _save_clock(monkeypatch)
+    api.SAVE_NAME_BOX_WAIT_S = config.SAVE_NAME_BOX_WAIT_S
+    assert api._act_save_file_as(path) is True
+    assert world.box_looks == 1
+    # Ctrl+S -> focus: no poll sleep before the fixed 0.1 s focus pause.
+    assert clock["sleeps"][0] == 0.1 and world.keys[:2] == ["ctrl+s", "ctrl+a"]
+    assert "ready after" not in capsys.readouterr().out
+
+
+def test_save_file_as_name_box_wait_wakes_on_window_events(monkeypatch, tmp_path, capsys):
+    ev = _healthy_events()
+    polls = []
+    real = ev.wait_for
+
+    def spy(condition, timeout, poll=0.05):
+        polls.append((timeout, poll))
+        return real(condition, timeout, poll)
+
+    monkeypatch.setattr(ev, "wait_for", spy)
+    path = str(tmp_path / "g.txt")
+    world = _SaveWorld(path, box_after=1)
+    api = _save_api(monkeypatch, world, events=ev)
+    api.SAVE_NAME_BOX_WAIT_S = 1.0
+    assert api._act_save_file_as(path) is True
+    assert (1.0, config.SAVE_BOX_POLL_S) in polls and world.box_looks == 2
+    assert "ready after" in capsys.readouterr().out
+
+
+# ============================================================
+# CLIPBOARD WIN32 CALLS
+# ============================================================
+
+# The clipboard helpers' own Win32 calls: typed on a private user32 (64-bit
+# handles), OpenClipboard tried again briefly while another process holds it,
+# and the clipboard closed on every path once it was opened. No test here
+# touches the real clipboard.
+
+
+# ============================================================
+# CLIPBOARD WIN32 CALLS TESTS
+# ============================================================
+
+import ctypes
+
+
+def test_the_clipboard_helpers_use_a_private_typed_user32(monkeypatch):
+    from ctypes import wintypes
+
+    monkeypatch.setattr(clip, "_user32_typed", None)
+    u = clip._user32()
+    assert u is not ctypes.windll.user32 and clip._user32() is u      # private, one instance
+    assert u.GetOpenClipboardWindow.restype is wintypes.HWND and u.GetOpenClipboardWindow.argtypes == []
+    assert u.GetClipboardSequenceNumber.restype is wintypes.DWORD
+    assert u.GetWindowThreadProcessId.argtypes == [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    assert u.GetWindowThreadProcessId.restype is wintypes.DWORD
+    # The shared loader every other library uses is left alone.
+    assert ctypes.windll.user32.GetOpenClipboardWindow.restype is not wintypes.HWND
+
+
+def test_holder_reads_the_owner_through_the_typed_calls(monkeypatch):
+    def thread_pid(hwnd, pid_ref):
+        pid_ref._obj.value = 4242 if hwnd == 0x7FFF00001234 else 0   # a 64-bit handle
+        return 1
+
+    monkeypatch.setattr(clip, "_user32", lambda: SimpleNamespace(
+        GetOpenClipboardWindow=lambda: 0x7FFF00001234, GetWindowThreadProcessId=thread_pid))
+    monkeypatch.setattr(clip.os, "getpid", lambda: 4242)
+    assert clip.holder() == "self"
+    monkeypatch.setattr(clip.os, "getpid", lambda: 1)
+    assert clip.holder() == "other"
+
+
+def test_open_is_retried_briefly_while_another_process_holds_it(monkeypatch, capsys):
+    calls = _fake_win32(monkeypatch)
+    left = {"busy": 2}
+    win = sys.modules["win32clipboard"]
+
+    def open_():
+        calls.append("open")
+        if left["busy"]:
+            left["busy"] -= 1
+            raise OSError("held")
+    win.OpenClipboard = open_
+    sleeps = []
+    monkeypatch.setattr("core.live_state.time.sleep", sleeps.append)
+    assert clip.set_text("x") is True
+    assert calls == ["open", "open", "open", "close"]
+    assert sleeps == list(clip.OPEN_RETRY_DELAYS[:2])
+    assert capsys.readouterr().out == ""                       # no busy line: it opened
+
+
+def test_open_gives_up_after_the_short_retries_and_never_closes_what_it_did_not_open(
+        monkeypatch, capsys):
+    calls = _fake_win32(monkeypatch, fail_open=True)
+    sleeps = []
+    monkeypatch.setattr("core.live_state.time.sleep", sleeps.append)
+    monkeypatch.setattr(clip, "holder", lambda: "other")
+    assert clip.set_text("x") is False
+    assert calls == ["open"] * (len(clip.OPEN_RETRY_DELAYS) + 1)
+    assert sleeps == list(clip.OPEN_RETRY_DELAYS) and sum(sleeps) < 0.1
+    assert capsys.readouterr().out.strip() == "[TypeText] clipboard busy holder=other"
+
+
+@pytest.mark.parametrize("failing", ["EmptyClipboard", "SetClipboardData"])
+def test_a_failed_write_always_closes_the_clipboard(monkeypatch, failing):
+    calls = _fake_win32(monkeypatch)
+    monkeypatch.setattr(clip, "holder", lambda: "unknown")
+
+    def boom(*_a):
+        raise OSError("refused")
+    setattr(sys.modules["win32clipboard"], failing, boom)
+    assert clip.set_text("x") is False
+    assert calls == ["open", "close"] and clip._ours_open == 0
+
+
+def test_a_failed_read_always_closes_the_clipboard(monkeypatch):
+    calls = _fake_win32(monkeypatch)
+
+    def boom(_f):
+        raise OSError("gone")
+    sys.modules["win32clipboard"].GetClipboardData = boom
+    assert clip.read_text() is None
+    assert calls == ["open", "close"] and clip._ours_open == 0
+
+
+# ============================================================
+# CLIPBOARD WRITE BLOCK
+# ============================================================
+
+# The clipboard write uses our own moveable memory block through a private,
+# fully typed kernel32/user32. pywin32 311's SetClipboardData took a str that
+# int() accepts ("37") as a HANDLE: typing digits into Calculator handed
+# Windows handle 37, and the next write freed it (0xC0000374 in _set).
+
+
+# ============================================================
+# CLIPBOARD WRITE BLOCK HELPERS
+# ============================================================
+
+_REAL_WRITE_UNICODE = clip._write_unicode    # before any test patches it
+
+class _FakeGlobalMemory:
+    """kernel32/user32 stand-ins over one real ctypes buffer (so memmove is
+    real); records the calls in order."""
+
+    HANDLE = 0x7FFF00002000                   # a 64-bit handle value
+
+    def __init__(self, lock_ok=True, set_ok=True):
+        self.calls, self.buf, self.size = [], None, 0
+        self.lock_ok, self.set_ok = lock_ok, set_ok
+
+    def GlobalAlloc(self, flags, size):
+        self.calls.append(("alloc", flags, size))
+        self.size, self.buf = size, ctypes.create_string_buffer(size)
+        return self.HANDLE
+
+    def GlobalLock(self, h):
+        self.calls.append(("lock", h))
+        return ctypes.addressof(self.buf) if self.lock_ok else None
+
+    def GlobalUnlock(self, h):
+        self.calls.append(("unlock", h))
+        return 0
+
+    def GlobalFree(self, h):
+        self.calls.append(("free", h))
+        return None
+
+    def SetClipboardData(self, fmt, h):
+        self.calls.append(("set", fmt, h))
+        return h if self.set_ok else None
+
+    def written(self):
+        return self.buf.raw[:self.size]
+
+
+def _fake_memory(monkeypatch, **kw):
+    mem = _FakeGlobalMemory(**kw)
+    monkeypatch.setattr(clip, "_kernel32", lambda: mem)
+    monkeypatch.setattr(clip, "_user32", lambda: mem)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 1418)
+    return mem
+
+
+# ============================================================
+# CLIPBOARD WRITE BLOCK TESTS
+# ============================================================
+
+def test_the_write_uses_a_private_kernel32_with_64_bit_signatures(monkeypatch):
+    from ctypes import wintypes
+
+    monkeypatch.setattr(clip, "_kernel32_typed", None)
+    monkeypatch.setattr(clip, "_user32_typed", None)
+    k, u = clip._kernel32(), clip._user32()
+    assert k is not ctypes.windll.kernel32 and clip._kernel32() is k
+    assert (k.GlobalAlloc.argtypes, k.GlobalAlloc.restype) == (
+        [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL)
+    assert (k.GlobalLock.argtypes, k.GlobalLock.restype) == ([wintypes.HGLOBAL], wintypes.LPVOID)
+    assert (k.GlobalUnlock.argtypes, k.GlobalUnlock.restype) == ([wintypes.HGLOBAL], wintypes.BOOL)
+    assert (k.GlobalFree.argtypes, k.GlobalFree.restype) == ([wintypes.HGLOBAL], wintypes.HGLOBAL)
+    assert (u.SetClipboardData.argtypes, u.SetClipboardData.restype) == (
+        [wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE)
+    for t in (wintypes.HGLOBAL, wintypes.LPVOID, wintypes.HANDLE):   # pointer-sized
+        assert ctypes.sizeof(t) == ctypes.sizeof(ctypes.c_void_p)
+
+
+@pytest.mark.parametrize("text, units", [
+    ("37", 2), ("3", 1), ("", 0), ("hello", 5), ("a🙂", 3), ("x" * 10_000, 10_000),
+    ("line1\r\nline2", 12),
+])
+def test_the_block_holds_the_text_and_its_nul_and_the_clipboard_owns_it(monkeypatch, text, units):
+    mem = _fake_memory(monkeypatch)
+    clip._write_unicode(text)
+    size = (units + 1) * 2
+    assert mem.calls == [("alloc", clip.GMEM_MOVEABLE, size), ("lock", mem.HANDLE),
+                         ("unlock", mem.HANDLE), ("set", 13, mem.HANDLE)]    # never freed
+    assert mem.written() == text.encode("utf-16-le") + b"\x00\x00"
+
+
+def test_a_digit_string_is_text_never_a_handle(monkeypatch):
+    # The Calculator crash: "37" must reach SetClipboardData as our block's handle.
+    calls = _fake_win32(monkeypatch)
+    mem = _fake_memory(monkeypatch)
+    monkeypatch.setattr(clip, "_write_unicode", _REAL_WRITE_UNICODE)
+    for digits in ("37", "3", "007", " 37", "12", "-5"):
+        mem.calls.clear()
+        assert clip.set_text(digits) is True
+        assert ("set", 13, mem.HANDLE) in mem.calls and ("free", mem.HANDLE) not in mem.calls
+        assert mem.written() == digits.encode("utf-16-le") + b"\x00\x00"
+    assert calls.count("open") == calls.count("close") == 6
+
+
+@pytest.mark.parametrize("fail", ["lock", "set"])
+def test_the_block_is_freed_only_when_the_clipboard_did_not_take_it(monkeypatch, fail):
+    mem = _fake_memory(monkeypatch, lock_ok=fail != "lock", set_ok=fail != "set")
+    with pytest.raises(OSError) as e:
+        clip._write_unicode("37")
+    assert e.value.winerror == 1418
+    assert mem.calls[-1] == ("free", mem.HANDLE)
+    assert [c[0] for c in mem.calls].count("free") == 1
+    if fail == "lock":
+        assert not any(c[0] in ("unlock", "set") for c in mem.calls)    # nothing to unlock or set
+    else:
+        assert [c[0] for c in mem.calls] == ["alloc", "lock", "unlock", "set", "free"]
+
+
+def test_a_refused_block_is_logged_as_denied_and_the_clipboard_closed(monkeypatch, capsys):
+    calls = _fake_win32(monkeypatch)
+    _fake_memory(monkeypatch, set_ok=False)
+    monkeypatch.setattr(clip, "_write_unicode", _REAL_WRITE_UNICODE)
+    monkeypatch.setattr(clip, "holder", lambda: "self")
+    assert clip.set_text("37") is False
+    assert calls == ["open", "close"]
+    assert capsys.readouterr().out.strip() == "[TypeText] clipboard denied holder=self code=1418"
+
+
+def test_nothing_hands_a_str_to_pywin32s_set_clipboard_data():
+    import inspect
+
+    src = inspect.getsource(clip)
+    assert "w.SetClipboardData(" not in src and "win32clipboard.SetClipboardData(" not in src
+    assert "SetClipboardText(" not in src
+

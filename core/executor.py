@@ -313,7 +313,10 @@ def run(name, api, action, param, arg=""):
 # ============================================================
 
 # Confidence assigned per click-resolution method (design doc #6's example).
-METHOD_CONFIDENCE = {"UIA": 0.92, "OCR": 0.74, "Vision": 0.45}
+# "UIA-unchanged": the UIA action ran but the window's accessibility text did
+# not change afterwards (Api.last_uia_effect is False). Still a success
+# (confidence never overturns a result), reported with less trust.
+METHOD_CONFIDENCE = {"UIA": 0.92, "UIA-unchanged": 0.5, "OCR": 0.74, "Vision": 0.45}
 
 # Browsers render their content into a canvas/DOM that UIA sees only as a
 # useless generic tree ("document", "group", "Empty"), so UIA-first clicking
@@ -366,6 +369,9 @@ class ExecutionResult:
             return " Resolved by reading on-screen text (OCR)."
         if self.method == "UIA":
             return " Resolved via the accessibility tree."
+        if self.method == "UIA-unchanged":
+            return (" Found via the accessibility tree, but the window showed no change "
+                    "afterwards -- check the result before relying on it.")
         return ""
 
 
@@ -477,7 +483,7 @@ class Executor:
         if action in ("click_on_text", "click_nth"):
             method = getattr(api.click_handler, "last_method", None) or "direct"
         elif action == "uia_click":
-            method = "UIA"
+            method = "UIA-unchanged" if getattr(api, "last_uia_effect", None) is False else "UIA"
 
         confidence = self._confidence(spec, action, method, ok, verified)
         res = ExecutionResult(

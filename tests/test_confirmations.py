@@ -72,6 +72,9 @@
 #   65. QUICK MESSAGE CHECKS API
 #   66. QUICK MESSAGE CHECKS HELPERS (2)
 #   67. QUICK MESSAGE CHECKS TESTS
+#   68. OWN DIALOG KEYS
+#   69. OWN DIALOG KEYS HELPERS
+#   70. OWN DIALOG KEYS TESTS
 # ============================================================
 
 """Confirmations (typed, spoken, buttons), ask before sending, remembered approvals and quick_message checks."""
@@ -2312,3 +2315,189 @@ def test_logs_name_no_person_and_no_message(monkeypatch, capsys):
     assert "[QuickMessage] final check failed; Enter not pressed" in text
     for word in ("Zorblax", "Quindlewhip", "pelican", "rendezvous"):
         assert word not in text
+
+
+# ============================================================
+# OWN DIALOG KEYS
+# ============================================================
+
+# Enter, Escape and Delete pressed inside the file dialog the agent's own
+# dialog key opened (same process, the dialog window class) are part of that
+# flow; everywhere else the confirmation gate is exactly as before.
+
+
+# ============================================================
+# OWN DIALOG KEYS HELPERS
+# ============================================================
+
+# hwnd -> (pid, class, thread id): Notepad, its Save As dialog, the replace
+# prompt, a window of another app, a non-dialog window of Notepad.
+_OWN_DIALOG_WINDOWS = {1: (50, "Notepad", 500), 7: (50, "#32770", 500),
+                       9: (50, "#32770", 500), 30: (77, "#32770", 900),
+                       11: (50, "NotepadPopup", 500)}
+_DOC, _SAVE_AS = (1, "*milk - Notepad"), (7, "Save as")
+
+
+def _own_dialog_run(monkeypatch, tmp_path, keys, foreground, answers=(), focus_class="Edit",
+                    enter_safe=False):
+    """hotkey ``keys``, then press_key Enter, Delete, Escape, done."""
+    from core.agent import AgentLoop
+    from test_agent import _batched_steps_run
+
+    monkeypatch.setattr(AgentLoop, "_window_facts",
+                        staticmethod(lambda h: _OWN_DIALOG_WINDOWS.get(h, (0, "", 0))))
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        GetGUIThreadInfo=lambda thread: (0, 7, 70, 0, 0, 0, 0, (0, 0, 0, 0)),
+        GetClassName=lambda h: focus_class if h == 70 else ""))
+    replies = [{"action": "hotkey", "parameter": keys},
+               {"action": "press_key", "parameter": "enter"},
+               {"action": "press_key", "parameter": "delete"},
+               {"action": "press_key", "parameter": "escape"},
+               {"action": "done", "parameter": "", "speech": "Saved."},
+               {"action": "done", "parameter": "", "speech": "Saved."}]
+    return _batched_steps_run(monkeypatch, tmp_path, replies, answers=answers,
+                              foreground=foreground, enter_safe=enter_safe)
+
+
+# ============================================================
+# OWN DIALOG KEYS TESTS
+# ============================================================
+
+def test_keys_inside_the_dialog_the_agent_opened_are_not_confirmed(monkeypatch, tmp_path, capsys):
+    rec = _own_dialog_run(monkeypatch, tmp_path, "ctrl+s", [_DOC, _SAVE_AS])
+    assert rec.asked == []                                         # no question at all
+    assert rec.calls == [("hotkey", "ctrl+s"), ("press_key", "enter"),
+                         ("press_key", "delete"), ("press_key", "escape")]
+    log = capsys.readouterr().out
+    assert "[DialogKeys] the dialog this phase opened is in front" in log
+    assert log.count("[Confirm] not asked: a key inside the dialog this phase opened") == 2
+    assert "Save as" not in log and "milk" not in log              # content-free
+
+
+def test_delete_in_the_dialogs_file_list_still_asks(monkeypatch, tmp_path):
+    rec = _own_dialog_run(monkeypatch, tmp_path, "ctrl+s", [_DOC, _SAVE_AS],
+                          answers=["yes"], focus_class="DirectUIHWND")
+    assert len(rec.asked) == 1 and "press_key(delete)" in rec.asked[0]
+
+
+@pytest.mark.parametrize("keys, foreground, why", [
+    ("ctrl+a", [_DOC], "no dialog key"),                           # nothing opened
+    ("ctrl+s", [_DOC], "no dialog appeared"),
+    ("ctrl+s", [_DOC, (30, "Other")], "another process"),
+    ("ctrl+s", [_DOC, (11, "Popup")], "not a dialog window"),
+    ("ctrl+p", [_DOC, (7, "Print")], "not a file dialog key"),     # Enter would print
+])
+def test_enter_and_delete_still_ask_everywhere_else(monkeypatch, tmp_path, capsys, keys,
+                                                    foreground, why):
+    rec = _own_dialog_run(monkeypatch, tmp_path, keys, foreground, answers=["yes", "yes"])
+    assert len(rec.asked) == 2, why                                # Enter and Delete, as before
+    assert "press_key(enter)" in rec.asked[0] and "press_key(delete)" in rec.asked[1]
+    assert "[Confirm] not asked" not in capsys.readouterr().out
+
+
+def test_the_replace_prompt_inside_the_flow_still_asks(monkeypatch, tmp_path):
+    # The dialog opened, then the replace prompt (another hwnd) came to the front.
+    rec = _own_dialog_run(monkeypatch, tmp_path, "ctrl+s",
+                          [_DOC, _SAVE_AS, _SAVE_AS, _SAVE_AS, (9, "Confirm Save As")],
+                          answers=["yes", "yes"])
+    assert len(rec.asked) == 2 and "press_key(enter)" in rec.asked[0]
+
+
+def test_enter_safe_still_skips_the_question_as_before(monkeypatch, tmp_path):
+    rec = _own_dialog_run(monkeypatch, tmp_path, "ctrl+a", [_DOC], answers=["yes"],
+                          enter_safe=True)
+    assert len(rec.asked) == 1 and "press_key(delete)" in rec.asked[0]   # Delete still asks
+
+
+def test_the_registry_skips_only_press_key_with_the_dialog_flag(tmp_path):
+    reg = ToolRegistry(db_path=str(tmp_path / "t.db"))
+    try:
+        for key in ("enter", "return", "delete"):
+            assert reg.requires_confirmation("press_key", key)
+            assert not reg.requires_confirmation("press_key", key, dialog_key_safe=True)
+            assert reg.requires_confirmation("browser_press_key", key, dialog_key_safe=True)
+        assert not reg.requires_confirmation("press_key", "escape")
+        assert reg.requires_confirmation("hotkey", "alt+f4", dialog_key_safe=True) == \
+            reg.requires_confirmation("hotkey", "alt+f4")
+        assert reg.requires_confirmation("window_close", "x", dialog_key_safe=True)
+    finally:
+        reg._conn and reg._conn.close()
+
+
+def test_ctrl_a_then_type_text_never_asks(monkeypatch, tmp_path):
+    """Replacing an editor's text: hotkey ctrl+a, then type_text over the
+    selection -- neither step asks, in the agent's own document or with no
+    known target. press_key Delete still would."""
+    from test_agent import _batched_steps_run
+
+    for opened in (True, False):
+        replies = ([{"action": "switch_app", "parameter": "notepad"}] if opened else []) + [
+            {"action": "hotkey", "parameter": "ctrl+a"},
+            {"action": "type_text", "parameter": "call mom at 6"},
+            {"action": "done", "parameter": "", "speech": "Changed it."}]
+        rec = _batched_steps_run(monkeypatch, tmp_path, replies, foreground=[_DOC])
+        assert rec.asked == []
+        assert rec.calls[-2:] == [("hotkey", "ctrl+a"), ("type_text", "call mom at 6")]
+    reg = ToolRegistry(db_path=str(tmp_path / "t.db"))
+    try:
+        assert not reg.requires_confirmation("hotkey", "ctrl+a")
+        assert not reg.requires_confirmation("type_text", "call mom at 6")
+        assert reg.requires_confirmation("press_key", "delete")
+    finally:
+        reg._conn and reg._conn.close()
+
+
+def _save_left_open_run(monkeypatch, tmp_path, foreground, answers=(), focus_class="Edit"):
+    """save_file_as stops with its dialog still open (fails), then press_key
+    Enter (which saves the file) and Delete, then done."""
+    from core.agent import AgentLoop
+    from test_agent import _batched_steps_run
+
+    path = str(tmp_path / "reminder.txt")
+    monkeypatch.setattr(AgentLoop, "_window_facts",
+                        staticmethod(lambda h: _OWN_DIALOG_WINDOWS.get(h, (0, "", 0))))
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        GetGUIThreadInfo=lambda thread: (0, 7, 70, 0, 0, 0, 0, (0, 0, 0, 0)),
+        GetClassName=lambda h: focus_class if h == 70 else ""))
+
+    def on_run(api, a, p):
+        if (a, p) == ("press_key", "enter"):
+            open(path, "w").close()
+
+    replies = [{"action": "save_file_as", "parameter": path},
+               {"action": "press_key", "parameter": "enter"},
+               {"action": "press_key", "parameter": "delete"},
+               {"action": "done", "parameter": "", "speech": "Saved."},
+               {"action": "done", "parameter": "", "speech": "Saved."}]
+    return _batched_steps_run(monkeypatch, tmp_path, replies, answers=answers,
+                              foreground=foreground, fail=(("save_file_as", path),),
+                              on_run=on_run)
+
+
+def test_a_dialog_save_file_as_left_open_counts_as_the_agents_own(monkeypatch, tmp_path, capsys):
+    # Real rt-notepad-edit runs: save_file_as stopped, then Enter in its dialog asked.
+    rec = _save_left_open_run(monkeypatch, tmp_path, [_DOC, _SAVE_AS])
+    assert rec.asked == []
+    assert [c[0] for c in rec.calls] == ["save_file_as", "press_key", "press_key"]
+    log = capsys.readouterr().out
+    assert "[DialogKeys] the dialog this phase opened is in front" in log
+    assert log.count("[Confirm] not asked: a key inside the dialog this phase opened") == 2
+
+
+def test_after_save_file_as_the_file_list_and_replace_prompt_still_ask(monkeypatch, tmp_path):
+    rec = _save_left_open_run(monkeypatch, tmp_path, [_DOC, _SAVE_AS], answers=["yes"],
+                              focus_class="DirectUIHWND")
+    assert len(rec.asked) == 1 and "press_key(delete)" in rec.asked[0]
+    (tmp_path / "reminder.txt").unlink()        # else save_file_as itself asks (replace)
+    # The replace prompt (another window) is in front for Enter and Delete.
+    rec = _save_left_open_run(monkeypatch, tmp_path,
+                              [_DOC, _SAVE_AS, _SAVE_AS, (9, "Confirm Save As")],
+                              answers=["yes", "yes"])
+    assert len(rec.asked) == 2 and "press_key(enter)" in rec.asked[0]
+
+
+def test_a_save_file_as_that_closed_its_dialog_leaves_nothing_open(monkeypatch, tmp_path, capsys):
+    # Saved: the document is in front again, so no dialog counts; Enter asks.
+    rec = _save_left_open_run(monkeypatch, tmp_path, [_DOC], answers=["yes", "yes"])
+    assert len(rec.asked) == 2
+    assert "[DialogKeys]" not in capsys.readouterr().out

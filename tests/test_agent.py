@@ -56,6 +56,7 @@
 #   49. SKIP VERIFIED READ
 #   50. SKIP VERIFIED READ RUN
 #   51. SKIP VERIFIED READ TESTS
+#   52. DONE-TIME FILE CHECK
 # ============================================================
 
 """The agent loop: safety gates, repeats and the done check, loop cycles, batched steps, network failures, prompt rules, size and action playbook."""
@@ -607,7 +608,8 @@ class _Tools:
         "browser_search": object(),
     }
 
-    def requires_confirmation(self, action, parameter="", resolve_path=None, enter_safe=False):
+    def requires_confirmation(self, action, parameter="", resolve_path=None, enter_safe=False,
+                              dialog_key_safe=False):
         return action in {"quick_message", "window_close"}
 
     def get(self, action):
@@ -2165,14 +2167,19 @@ STATES = {
 # copies to them (the listing advice kept for other file changes), then for the
 # dialog-key guidance merged into the LOOP rule, "two tries of the same key
 # sequence" merged into the two-approaches rule, press_key's menu line naming
-# hotkey for combos, and two sentences of the succeeded-actions rule tightened.
+# hotkey for combos, and two sentences of the succeeded-actions rule tightened,
+# then for the save_file_as menu line, then for the save rule moved into PATHS AND FILES
+# (use save_file_as; the loop rule's "prefer the dialog's file-name box" removed).
+# then for the editor rule in PATHS AND FILES (hotkey ctrl+a, then type_text over the
+# selection, no delete), paid for by dropping the move/copy parenthetical that only
+# repeated the move_files / copy_files menu lines.
 PROMPT_HASHES = {
-    "plain": "d832e27637fa7d3038a3b380b477884eee80b10361026cecdd81cc53ca8faaf9",
-    "project": "6211c71cde7e65241355ced1eab08b07973058a8ae07afd76a0c62dccf9e6b6e",
-    "long-screen": "0bb8c0569eb136b3834429da65ac0b78948562c72100f58f5c5feca95e7988e9",
-    "hints-and-conversation": "dbeb5eaa9bb22dbd92469da27c25db3854d72ce5d8c9a5bbf67690f30df38eb3",
+    "plain": "386b9875c558525d936692a3ea56a755dcc369216758e3cf19f102d22bd67311",
+    "project": "016c2414c2164f939b72c460fe966e354ef108305ead1d87aa426622ac6ce507",
+    "long-screen": "87018c13ce2bd7ada32f59e4cc1ba2e5dc3fa0cad95918e3fc9e3144fbdd3a89",
+    "hints-and-conversation": "e8fa6257cff2e75c97cf971847bbb98dfb6687a6c9509a41738a35e77ad6dde7",
 }
-PLAIN_LENGTH = 14650            # 14,362 before the dialog-key guidance; 13,924 before move/copy_files; 21,056 originally
+PLAIN_LENGTH = 14835            # 14,783 before the editor rule; 14,751 before the save rule; 14,650 before save_file_as; 14,362 before the dialog-key guidance; 13,924 before move/copy_files; 21,056 originally
 
 
 # ============================================================
@@ -2260,14 +2267,39 @@ def test_dialog_key_guidance_is_in_the_prompt_once(monkeypatch, batching):
     loop_line = next(l for l in text.split("\n") if l.startswith("- You work in a LOOP"))
     for phrase in ("a key that opens a dialog (save, open, print, menus)",
                    "read the screen; type into a dialog only once an observation says one appeared",
-                   "never a file path into the document",
-                   "prefer the dialog's file-name box"):
+                   "never a file path into the document"):
         assert text.count(phrase) == 1 and phrase in loop_line, phrase
+    # Saving goes through save_file_as, said once, in PATHS AND FILES; the old
+    # "prefer the dialog's file-name box" clause would contradict it.
+    files_line = next(l for l in text.split("\n") if l.startswith("- PATHS AND FILES:"))
+    rule = ("To save a document from an app, use save_file_as with the full path instead "
+            "of typing into its dialog.")
+    assert text.count(rule) == 1 and rule in files_line
+    assert "prefer the dialog's file-name box" not in text
     assert ("stops at the first failure or question and after a key that opens a dialog"
             in loop_line) is (batching == "1")
     assert text.count("or two tries of the same key sequence, have failed, stop trying "
                       "variations: use ask_user or say so in done.") == 1
     assert text.count("- press_key <key>: Press one key (a combo is hotkey)") == 1
+
+def test_editor_rule_is_in_paths_and_files_once():
+    """rt-notepad-edit: 'make that 6' appended ('call mom at 5call mom at 6'),
+    or pressed Delete (a confirmation) before typing. One rule, in PATHS AND
+    FILES; the append fact stays on type_text's menu line, the ctrl+a clause
+    in its describe_action entry."""
+    from core.tools import SPECS, action_entry
+
+    text = build("plain")
+    files_line = next(l for l in text.split("\n") if l.startswith("- PATHS AND FILES:"))
+    rule = ("To change text in an open editor, hotkey ctrl+a, then type_text replaces the "
+            "selection; never press delete first.")
+    assert text.count(rule) == 1 and rule in files_line
+    assert "only appends" in next(l for l in text.split("\n") if l.startswith("- type_text "))
+    clause = "After hotkey ctrl+a it types over the selection, so no Delete is needed."
+    assert clause in SPECS["type_text"].limits and clause in action_entry("type_text")
+    assert clause not in text                                      # not duplicated in the prompt
+    # The move/copy details live on their own menu lines, not in the rule.
+    assert "they create the folder, never overwrite and list the result" not in text
 
 
 # ============================================================
@@ -2700,3 +2732,84 @@ class TestSkipVerifiedRead:
         monkeypatch.setenv("MISTAI_SKIP_VERIFIED_READ", "0")
         _skip_verified_read_run(monkeypatch, [("open_app", "notepad")])
         assert "verified-read skip not taken (setting off)" in capsys.readouterr().out
+
+
+# ============================================================
+# DONE-TIME FILE CHECK
+# ============================================================
+
+# rt-notepad-edit run 3 called done while the file it was asked to save did
+# not exist. A path this phase passed to save_file_as / write_file must hold a
+# file at done: one FILE CHECK reminder, then the phase ends as not done.
+
+from core.agent import FILE_NOT_SAVED_SPEECH
+
+
+def _file_check_run(monkeypatch, tmp_path, steps, on_run=None, fail=()):
+    replies = steps + [{"action": "done", "parameter": "", "speech": "Saved it."}] * 2
+    return _batched_steps_run(monkeypatch, tmp_path, replies, answers=["yes"] * 3,
+                              on_run=on_run, fail=fail)
+
+
+def _file_checks(rec):
+    return [o for o in _batched_steps_observations(rec) if "FILE CHECK" in o]
+
+
+@pytest.mark.parametrize("action, param", [
+    ("save_file_as", "{tmp}\\reminder.txt"),
+    ("save_file_as", '"{tmp}\\reminder.txt"'),
+    ("write_file", "{tmp}\\reminder.txt|||call mom at 6"),
+])
+def test_done_is_refused_while_the_saved_file_is_missing(monkeypatch, tmp_path, capsys,
+                                                         action, param):
+    param = param.replace("{tmp}", str(tmp_path))
+    rec = _file_check_run(monkeypatch, tmp_path, [{"action": action, "parameter": param}])
+    (note,) = _file_checks(rec)
+    assert f"no file exists at '{tmp_path}\\reminder.txt', where you saved with {action}" in note
+    assert rec.result == {"success": False, "error": "file not saved",
+                          "speech": FILE_NOT_SAVED_SPEECH, "steps": rec.result["steps"]}
+    log = capsys.readouterr().out
+    assert "[DoneCheck] file check: 1 saved path(s) missing" in log
+    assert "[DoneCheck] file still missing; not reported as done" in log
+    assert str(tmp_path) not in log and "reminder.txt" not in log       # content-free
+
+
+def test_a_file_saved_after_the_reminder_finishes_normally(monkeypatch, tmp_path):
+    path = tmp_path / "reminder.txt"
+    replies = [{"action": "save_file_as", "parameter": str(path)},
+               {"action": "done", "parameter": "", "speech": "Saved it."},
+               {"action": "save_file_as", "parameter": str(path)},
+               {"action": "done", "parameter": "", "speech": "Saved it."}]
+    calls = []
+
+    def on_run(api, a, p):
+        calls.append(a)
+        if len(calls) == 2:                      # the second try writes the file
+            path.write_text("call mom at 6")
+
+    rec = _batched_steps_run(monkeypatch, tmp_path, replies, on_run=on_run)
+    assert len(_file_checks(rec)) == 1
+    assert rec.result["success"] is True and rec.result["speech"] == "Saved it."
+
+
+@pytest.mark.parametrize("after", [
+    None,                                                                  # the file exists
+    {"action": "move_files", "parameter": "{tmp}\\a.txt|||{tmp}\\done"},  # moved away
+    {"action": "run_command", "parameter": "Remove-Item '{tmp}\\a.txt'"},  # state-changing command
+])
+def test_no_file_check_when_the_file_exists_or_was_moved_on(monkeypatch, tmp_path, after):
+    path = tmp_path / "a.txt"
+    steps = [{"action": "write_file", "parameter": f"{path}|||x"}]
+    if after:
+        steps.append({k: v.replace("{tmp}", str(tmp_path)) for k, v in after.items()})
+    else:
+        path.write_text("x")
+    rec = _file_check_run(monkeypatch, tmp_path, steps)
+    assert _file_checks(rec) == [] and rec.result["success"] is True
+
+
+def test_a_relative_or_unrelated_path_is_not_checked(monkeypatch, tmp_path):
+    rec = _file_check_run(monkeypatch, tmp_path, [
+        {"action": "write_file", "parameter": "notes.txt|||x"},
+        {"action": "inspect_file", "parameter": str(tmp_path / "missing.txt")}])
+    assert _file_checks(rec) == [] and rec.result["success"] is True

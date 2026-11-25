@@ -1826,3 +1826,26 @@ def test_tightened_realistic_scenarios(tmp_path):
         assert "Monthly plan: $14.99" in page
     finally:
         rs.stop_server(server)
+
+
+def test_notepad_stubs_save_through_save_file_as():
+    """rt-notepad-save / rt-notepad-edit: the stub saves with save_file_as (one
+    step, the full path) instead of Ctrl+S, typing the path and Enter; the
+    real checks are unchanged."""
+    by = {s["name"]: s for s in rs.load_scenarios(SCENARIOS)[11:]}
+    save, edit = by["rt-notepad-save"], by["rt-notepad-edit"]
+    assert [s["action"] for s in save["stub"][0]] == [
+        "open_app", "type_text", "save_file_as", "done", "done"]
+    assert save["stub"][0][2]["parameter"] == r"{tmp}\groceries.txt"
+    assert [s["action"] for s in edit["stub"][1]] == [
+        "switch_app", "hotkey", "type_text", "save_file_as", "done", "done"]
+    assert edit["stub"][1][3]["parameter"] == r"{tmp}\reminder.txt"
+    for sc in (save, edit):
+        steps = [s for turn in sc["stub"] for s in turn]
+        assert not any(s["action"] == "type_text" and "{tmp}" in s["parameter"] for s in steps)
+        assert "ui_input" in sc["tags"] and sc["timeout"] == 180
+    assert save["expect"] == {
+        "process_started": ["notepad"],
+        "file_contains": [{"path": r"{tmp}\groceries.txt", "text": "milk eggs bread",
+                           "ignore_case": True}]}
+    assert save["answers"] == ["yes", "yes"] and edit["answers"] == ["yes", "yes", "yes"]

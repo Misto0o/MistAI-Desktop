@@ -75,6 +75,7 @@
 #   67. API ERROR REDACTION
 #   68. API ERROR WORDING
 #   69. BACKEND URL AND KEY
+#   70. CRASH LOG
 # ============================================================
 
 """
@@ -562,6 +563,32 @@ DIALOG_KEYS = frozenset({
     "ctrl+s", "ctrl+shift+s", "ctrl+o", "ctrl+p", "ctrl+n", "ctrl+shift+n",
     "f12", "alt", "f10",
 })
+# The dialog keys that open a file (save / open) dialog, and that dialog's
+# window class. Inside such a dialog the agent's own key opened (same process,
+# it appeared after the key), these single keys are part of the flow and skip
+# confirmation (Delete only while typing in one of its edit boxes).
+FILE_DIALOG_KEYS = frozenset({"ctrl+s", "ctrl+shift+s", "ctrl+o", "f12"})
+DIALOG_WINDOW_CLASS = "#32770"
+OWN_DIALOG_KEYS = frozenset({"enter", "return", "escape", "esc", "delete", "del"})
+# save_file_as: a new Save As dialog is in front before its file-name box is in
+# the accessibility tree (real runs: the first look found nothing, a look a
+# step later found it). Look again for up to this long, every SAVE_BOX_POLL_S.
+SAVE_NAME_BOX_WAIT_S = 3.0
+SAVE_BOX_POLL_S = 0.1
+# Keypad buttons are often named by the word, not the glyph (Windows
+# Calculator: "Seven", "Plus", "Equals"). uia_click tries this name once, by
+# exact match, when a one-character target found nothing.
+SPELLED_KEY_NAMES = {
+    "0": "Zero", "1": "One", "2": "Two", "3": "Three", "4": "Four",
+    "5": "Five", "6": "Six", "7": "Seven", "8": "Eight", "9": "Nine",
+    "+": "Plus", "-": "Minus", "*": "Multiply by", "×": "Multiply by",
+    "/": "Divide by", "÷": "Divide by", "=": "Equals", ".": "Decimal separator",
+}
+
+
+def spelled_key_name(target):
+    """The spelled-out button name for a one-character key target, or ''."""
+    return SPELLED_KEY_NAMES.get(str(target or "").strip(), "")
 
 
 def normalized_keys(param):
@@ -1674,3 +1701,44 @@ class APIKeyManager:
     @property
     def has_key(self):
         return self._api_key != ""
+
+
+# ============================================================
+# CRASH LOG
+# ============================================================
+
+# A native crash (an access violation, heap corruption 0xC0000374) kills the
+# process with no Python traceback. faulthandler then writes the stack of
+# every thread to <logs>/crash.log: function names, files and line numbers
+# only, never values, so it holds no content. One handle stays open for the
+# whole process (faulthandler writes to its file descriptor at crash time).
+# It needs a real file: a frozen windowed app has no stderr at all.
+
+_crash_log_file = None
+
+
+def crash_log_dir():
+    return os.path.join(os.path.expanduser("~"), "MistAI", "logs")
+
+
+def enable_crash_log(folder=None):
+    """faulthandler for every thread into <folder>/crash.log (append). The
+    path, or "" when it could not be set up; never raises."""
+    global _crash_log_file
+    import faulthandler
+    import time
+
+    try:
+        if _crash_log_file is None or _crash_log_file.closed:
+            folder = folder or crash_log_dir()
+            os.makedirs(folder, exist_ok=True)
+            f = open(os.path.join(folder, "crash.log"), "a", encoding="utf-8")
+            f.write(f"--- process {os.getpid()} started {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    f" (frozen: {'yes' if getattr(sys, 'frozen', False) else 'no'})\n")
+            f.flush()
+            _crash_log_file = f
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+        return _crash_log_file.name
+    except Exception as e:
+        print(f"[CrashLog] not enabled ({type(e).__name__})")
+        return ""
