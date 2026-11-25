@@ -245,7 +245,8 @@ def parse_log(text):
 # label, an exception type or an HTTP status.
 INFRA_LINES = (
     (re.compile(r"\[AgentLoop\] Network error: (\w+) after [\d.]+s"), lambda m: m.group(1)),
-    (re.compile(r"\[\w+\] [\w ]{1,40}? (?:request failed|is rate-limited or unavailable right now)"
+    (re.compile(r"\[\w+\] [\w ]{1,40}? (?:request failed|is busy right now"
+                r"|is rate-limited or unavailable right now)"
                 r" \(HTTP (5\d\d|429)\b"), lambda m: "HTTP " + m.group(1)),
     (re.compile(r"\[\w+\] LLM call failed: (\w*(?:Timeout|ConnectionError))\b"),
      lambda m: m.group(1)),

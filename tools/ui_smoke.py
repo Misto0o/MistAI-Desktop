@@ -8,7 +8,8 @@ Not part of pytest or CI. Windows only; needs pywebview and the Edge WebView2
 runtime (what the app itself needs). No microphone, no Node, no network:
 
 - memory/tasks/tool stats go to a throwaway SQLite file (MISTAI_DB_PATH),
-  seeded with user_gender=female and model=mistral;
+  seeded with user_gender=female and an old picker value model=mistral
+  (ignored: Nova runs, and the row is left as it was);
 - Api.check_api_status is stubbed at class level (so pywebview still exposes
   it); no LLM request is made;
 - the page is a copy of ui/html.py's HTML with an error-capture snippet added
@@ -69,11 +70,11 @@ console.error=(...a)=>{__smokeErrors.push('console.error: '+a.map(String).join('
 
 _STATE = """JSON.stringify({
   online: document.getElementById('online-text').textContent,
-  options: Array.from(document.getElementById('sel-model').options)
-    .map(o=>[o.value,o.textContent]),
-  model: document.getElementById('sel-model').value,
+  modelControl: !!(document.getElementById('sel-model')||document.getElementById('model-note')),
+  modelWords: (()=>{const b=document.body.cloneNode(true);
+    b.querySelectorAll('script,style').forEach(e=>e.remove());
+    return (b.textContent.match(/(nova|flux|sage|cohere|gemini|mistral|model)/gi)||[]);})(),
   gender: document.getElementById('sel-gender').value,
-  note: document.getElementById('model-note').textContent,
   backendRow: getComputedStyle(document.getElementById('backend-row')).display,
   errors: window.__smokeErrors || ['capture snippet missing']})"""
 
@@ -145,7 +146,7 @@ def main_mode(mode):
     import webview
 
     from core.api import Api
-    from core.config import MODEL_CHOICES, MODEL_LABELS, esc
+    from core.config import DEFAULT_MODEL, esc
     from core.memory import Memory
     from ui.html import HTML
 
@@ -203,7 +204,6 @@ def main_mode(mode):
         page = HTML.replace("<head>", "<head>" + _CAPTURE, 1)
         window = webview.create_window("MistAI UI smoke", html=page, js_api=api, hidden=True)
         api._window = window
-        expected_options = [[m, MODEL_LABELS[m]] for m in MODEL_CHOICES]
 
         def checks(state, saved, ptt, voice, facts, confirm):
             before, listening, note, after = (ptt.get(k) or {} for k in
@@ -211,13 +211,15 @@ def main_mode(mode):
             return [
                 ("header leaves 'Checking...'", state["online"] not in ("", "Checking..."),
                  state["online"]),
-                ("Model dropdown has the labelled options (Nova, Flux)",
-                 state["options"] == expected_options, state["options"]),
-                ("saved model (mistral) is selected", state["model"] == "mistral",
-                 state["model"]),
+                ("Settings has no model control", state["modelControl"] is False,
+                 state["modelControl"]),
+                ("page text names no model", state["modelWords"] == [], state["modelWords"]),
+                ("old saved model (mistral) ignored: Nova runs, the row is untouched",
+                 api.current_model() == DEFAULT_MODEL
+                 and api.memory.get_profile("model") == "mistral",
+                 [api.current_model(), api.memory.get_profile("model")]),
                 ("Gender select shows the saved value (female)", state["gender"] == "female",
                  state["gender"]),
-                ("model note is empty", state["note"] == "", state["note"]),
                 (f"backend switch {'shown' if expect_dev else 'hidden'}",
                  (state["backendRow"] != "none") == expect_dev, state["backendRow"]),
                 (f"Save {'switches' if expect_dev else 'never switches'} the route",
@@ -276,7 +278,7 @@ def main_mode(mode):
                 # Startup has settled once the flags step has applied (the row
                 # is shown in dev) and the other cards have loaded.
                 def started(s):
-                    return (s["options"] and s["online"] != "Checking..."
+                    return (s["online"] != "Checking..."
                             and s["gender"] == "female"
                             and (s["backendRow"] != "none") == expect_dev)
                 state = json.loads(poll(_STATE, lambda v: started(json.loads(v))))

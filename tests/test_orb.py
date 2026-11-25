@@ -767,9 +767,8 @@ globalThis.pywebview = {api: {orb_state: () => Promise.resolve({state: states.sh
 
     @floating_orb_window_needs_node
     def test_the_switch_asks_python_and_shows_what_python_saved(self, tmp_path):
-        options, set_results, set_gender = _real_outputs()
-        cfg = {"options": options, "gender": "female", "set_model": set_results,
-               "set_gender": set_gender, "flags": {"is_dev": False}}
+        set_gender = _real_outputs()
+        cfg = {"gender": "female", "set_gender": set_gender, "flags": {"is_dev": False}}
         prefix = _HARNESS.split("%PAGE%", 1)[0]
         f = tmp_path / "toggle.js"
         f.write_text(prefix.replace("%CONFIG%", json.dumps(cfg)) + _script() + _TOGGLE,
@@ -3090,9 +3089,8 @@ const settle = () => new Promise(r => realSetTimeout(r, 30));
 
 @orb_states_needs_node
 def test_the_page_drives_the_orb_from_its_existing_signals(tmp_path):
-    options, set_results, set_gender = _real_outputs()
-    cfg = {"options": options, "gender": "female", "set_model": set_results,
-           "set_gender": set_gender, "flags": {"is_dev": False}}
+    set_gender = _real_outputs()
+    cfg = {"gender": "female", "set_gender": set_gender, "flags": {"is_dev": False}}
     prefix = _HARNESS.split("%PAGE%", 1)[0]
     script = tmp_path / "orb.js"
     script.write_text(prefix.replace("%CONFIG%", json.dumps(cfg)) + _script() + _DRIVE,

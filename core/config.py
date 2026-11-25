@@ -105,17 +105,16 @@ FALLBACK_API = "https://mist-ai.fly.dev/api/v1/chat"
 # structured agent-mode contract.
 API_MODE = "backend"  # "direct_api" or "backend"
 
-# The models the user can pick in Settings (Api.set_model, saved as the
-# user_profile key "model"). Every LLM call -- agent, planner, conversation
-# router, hotkey lookup -- tries model_chain(the one picked): that model, then
-# the other one once when the backend answers with an HTTP error. Vision
-# stays on Cohere (screen.py CohereVision), never one of these.
+# The models sent to the backend. There is no picker: every LLM call --
+# agent, planner, conversation router, hotkey lookup -- tries
+# model_chain(Api.current_model()), i.e. Nova, then Flux once when the backend
+# answers with an HTTP error. A saved profile "model" value is never read.
+# Vision stays on Cohere (screen.py CohereVision), never one of these.
 MODEL_CHOICES = ("gemini", "mistral")   # ids sent to the backend; first = default
-# What the UI shows for each id (Api.get_model_options). The only place the
-# names appear: ui/html.py hardcodes no id or label.
+# Names for log lines (and live_checks --model); never shown in the UI.
 MODEL_LABELS = {"gemini": "Nova", "mistral": "Flux"}
 DEFAULT_MODEL = "gemini"
-AGENT_MODEL = DEFAULT_MODEL  # alias: the default before the user picks one
+AGENT_MODEL = DEFAULT_MODEL  # alias used by tools/run_scenarios.py
 # Conversation layer (core/conversation.py): timeout of the chat-or-task
 # routing call (primary URL only, no fallback). Any failure routes to the
 # agent.
@@ -1591,11 +1590,12 @@ ERROR_DETAIL_CHARS = 120
 # API ERROR WORDING
 # ============================================================
 
-def describe_api_error(response, model=""):
+def describe_api_error(response):
     """One plain sentence for a failed LLM response: the status code plus the
     body's "error"/"message" field (capped, URLs and key-like strings
-    removed). Never headers, keys, URLs or the request text. The caller
-    decides what to do; nothing here retries or switches models."""
+    removed). Never headers, keys, URLs, the request text or a model name
+    (it is shown, captioned and spoken). The caller decides what to do;
+    nothing here retries or switches models."""
     status = getattr(response, "status_code", None)
     detail = ""
     try:
@@ -1609,14 +1609,11 @@ def describe_api_error(response, model=""):
         pass
     if len(detail) > ERROR_DETAIL_CHARS:
         detail = detail[: ERROR_DETAIL_CHARS - 3].rstrip() + "..."
-    # The name the user sees in Settings (MODEL_LABELS), not the backend id.
-    name = MODEL_LABELS.get(model) or (model or "the model").capitalize()
     code = f"HTTP {status}" if status else "no status"
     reason = f"{code}: {detail}" if detail else code
     if status == 429:
-        return (f"{name} is rate-limited or unavailable right now ({reason}). "
-                f"Pick another model in Settings or try again later.")
-    return f"{name} request failed ({reason})."
+        return f"The service is busy right now ({reason}). Try again in a moment."
+    return f"The service request failed ({reason})."
 
 
 # ============================================================

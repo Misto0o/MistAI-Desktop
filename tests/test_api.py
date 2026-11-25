@@ -62,7 +62,7 @@ import pytest
 from ui.html import HTML
 
 from core.api import Api
-from core.config import MODEL_CHOICES, MODEL_LABELS, APIKeyManager
+from core.config import MODEL_CHOICES, MODEL_LABELS, APIKeyManager, describe_api_error
 from core.memory import Memory
 import core.api as api_mod
 from core.executor import Executor
@@ -82,7 +82,8 @@ from core.tools import ToolSpec
 #
 # String checks always run. The Node tests run the WHOLE page script with those
 # storage APIs throwing, fire pywebviewready, and feed it the REAL
-# get_model_options()/set_model() output; they skip when Node is missing.
+# set_user_gender() output; they skip when Node is missing. There is no
+# model picker: the page never asks for, shows or sends a model.
 #
 # Merged by area (pure moves, no test changed) from: test_ui_model_card.py, test_ui_facts.py, test_ui_flags.py, test_ui_ptt.py.
 
@@ -113,17 +114,17 @@ def test_page_uses_no_browser_storage():
 
 
 def test_page_hardcodes_no_model_id_or_label():
-    for word in (*MODEL_CHOICES, *MODEL_LABELS.values()):
+    for word in (*MODEL_CHOICES, *MODEL_LABELS.values(), "cohere", "sage"):
         assert not re.search(rf"\b{re.escape(word)}\b", HTML, re.I), word
-    m = re.search(r'<select id="sel-model">(.*?)</select>', HTML, re.S)
-    assert m and m.group(1).strip() == ""
+    assert "sel-model" not in HTML and "model-note" not in HTML
 
 
 def test_startup_starts_intervals_first_and_runs_each_step_on_its_own():
     h = _ready_handler()
     assert h.startswith(",()=>{")                      # not async: nothing awaited in turn
     intervals = [h.index(f"setInterval({f}") for f in ("updateStats", "checkStatus", "syncBusy")]
-    steps = [h.index(f"runStep('{s}',") for s in ("flags", "gender", "models", "stats", "status")]
+    steps = [h.index(f"runStep('{s}',") for s in ("flags", "gender", "stats", "status")]
+    assert "runStep('models'" not in h
     assert max(intervals) < min(steps)
     assert "await" not in h
     assert "async function runStep(name,step){\n  try{await step();}catch(e){console.error(" \
@@ -139,13 +140,26 @@ def test_gender_comes_from_python_and_is_saved_there():
         in js
 
 
-def test_model_card_shows_labels_sends_ids_and_has_a_visible_note():
+def test_settings_has_no_model_card_and_the_page_never_asks_for_a_model():
     js = _script()
-    assert '<div class="card-note" id="model-note">Loading models...</div>' in HTML
-    assert "opt.value=String(c.id);opt.textContent=String(c.label||c.id);" in js
-    assert "pywebview.api.set_model(e.target.value)" in js
-    assert "'Model: '+(r.label||r.model)+' (applies from the next request)'" in js
-    assert "setModelNote('Could not load the model list: '" in js
+    assert not re.search(r'<div class="card-title">\s*Model\s*</div>', HTML)
+    for gone in ("get_model_options", "set_model", "loadModels", "setModelNote", "selModel",
+                 "applies from the next request", "Loading models"):
+        assert gone not in HTML, gone
+    # The text a user can read (markup minus scripts, styles and comments)
+    # names no model and no Settings remedy.
+    page = re.sub(r"<script>.*?</script>|<style>.*?</style>|<!--.*?-->", "", HTML, flags=re.S)
+    visible = re.sub(r"<[^>]+>", " ", page)
+    assert not re.search(r"\b(model|models|nova|flux|sage|cohere)\b", visible, re.I)
+    assert "another model" not in js.lower()
+
+
+def test_no_user_visible_error_names_a_model_or_points_to_settings():
+    for status in (429, 400, 500, 502, 503, None):
+        resp = SimpleNamespace(status_code=status, json=lambda: {"error": "x"})
+        msg = describe_api_error(resp)
+        assert not re.search(r"\b(nova|flux|sage|cohere|gemini|mistral|model|settings)\b",
+                             msg, re.I), msg
 
 
 # -- the whole page in Node ----------------------------------------------------------
@@ -197,11 +211,12 @@ function makeEl(tag) {
   };
 }
 const els = {};
+const looked = new Set();       // every id the page looked up
 const denied = (what) => () => {
   throw new Error("Failed to read the '" + what + "' property from 'Window': Access is denied for this document.");
 };
 globalThis.document = {
-  getElementById(id) { return els[id] || (els[id] = makeEl('#' + id)); },
+  getElementById(id) { looked.add(id); return els[id] || (els[id] = makeEl('#' + id)); },
   createElement(t) { return makeEl(t); },
 };
 Object.defineProperty(globalThis.document, 'cookie', {get: denied('cookie'), set: denied('cookie')});
@@ -223,10 +238,8 @@ function api(name, value) {
   };
 }
 globalThis.pywebview = {api: {
-  get_model_options: api('get_model_options', CONFIG.options),
   get_user_gender: api('get_user_gender', CONFIG.gender),
   set_user_gender: api('set_user_gender', (g) => CONFIG.set_gender[g]),
-  set_model: api('set_model', (m) => CONFIG.set_model[m]),
   get_memory_stats: api('get_memory_stats',
     {conversation_length: 3, actions_performed: 2, facts_remembered: 1, pending_reminders: 0}),
   check_api_status: api('check_api_status', {online: true}),
@@ -248,10 +261,8 @@ let out_actions = [];
 (async () => {
   for (const fn of listeners['pywebviewready'] || []) fn();
   await settle();
-  const sel = document.getElementById('sel-model'), note = document.getElementById('model-note');
   const snap = () => ({
-    options: sel.children.map(o => [o.value, o.textContent]), value: sel.value,
-    note: [note.textContent, note.className],
+    looked: [...looked].sort(),
     msgs: document.getElementById('chat').children.map(m => [m.className, m.textContent]),
   });
   const out = {calls: calls.slice(), intervals, consoleErrors: consoleErrors.slice(),
@@ -261,7 +272,6 @@ let out_actions = [];
     stats: String(document.getElementById('stat-msgs').textContent),
     // Not set by the page: the HTML default stays (display:none, string-checked).
     backendRow: document.getElementById('backend-row').style.display || 'unset', ...snap()};
-  for (const m of CONFIG.change || []) await sel.onchange({target: {value: m}});
   const gsel = document.getElementById('sel-gender');
   for (const g of CONFIG.gender_change || []) await gsel.onchange({target: {value: g}});
   // Push-to-talk and wake actions, with a snapshot after each.
@@ -308,14 +318,11 @@ let out_actions = [];
 # ============================================================
 
 def _real_outputs():
-    """The REAL Api methods' output, as the page would receive it."""
+    """The REAL Api set_user_gender output, as the page would receive it."""
     api = Api.__new__(Api)
     api.memory = SimpleNamespace(set_profile=lambda *_a: None)
     api.tts = SimpleNamespace(set_gender=lambda _g: None)
-    options = api.get_model_options()
-    set_results = {m: api.set_model(m) for m in ("mistral", "bogus")}
-    set_gender = {g: api.set_user_gender(g) for g in ("male", "robot")}
-    return options, set_results, set_gender
+    return {g: api.set_user_gender(g) for g in ("male", "robot")}
 
 
 # ============================================================
@@ -323,9 +330,8 @@ def _real_outputs():
 # ============================================================
 
 def _run_page(tmp_path, **config):
-    options, set_results, set_gender = _real_outputs()
-    cfg = {"options": options, "gender": "female", "set_model": set_results,
-           "set_gender": set_gender, "flags": {"is_dev": True}, **config}
+    set_gender = _real_outputs()
+    cfg = {"gender": "female", "set_gender": set_gender, "flags": {"is_dev": True}, **config}
     script = tmp_path / "page.js"
     script.write_text(_HARNESS.replace("%CONFIG%", json.dumps(cfg))
                       .replace("%PAGE%", _script()), encoding="utf-8")
@@ -341,11 +347,8 @@ def _run_page(tmp_path, **config):
 needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 
 
-LABELLED = [["gemini", "Nova"], ["mistral", "Flux"]]
-
-
-STARTUP_CALLS = {"get_ui_flags", "get_user_gender", "get_model_options", "get_memory_stats",
-                 "check_api_status"}
+STARTUP_CALLS = {"get_ui_flags", "get_user_gender", "get_memory_stats", "check_api_status"}
+MODEL_CALLS = {"get_model_options", "set_model"}
 
 
 # ============================================================
@@ -354,49 +357,39 @@ STARTUP_CALLS = {"get_ui_flags", "get_user_gender", "get_model_options", "get_me
 
 @needs_node
 def test_whole_page_starts_with_storage_denied_and_renders_the_real_options(tmp_path):
-    r = _run_page(tmp_path, change=["mistral", "bogus"], gender_change=["male", "robot"])
+    r = _run_page(tmp_path, gender_change=["male", "robot"])
     assert r["consoleErrors"] == []                 # storage was never touched
     assert STARTUP_CALLS <= set(r["calls"])
     assert r["intervals"] == [1000, 4000, 20000, 1500]   # clock, then the three
     assert r["gender"] == "female"                  # from Python, not the browser
-    assert r["options"] == LABELLED and r["value"] == "gemini"
-    assert r["note"] == ["", "card-note"]
     assert r["online"] == "Online" and r["stats"] == "3"
-    # Choosing Flux sends the id; an id Python refuses shows its error and the
-    # card reloads to the model really in use.
     assert r["after"]["msgs"] == [
-        ["msg system", "Model: Flux (applies from the next request)"],
-        ["msg error", "Unknown model. Choose one of: gemini, mistral."],
         # A refused gender shows Python's error and reloads the saved value.
         ["msg error", "Unknown gender address. Choose one of: male, female, none."],
     ]
-    assert r["after"]["calls"] == ["set_model", "set_model", "get_model_options",
-                                   "set_user_gender", "set_user_gender", "get_user_gender"]
+    assert r["after"]["calls"] == ["set_user_gender", "set_user_gender", "get_user_gender"]
 
 
 @needs_node
-def test_a_failed_model_load_shows_a_visible_error_and_blocks_nothing(tmp_path):
-    r = _run_page(tmp_path, fail={"get_model_options": "reject"})
-    assert r["note"] == ["Could not load the model list: get_model_options failed",
-                         "card-note error"]
-    assert any(e.startswith("[models] could not load the model list:")
-               for e in r["consoleErrors"])
+def test_the_page_never_calls_a_model_api_or_looks_up_a_model_control(tmp_path):
+    r = _run_page(tmp_path, gender_change=["male"])
+    assert not MODEL_CALLS & set(r["calls"] + r["after"]["calls"])
+    assert not {"sel-model", "model-note"} & set(r["looked"] + r["after"]["looked"])
+    assert not any("[models]" in e for e in r["consoleErrors"])
     assert r["online"] == "Online" and r["stats"] == "3" and r["gender"] == "female"
     assert r["intervals"] == [1000, 4000, 20000, 1500]
 
 
 @needs_node
-def test_an_empty_model_list_is_an_error_not_a_blank_dropdown(tmp_path):
-    r = _run_page(tmp_path, options={"choices": [], "current": "gemini"})
-    assert r["options"] == []
-    assert r["note"] == ["Could not load the model list: no models were returned",
-                         "card-note error"]
+def test_no_chat_message_mentions_a_model(tmp_path):
+    r = _run_page(tmp_path, gender_change=["male", "robot"])
+    text = " ".join(t for _c, t in r["msgs"] + r["after"]["msgs"])
+    assert not re.search(r"\b(model|nova|flux|sage|cohere)\b", text, re.I)
 
 
 @needs_node
 def test_a_step_that_never_answers_does_not_block_the_others(tmp_path):
     r = _run_page(tmp_path, fail={"get_user_gender": "hang"})
-    assert r["options"] == LABELLED
     assert r["online"] == "Online" and r["stats"] == "3"
     assert r["intervals"] == [1000, 4000, 20000, 1500]
 
@@ -633,7 +626,7 @@ def test_flags_that_never_load_leave_the_page_as_a_build(tmp_path, fail):
     r = _run_page(tmp_path, fail={"get_ui_flags": fail}, save=SAVES)
     assert r["backendRow"] == "unset"                          # the hidden HTML default
     assert "set_api_mode" not in r["after"]["calls"]
-    assert r["options"] and r["online"] == "Online"            # nothing else blocked
+    assert r["stats"] == "3" and r["online"] == "Online"       # nothing else blocked
 
 
 # ==========================================================================

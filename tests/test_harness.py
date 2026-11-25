@@ -282,7 +282,7 @@ def _changer(seen, exc):
         os.environ["MISTAI_SCRUB_OUTBOUND"] = "0"
         os.environ["MISTAI_LIVECHECK_TEST"] = "1"
         api.set_ask_before_sending("never")
-        api.set_model("mistral")
+        api._model_override = "mistral"            # as --model does
         api.remember_send_approval("discord", CONTACT)
         raise exc
     return change
@@ -304,7 +304,7 @@ def test_settings_and_env_are_restored_after_a_failing_or_interrupted_check(tmp_
             try:
                 seen["restored"] = (
                     {k: api.memory.get_profile(k) for k in ("model", "ask_before_sending")},
-                    api.get_remembered_approvals_count(), api._model)
+                    api.get_remembered_approvals_count(), api._model_override)
             except Exception:
                 pass
         real_close(api)
@@ -315,7 +315,8 @@ def test_settings_and_env_are_restored_after_a_failing_or_interrupted_check(tmp_
     assert got == code
     assert {k: v for k, v in os.environ.items() if k.startswith("MISTAI_")} == env
     profile, approvals, model = seen["restored"]
-    assert profile == seen["before"] and approvals == 0 and model != "mistral"
+    assert profile == seen["before"] and approvals == 0 and model is None
+    assert profile["model"] is None                          # nothing writes a model row
     assert _status(summary, "loop-guard") == "PASS"          # ran before the broken check
     if code == 130:
         assert _status(summary, "approval-count") == "SKIP" and "interrupted (Ctrl+C)" in summary
@@ -394,14 +395,17 @@ def test_wrong_person_check_fails_when_a_mismatched_header_is_accepted(tmp_path,
 def test_infra_lines_are_recognised_by_shape_only():
     log = "\n".join([
         "[AgentLoop] Network error: ReadTimeout after 30.1s",
-        "  [Conversation] Nova request failed (HTTP 503: upstream busy).",
+        "  [Conversation] The service request failed (HTTP 503: upstream busy).",
         "[Planner] LLM call failed: ConnectTimeout",
-        "[AgentLoop] Flux is rate-limited or unavailable right now (HTTP 429: slow down). Pick ...",
-        "[AgentLoop] Nova request failed (HTTP 400: bad request).",        # a client error: not INFRA
+        "[AgentLoop] The service is busy right now (HTTP 429: slow down). Try again in a moment.",
+        "[AgentLoop] The service request failed (HTTP 400: bad request).",  # a client error: not INFRA
         "[Conversation] Router failed (ValueError) -- routing to agent",
         "[AgentLoop] Agent call failed: KeyError after 0.1s",
     ])
     assert lc.infra_errors(log) == ["ReadTimeout", "HTTP 503", "ConnectTimeout", "HTTP 429"]
+    # Lines written before the wording change still count.
+    assert lc.infra_errors("[AgentLoop] Flux is rate-limited or unavailable right now "
+                           "(HTTP 429: slow down). Pick ...") == ["HTTP 429"]
     assert lc.classify("FAIL", ["ReadTimeout"], hard=False) == "INFRA"
     assert lc.classify("FAIL", ["ReadTimeout"], hard=True) == "FAIL"     # a safety violation stays
     assert lc.classify("FAIL", [], hard=False) == "FAIL"
@@ -528,11 +532,15 @@ def test_model_is_validated_against_the_choices(tmp_path, capsys):
     assert lc.resolve_model("") is None
 
 
-def test_model_is_applied_through_the_profile_and_restored(tmp_path, monkeypatch):
+def test_model_override_is_applied_without_the_profile_and_restored(tmp_path, monkeypatch):
+    """--model (testing only) sets Api._model_override: the chain starts there,
+    nothing is written to the profile, and it is cleared afterwards."""
+    from core.config import model_chain
     seen = {}
 
     def look(ctx):
-        seen["during"] = (ctx.api.current_model(), ctx.api.memory.get_profile("model"))
+        seen["during"] = (ctx.api.current_model(), ctx.api.memory.get_profile("model"),
+                          model_chain(ctx.api.current_model()))
         return "PASS", []
 
     real_restore = lc.restore_settings
@@ -544,8 +552,8 @@ def test_model_is_applied_through_the_profile_and_restored(tmp_path, monkeypatch
     monkeypatch.setitem(lc.CHECK_FUNCS, "approval-count", look)
     monkeypatch.setattr(lc, "restore_settings", restore)
     code, summary = _run(tmp_path, "--only", "approval-count", "--model", "Flux")
-    assert code == 0 and seen["during"] == ("mistral", "mistral")
-    assert seen["after"] != "mistral"
+    assert code == 0 and seen["during"] == ("mistral", None, ("mistral", "gemini"))
+    assert seen["after"] == "gemini"
     assert "Model: mistral (Flux), set with --model" in summary
 
 

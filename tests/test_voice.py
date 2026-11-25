@@ -2231,7 +2231,7 @@ def _api_error_result():
     speech to the same describe_api_error() sentence."""
     from core.config import describe_api_error
     response = SimpleNamespace(status_code=503, json=lambda: {"error": "overloaded"})
-    message = describe_api_error(response, "gemini")
+    message = describe_api_error(response)
     return message, {"success": False, "command": {"action": "done", "parameter": "",
                                                    "speech": message},
                      "steps": 0, "error": message}

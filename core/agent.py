@@ -1136,7 +1136,7 @@ class AgentLoop:
                     }
 
                     self._check_request_size(system, messages)
-                    # model_chain: the picked model (today's URL fallback,
+                    # model_chain: the first model, Nova (today's URL fallback,
                     # except a 429 goes straight on), then the other model
                     # once at the primary URL; then the error path below.
                     chain = model_chain(model)
@@ -1147,7 +1147,7 @@ class AgentLoop:
                         r = _post(url, json=request_data, headers=headers, timeout=30)
                         if r.ok:
                             break
-                        failed_model, failed_response = attempt_model, r
+                        failed_response = r
                         tried.append(f"{name} primary {r.status_code}")
                         fallback_url = (self.api.api_manager.get_fallback_url()
                                         if attempt == 0 and r.status_code != 429 else None)
@@ -1165,8 +1165,8 @@ class AgentLoop:
                     if not r.ok:
                         print(f"[AgentLoop] API failed: {'; '.join(tried)}")
                         # Say what the backend said for the last model tried
-                        # (its primary-URL answer), plainly.
-                        message = describe_api_error(failed_response, failed_model)
+                        # (its primary-URL answer), plainly; no model name.
+                        message = describe_api_error(failed_response)
                         print(f"[AgentLoop] {message}")
                         if self.api.caption_window and self.api.captions_enabled:
                             self.api.caption_window.show_error(message, 5)

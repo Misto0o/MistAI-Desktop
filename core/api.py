@@ -62,7 +62,6 @@ from .config import (
     ENTER_CONFIRM_APPS,
     GENDER_CHOICES,
     MODEL_CHOICES,
-    MODEL_LABELS,
     orb_flight_enabled,
     orb_panels_enabled,
     PTT_PAUSE_THRESHOLD,
@@ -727,8 +726,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         # Nothing is seeded: built-in hotkeys and MistAI's facts about itself
         # are read from code (config.DEFAULT_HOTKEYS, config.MISTAI_FACTS).
         self.tts.set_gender(self.memory.get_profile("user_gender", "none"))
-        self._model = self._load_model_choice()
-        self._request_model = None  # the running request's model (hotkey lookup)
+        self._model_override = None  # live_checks --model only (current_model)
         self.vision = CohereVision()
         self.live = LiveStateTracker()
         # Frames on demand + change detection (WindowWatch), fed by the
@@ -1837,40 +1835,15 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         saved = saved.strip().lower()
         return saved if saved in GENDER_CHOICES else DEFAULT_GENDER
 
-    # -- Model choice -----------------------------------------------------------
-
-    def _load_model_choice(self):
-        saved = str(self.memory.get_profile("model", DEFAULT_MODEL) or "").strip().lower()
-        if saved not in MODEL_CHOICES:
-            print(f"[Model] Saved choice is not one of {MODEL_CHOICES}; using {DEFAULT_MODEL}")
-            return DEFAULT_MODEL
-        return saved
+    # -- Model (always Nova, then Flux; no picker) --------------------------------
 
     def current_model(self):
-        """The model every LLM call uses: the user's choice, else
-        DEFAULT_MODEL. ask_mistai reads it once per request, so a change
-        applies from the next request."""
-        model = getattr(self, "_model", None)
+        """The first model of every LLM call's chain: DEFAULT_MODEL (Nova).
+        A saved profile "model" value (from the old Settings picker) is never
+        read or written. ``_model_override`` (a MODEL_CHOICES id) is for
+        tools/live_checks.py --model only; nothing in the UI sets it."""
+        model = getattr(self, "_model_override", None)
         return model if model in MODEL_CHOICES else DEFAULT_MODEL
-
-    def set_model(self, name):
-        """Validate against MODEL_CHOICES and save as the profile key "model"."""
-        model = str(name or "").strip().lower()
-        if model not in MODEL_CHOICES:
-            return {"success": False,
-                    "error": f"Unknown model. Choose one of: {', '.join(MODEL_CHOICES)}."}
-        self._model = model
-        self.memory.set_profile("model", model)
-        print(f"[Model] Set to {model} (applies from the next request)")
-        return {"success": True, "model": model, "label": MODEL_LABELS.get(model, model)}
-
-    def get_model_options(self):
-        """Every choice as {id, label} (the UI shows labels, sends ids), plus
-        the current id."""
-        return {
-            "choices": [{"id": m, "label": MODEL_LABELS.get(m, m)} for m in MODEL_CHOICES],
-            "current": self.current_model(),
-        }
 
     # -- Floating orb (Settings, default off; core/floating_orb.py) -----------
 
@@ -2332,9 +2305,9 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         thread_started = False  # has the agent thread (which owns release) begun?
         minimized = False       # did THIS call minimize MistAI (restored at the end)?
         heartbeat = None        # this task's "Still working." timer (voice only)
-        # Single sources of truth: the model is the user's choice, read once
-        # here so the whole request keeps it (the ``model`` argument is
-        # ignored: nothing may pick a different one per call); the gender
+        # Single sources of truth: the model is current_model() (Nova, then
+        # Flux), read once here (the ``model`` argument is ignored: nothing
+        # may pick a different one per call); the gender
         # comes from the saved profile (the UI dropdown writes the profile
         # too, so text and voice can no longer disagree about "sir").
         model = self.current_model()
@@ -2420,7 +2393,6 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     my_gen = self._agent_generation
                     self._agent_task = message
                     self._agent_started_at = time.time()
-                    self._request_model = model  # the hotkey lookup follows it
 
             if gate_taken:
                 self._trusted_project_roots = set()
@@ -2465,7 +2437,6 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     if my_gen != self._agent_generation:
                         return  # stale callback from an older run; ignore
                     self._agent_task = None
-                    self._request_model = None
                     try:
                         self._agent_lock.release()
                     except RuntimeError:
@@ -2555,7 +2526,6 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 self._cancel_heartbeat(heartbeat)
                 with self._agent_state_lock:
                     self._agent_task = None
-                    self._request_model = None
                     try:
                         self._agent_lock.release()
                     except RuntimeError:
@@ -3777,8 +3747,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 f"'ctrl+k', nothing else. If you genuinely don't know, reply "
                 f"exactly 'unknown'."
             )
-            # The running request's model while a task runs, else the choice.
-            model = getattr(self, "_request_model", None) or self.current_model()
+            model = self.current_model()
             # model_chain: the model, then the next one once after an HTTP error.
             chain = model_chain(model)
             for attempt, attempt_model in enumerate(chain):
@@ -3790,7 +3759,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 )
                 if r.ok:
                     break
-                print(f"[Hotkey] {describe_api_error(r, attempt_model)}")
+                print(f"[Hotkey] {describe_api_error(r)}")
                 if attempt + 1 < len(chain):
                     print(model_failover_line("Hotkey", attempt_model, r.status_code,
                                               chain[attempt + 1]))

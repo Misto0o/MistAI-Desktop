@@ -277,12 +277,6 @@ button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{trans
       <select id="sel-gender"><option value="none">Neutral</option><option value="male">Sir</option><option value="female">Ma'am</option></select>
     </div>
 
-    <div class="card">
-      <div class="card-title">Model</div>
-      <!-- Options come from Api.get_model_options() (config.MODEL_CHOICES). -->
-      <select id="sel-model"></select>
-      <div class="card-note" id="model-note">Loading models...</div>
-    </div>
   </div>
 
   <div class="center">
@@ -372,7 +366,7 @@ const btnSend=document.getElementById('btn-send'),orb=document.getElementById('o
 const orbWrap=document.getElementById('orb-wrap');
 const swWake=document.getElementById('sw-wake');
 const swCap=document.getElementById('sw-cap'),wave=document.getElementById('wave');
-const selGender=document.getElementById('sel-gender'),selModel=document.getElementById('sel-model');
+const selGender=document.getElementById('sel-gender');
 const apiModal=document.getElementById('apiModal');
 const mistStatus=document.getElementById('mist-status'),mistStatusText=document.getElementById('mist-status-text');
 const btnPtt=document.getElementById('btn-ptt'),ctrlCaption=document.getElementById('ctrl-caption');
@@ -429,7 +423,6 @@ window.addEventListener('pywebviewready',()=>{
   setInterval(syncBusy,1500);
   runStep('flags',loadFlags);
   runStep('gender',loadGender);
-  runStep('models',loadModels);
   runStep('stats',updateStats);
   runStep('status',checkStatus);
   runStep('orb',loadOrbSetting);
@@ -452,47 +445,6 @@ selGender.onchange=async e=>{
     const r=await pywebview.api.set_user_gender(e.target.value);
     if(!(r&&r.success)){addMsg((r&&r.error)||'Could not save the gender address','error');await loadGender();}
   }catch(err){console.error('[gender] save failed:',err);addMsg('Could not save the gender address: '+err,'error');}
-};
-
-// The model choice lives in Python; the UI shows labels and sends ids. A
-// running request keeps its model.
-const modelNote=document.getElementById('model-note');
-function setModelNote(text,isError){
-  modelNote.textContent=text;
-  modelNote.className='card-note'+(isError?' error':'');
-}
-async function loadModels(){
-  try{
-    const o=await pywebview.api.get_model_options();
-    const choices=(o&&Array.isArray(o.choices))?o.choices:[];
-    if(!choices.length)throw new Error('no models were returned');
-    selModel.innerHTML='';
-    for(const c of choices){
-      const opt=document.createElement('option');
-      opt.value=String(c.id);opt.textContent=String(c.label||c.id);
-      selModel.appendChild(opt);
-    }
-    selModel.value=o.current;
-    setModelNote('',false);
-  }catch(e){
-    console.error('[models] could not load the model list:',e);
-    setModelNote('Could not load the model list: '+((e&&e.message)||e),true);
-  }
-}
-selModel.onchange=async e=>{
-  if(!ready)return;
-  try{
-    const r=await pywebview.api.set_model(e.target.value);
-    if(r&&r.success){
-      addMsg('Model: '+(r.label||r.model)+' (applies from the next request)','system');
-    }else{
-      addMsg((r&&r.error)||'Could not change the model','error');
-      await loadModels();   // show the model that is really in use
-    }
-  }catch(err){
-    console.error('[models] set_model failed:',err);
-    addMsg('Error: '+err,'error');await loadModels();
-  }
 };
 
 function setMistStatus(state,text){
@@ -879,8 +831,8 @@ async function send() {
     // finish (or reports still_running / busy honestly). A UI timer that
     // gave up after 130s used to unlock the input while the loop was still
     // driving the mouse -- which is how two agents ended up running at once.
-    // model + gender are resolved on the Python side (Api.current_model(),
-    // set from the Model card, and the saved profile) -- the UI passes null.
+    // model + gender are resolved on the Python side (Api.current_model()
+    // and the saved profile) -- the UI passes null.
     const res = await pywebview.api.ask_mistai(msg, null, null);
     stepEl = null;
     showResult(res);

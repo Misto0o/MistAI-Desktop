@@ -753,7 +753,7 @@ def test_no_key_backend_failure_is_not_masked_by_an_unauthenticated_fallback(
     assert calls == [("https://example.invalid/public", "gemini"),
                      ("https://example.invalid/public", "mistral")]
     # The last failure itself is reported, plainly (describe_api_error).
-    assert result["error"] == "Flux request failed (HTTP 503)."
+    assert result["error"] == "The service request failed (HTTP 503)."
 
 
 def test_stop_while_model_request_is_in_flight_prevents_returned_action_dispatch(

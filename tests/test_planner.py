@@ -928,9 +928,9 @@ def test_chat_routed_turn_leaves_the_workspace_alone(monkeypatch, tmp_path):
 
 # ==========================================================================
 # moved from tests/test_model_choice.py
-# The user's model choice: one validated, saved setting that every LLM call
-# uses (agent, planner, router, hotkey lookup). A running request keeps its
-# model; failures are reported plainly and never switch to another model.
+# The model: no picker. Every LLM call (agent, planner, router, hotkey
+# lookup) runs model_chain(Nova): Flux once after an HTTP error; an old saved
+# "model" row is ignored and left as it was; failures are reported plainly.
 # ==========================================================================
 
 
@@ -980,9 +980,9 @@ def memory(monkeypatch, tmp_path):
 
 
 def _api_with(memory):
+    """A bare Api over ``memory``, as one would start with that settings file."""
     api = Api.__new__(Api)
     api.memory = memory
-    api._model = api._load_model_choice()
     return api
 
 
@@ -990,42 +990,41 @@ def _api_with(memory):
 # CONVERSATION ROUTER TESTS (6)
 # ============================================================
 
-def test_set_model_validates_saves_and_survives_a_restart(memory):
+@pytest.mark.parametrize("saved", ["gemini", "mistral", "cohere"])
+def test_an_old_saved_model_is_ignored_and_never_rewritten(memory, saved):
+    """A settings file from the picker era loads, runs the default chain, and
+    keeps its row exactly as it was (never deleted, never rewritten)."""
+    memory.set_profile("model", saved)
     api = _api_with(memory)
     assert api.current_model() == "gemini"
-    assert api.set_model(" Mistral ") == {"success": True, "model": "mistral", "label": "Flux"}
-    assert memory.get_profile("model") == "mistral"
-    assert _api_with(memory).current_model() == "mistral"     # next start
-    assert api.get_model_options() == {
-        "choices": [{"id": "gemini", "label": "Nova"}, {"id": "mistral", "label": "Flux"}],
-        "current": "mistral",
-    }
+    assert config.model_chain(api.current_model()) == ("gemini", "mistral")
+    assert memory.get_profile("model") == saved
 
 
-def test_real_model_options_are_complete():
-    """What the UI renders: never empty, every entry has an id and a label."""
-    opts = Api.__new__(Api).get_model_options()
-    assert opts["choices"] and opts["current"] == "gemini"
-    assert [c["label"] for c in opts["choices"]] == ["Nova", "Flux"]   # only these, in order
-    assert [c["id"] for c in opts["choices"]] == list(config.MODEL_CHOICES)
-    assert all(isinstance(c["label"], str) and c["label"].strip() for c in opts["choices"])
-    assert opts["current"] in [c["id"] for c in opts["choices"]]
+def test_the_picker_api_is_gone():
+    """Nothing the page (js_api) could call chooses or lists a model."""
+    for name in ("set_model", "get_model_options", "_load_model_choice", "_request_model"):
+        assert not hasattr(Api, name), name
+    assert config.MODEL_CHOICES == ("gemini", "mistral")      # the chain order, Nova first
 
 
 @pytest.mark.parametrize("name", ["gpt-4", "Flux", "", None, "cohere", "cohere; drop table"])
-def test_set_model_rejects_anything_outside_the_choices(memory, name):
-    """Ids only: a label such as "Flux" is not an id."""
+def test_the_testing_override_accepts_only_choice_ids(memory, name):
+    """Api._model_override (live_checks --model only): ids only -- a label such
+    as "Flux" is not an id -- anything else runs Nova; never saved."""
     api = _api_with(memory)
-    api.set_model("mistral")
-    result = api.set_model(name)
-    assert result["success"] is False and "gemini, mistral" in result["error"]
-    assert api.current_model() == "mistral" and memory.get_profile("model") == "mistral"
+    api._model_override = "mistral"
+    assert api.current_model() == "mistral"
+    api._model_override = name
+    assert api.current_model() == "gemini"
+    assert memory.get_profile("model") is None
 
 
 def test_a_bad_saved_value_falls_back_to_the_default(memory, capsys):
     memory.set_profile("model", "gpt-9")
     assert _api_with(memory).current_model() == "gemini"
-    assert "using gemini" in capsys.readouterr().out
+    assert "[Model]" not in capsys.readouterr().out           # read never, so nothing to say
+    assert memory.get_profile("model") == "gpt-9"
 
 
 def test_a_saved_cohere_choice_now_runs_nova(memory):
@@ -1111,45 +1110,41 @@ def _hotkey_models(monkeypatch, api):
 # CONVERSATION ROUTER TESTS (8)
 # ============================================================
 
-def test_request_uses_the_choice_everywhere_and_keeps_it_while_running(monkeypatch):
+def test_every_call_site_starts_with_nova_whatever_was_saved(monkeypatch):
     api = _routing_api(monkeypatch, '{"route": "task", "reply": ""}')
-    api.memory.set_profile = lambda *_a: None
-    api._model = "mistral"
+    api.memory.get_profile = lambda key, default=None: "mistral" if key == "model" else default
+    api.memory.set_profile = lambda *_a: pytest.fail("nothing may be saved")
 
-    Api.ask_mistai(api, "open notepad", model="gemini", input_mode="text")  # arg ignored
-    assert api.rec["router"][0][2] == "mistral"                 # router
-    assert api.agent.runs[0][1][1] == "mistral"                  # agent + planner
+    Api.ask_mistai(api, "open notepad", model="mistral", input_mode="text")  # arg ignored
+    assert api.rec["router"][0][2] == "gemini"                  # router
+    assert api.agent.runs[0][1][1] == "gemini"                   # agent + planner
     sent = _hotkey_models(monkeypatch, api)
-
-    api.set_model("gemini")                                      # changed mid-task
-    assert Api._ask_llm_for_hotkey(api, "discord") == "ctrl+k"
-    assert sent == ["mistral"]                                   # running request's model
-
+    assert Api._ask_llm_for_hotkey(api, "discord") == "ctrl+k"   # while the task runs
     api.agent.callbacks["on_done"]({"success": True, "steps": 1})
-    Api._ask_llm_for_hotkey(api, "discord")
-    assert sent == ["mistral", "gemini"]                         # next one: the new choice
+    Api._ask_llm_for_hotkey(api, "discord")                      # and after it
+    assert sent == ["gemini", "gemini"]
 
 
 # -- the plain error message ------------------------------------------------------
 
-@pytest.mark.parametrize("resp, model, expected", [
-    (_Resp(429, {"error": "Rate limit exceeded"}), "mistral",
-     "Flux is rate-limited or unavailable right now (HTTP 429: Rate limit exceeded). "
-     "Pick another model in Settings or try again later."),
-    (_Resp(400, {"error": {"message": "Unknown model 'mistral'"}}), "mistral",
-     "Flux request failed (HTTP 400: Unknown model 'mistral')."),
-    (_Resp(503, {"message": "Upstream down"}), "gemini",
-     "Nova request failed (HTTP 503: Upstream down)."),
-    (_Resp(502, text="<html>bad gateway</html>"), "gemini", "Nova request failed (HTTP 502)."),
+@pytest.mark.parametrize("resp, expected", [
+    (_Resp(429, {"error": "Rate limit exceeded"}),
+     "The service is busy right now (HTTP 429: Rate limit exceeded). Try again in a moment."),
+    (_Resp(400, {"error": {"message": "Bad request body"}}),
+     "The service request failed (HTTP 400: Bad request body)."),
+    (_Resp(503, {"message": "Upstream down"}),
+     "The service request failed (HTTP 503: Upstream down)."),
+    (_Resp(502, text="<html>bad gateway</html>"), "The service request failed (HTTP 502)."),
 ])
-def test_describe_api_error(resp, model, expected):
-    assert describe_api_error(resp, model) == expected
+def test_describe_api_error(resp, expected):
+    assert describe_api_error(resp) == expected
+    assert "Settings" not in expected and "model" not in expected.lower()
 
 
 def test_error_text_never_carries_urls_or_keys_and_is_capped():
     body = {"error": "Key mistai_abc123def456 rejected at https://api.mistai.org/v1?k=1 "
                      "bearer sk-ZYXWVUTSRQ " + "x" * 300}
-    msg = describe_api_error(_Resp(401, body), "gemini")
+    msg = describe_api_error(_Resp(401, body))
     for leak in ("mistai_abc", "https://", "api.mistai.org", "sk-ZYX"):
         assert leak not in msg
     detail = msg.split("(HTTP 401: ", 1)[1].rsplit(").", 1)[0]
@@ -1186,9 +1181,8 @@ def test_planner_429_on_nova_goes_to_flux_once_with_no_same_model_retry(monkeypa
     assert planner._llm(_chain_api(), "prompt", "gemini") == ""
     assert sent == [("primary", "gemini"), ("primary", "mistral")]   # no Nova retry
     out = capsys.readouterr().out
-    assert "[Planner] Nova is rate-limited" in out
+    assert out.count("[Planner] The service is busy right now") == 2   # Nova, then Flux
     assert "[Planner] Nova HTTP 429, trying Flux" in out
-    assert "[Planner] Flux is rate-limited" in out
     for leak in ("invalid", "secret", "prompt"):
         assert leak not in out                       # no URLs, keys or prompt text
 
@@ -1266,7 +1260,7 @@ def test_hotkey_failure_is_logged_plainly(monkeypatch, capsys):
     assert Api._ask_llm_for_hotkey(api, "discord") is None
     assert sent == ["gemini", "mistral"]
     out = capsys.readouterr().out
-    assert "[Hotkey] Nova is rate-limited" in out and "[Hotkey] Flux is rate-limited" in out
+    assert out.count("[Hotkey] The service is busy right now") == 2
     assert "[Hotkey] Nova HTTP 429, trying Flux" in out
 
 
@@ -1317,8 +1311,8 @@ def test_agent_429_on_nova_goes_to_flux_once_then_reports_plainly(
     loop = _agent_chain_loop(monkeypatch, api)
 
     out = loop._loop("open notepad", "gemini", "none", mode, None)
-    msg = ("Flux is rate-limited or unavailable right now (HTTP 429: Rate limit "
-           "exceeded). Pick another model in Settings or try again later.")
+    msg = ("The service is busy right now (HTTP 429: Rate limit exceeded). "
+           "Try again in a moment.")
     assert out == {"success": False, "error": msg, "speech": msg}
     assert spoken == ([msg] if spoken_expected else [])
     assert sent == [("primary", "gemini"), ("primary", "mistral")]   # no same-model retry

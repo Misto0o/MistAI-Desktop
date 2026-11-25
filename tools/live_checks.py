@@ -155,7 +155,7 @@ def parse_timing(text):
 
 
 def resolve_model(name):
-    """A MODEL_CHOICES id for an id or a Settings label (Nova, Flux), else None."""
+    """A MODEL_CHOICES id for an id or its log label (Nova, Flux), else None."""
     from core.config import MODEL_CHOICES, MODEL_LABELS
 
     key = str(name or "").strip().lower()
@@ -673,9 +673,9 @@ def _profile_rows(api):
 def snapshot_settings(api):
     rows = _profile_rows(api)
     keep = {k: v for k, v in rows.items()
-            if k in ("model", "ask_before_sending", "approval_key") or k.startswith("approved:")}
+            if k in ("ask_before_sending", "approval_key") or k.startswith("approved:")}
     env = {k: v for k, v in os.environ.items() if k.startswith("MISTAI_")}
-    return {"rows": keep, "env": env, "model_attr": getattr(api, "_model", None)}
+    return {"rows": keep, "env": env, "model_override": getattr(api, "_model_override", None)}
 
 
 def restore_settings(api, snap):
@@ -687,15 +687,14 @@ def restore_settings(api, snap):
         mem = api.memory
         with mem._lock:
             for k in [k for k in _profile_rows_unlocked(mem)
-                      if k in ("model", "ask_before_sending", "approval_key")
+                      if k in ("ask_before_sending", "approval_key")
                       or k.startswith("approved:")]:
                 mem.conn.execute("DELETE FROM user_profile WHERE key=?", (k,))
             for k, v in snap["rows"].items():
                 mem.conn.execute("INSERT INTO user_profile (key,value,updated) VALUES (?,?,?)",
                                  (k, v, datetime.now().isoformat()))
             mem.conn.commit()
-        if snap["model_attr"] is not None:
-            api._model = snap["model_attr"]
+        api._model_override = snap["model_override"]
     except Exception as e:
         print(f"[LiveChecks] settings restore failed ({type(e).__name__})")
 
@@ -763,8 +762,8 @@ class Ctx:
 
 def run_check(spec, mode, runner, values, args, session_db):
     """One check: SimpleNamespace(status, reasons, hard, net_sentences).
-    --model is applied through the temporary database's profile (as the
-    Settings dropdown does). Settings, env and the temp folder are
+    --model sets Api._model_override (testing only; there is no picker and
+    nothing is written to the profile). Settings, env and the temp folder are
     restored/removed in a finally, also on Ctrl+C."""
     api = runner.api()
     close_databases(api)            # the previous session's (or the Api's first) databases
@@ -776,7 +775,7 @@ def run_check(spec, mode, runner, values, args, session_db):
     rec.install()
     try:
         if getattr(args, "model", None):
-            api.set_model(args.model)
+            api._model_override = args.model
         ctx = Ctx(spec, mode, runner, values, tmp, args)
         status, reasons = CHECK_FUNCS[spec["id"]](ctx)
         if status == "PASS" and ctx.soft:
@@ -1085,7 +1084,6 @@ def chk_approval_count(ctx):
     name = ctx.values.get("send_contact") or ("Zorblax Quindlewhip " + secrets.token_hex(2))
     param = f"{app}|{name}|{message_body()}"
     api.set_ask_before_sending("when_unsure")
-    api.memory.set_profile("model", api.current_model())
     ctx.runner.answers = ["button:remember"]
     question = api.agent._confirmation_question("quick_message", param)
     v = api.agent._ask_confirmation(question, "text", offer_remember=True)
@@ -1390,7 +1388,7 @@ def parse_args(argv=None):
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--allow-send", action="store_true")
     ap.add_argument("--allow-elevated", action="store_true")
-    ap.add_argument("--model", default="", help="a model id or its Settings label (Nova, Flux)")
+    ap.add_argument("--model", default="", help="testing only: a model id or its label (Nova, Flux) to try first")
     ap.add_argument("--local-config", default=DEFAULT_LOCAL)
     ap.add_argument("--checks", default=DEFAULT_CHECKS)
     ap.add_argument("--log-root", default=os.path.join(os.path.expanduser("~"), "MistAI", "logs"))

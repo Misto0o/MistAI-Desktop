@@ -245,7 +245,7 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback
             if u
         )
     )
-    # model_chain: the picked model on every URL (a 429 skips the rest), then
+    # model_chain: the first model (Nova) on every URL (a 429 skips the rest), then
     # the next model once on the first URL -- only after an HTTP error, never
     # after a timeout or network failure.
     chain = model_chain(model)
@@ -264,7 +264,7 @@ def _llm(api, prompt, model, timeout=PLANNING_TIMEOUT, label="Planner", fallback
                     return r.json().get("response", "")
                 # Logged only: planning and routing fail over to their safe paths
                 # (one phase / the agent), which then report the same error.
-                print(f"[{label}] {describe_api_error(r, attempt_model)}")
+                print(f"[{label}] {describe_api_error(r)}")
                 status = r.status_code
                 if status == 429:
                     break
@@ -1063,8 +1063,8 @@ def parse_route(raw):
 # ============================================================
 
 def _model_for(api, model):
-    """The request's model, else the user's choice (api.current_model()),
-    else the default -- bare test objects have no current_model."""
+    """The request's model, else api.current_model() (Nova), else the
+    default -- bare test objects have no current_model."""
     if model:
         return model
     current = getattr(api, "current_model", None)

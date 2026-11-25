@@ -91,7 +91,8 @@ python assistant.py
 
 Settings (the gear) holds the API key, "Ask before sending a message",
 remembered approvals and "Import my facts". The sidebar holds the wake word,
-captions, the floating orb options, how Mist addresses you, and the model.
+captions, the floating orb options and how Mist addresses you. The model is
+always Nova, with Flux as the automatic fallback.
 
 Release build (CI does this on a `v*` tag; output `dist/MistAI.exe`):
 

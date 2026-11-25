@@ -1280,9 +1280,9 @@ function view() {
 # ============================================================
 
 def _run_confirm_page(tmp_path, steps):
-    options, set_results, set_gender = _real_outputs()
-    cfg = {"options": options, "gender": "none", "set_model": set_results,
-           "set_gender": set_gender, "flags": {"is_dev": False}, "steps": steps}
+    set_gender = _real_outputs()
+    cfg = {"gender": "none", "set_gender": set_gender, "flags": {"is_dev": False},
+           "steps": steps}
     script = tmp_path / "confirm.js"
     script.write_text(_page_harness().replace("%CONFIG%", json.dumps(cfg))
                       + _script() + _DRIVER, encoding="utf-8")
