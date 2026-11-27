@@ -108,6 +108,10 @@ ALLOWED_LOG_LINES = [re.compile(p) for p in (
     r"|unverified|low confidence|not in front|batch)\)",
     r"\[OpenApp\] timing route=(path|app-id|app-id cached|app-id refreshed|start-menu)"
     r"( \w+ [\d.]+s)+ (window|no window)",
+    r"\[OpenApp\] (attempt \d+ of \d+ showed a window|no window after \d+ attempt\(s\)) "
+    r"\((exact|whole word|prefix|substring) match, \d+ candidate\(s\)(, \d+ weaker)?\)",
+    r"\[StartApps\] (loaded \d+ apps in [\d.]+s|load failed \(\w+\)|lookup failed \(\w+\))",
+    r"\[Task\] ended without an answer -- told the user \(\w+\)",
     r"\[Browser\] (start phases: seed [\d.]+s driver [\d.]+s launch [\d.]+s page [\d.]+s"
     r"|start timed out after [\d.]+s|start finished after the timeout"
     r"|previous start failed -- starting again)",

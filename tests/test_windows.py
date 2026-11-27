@@ -183,23 +183,35 @@ def test_app_window_state_sees_a_foreground_uwp_app(monkeypatch):
 
 
 def test_open_app_by_aumid_fails_fast_without_start_menu_typing(monkeypatch):
+    from core import start_apps as sa
     api = Api.__new__(Api)
     api._BROWSER_APP_NAMES = set()
     api.app_window_state = lambda _n: ("not_running", "")
     api._resolve_app_exe = lambda _n: None
-    api._resolve_app_id = lambda _n: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+    api.start_apps = sa.StartAppsCache(loader=lambda: [
+        ("Calculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")])
     api.is_app_running = lambda _n: True
     waits, launched, keys = [], [], []
-    api._wait_for_app_window = lambda _a, timeout: waits.append(timeout) or False
+    clock = [0.0]
+    monkeypatch.setattr("core.api.time.perf_counter", lambda: clock[0])
+
+    def wait(_a, timeout):
+        waits.append(timeout)
+        clock[0] += timeout
+        return False
+
+    api._wait_for_app_window = wait
     monkeypatch.setattr("core.api.subprocess.Popen", lambda args: launched.append(args))
+    monkeypatch.setattr("core.api.os.startfile", lambda t: launched.append(["startfile", t]),
+                        raising=False)
     monkeypatch.setattr("core.api.pyautogui.press", lambda k: keys.append(k))
     monkeypatch.setattr("core.api.pyautogui.write", lambda *a, **k: keys.append(a))
 
     assert Api._act_open_app(api, "calculator") is False
-    assert launched == [["explorer.exe",
-                         "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"]]
-    assert waits == [5.0] and keys == []
-    assert "no window appeared within 5s" in api.last_result_text
+    target = "shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+    assert launched == [["explorer.exe", target], ["startfile", target]]   # two shell routes
+    assert waits == [3.0, 4.0] and sum(waits) <= Api.OPEN_APP_BUDGET_S and keys == []
+    assert "showed no window within 7s" in api.last_result_text
 
 
 # -- Input target reporting ----------------------------------------------------------

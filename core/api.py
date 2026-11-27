@@ -1279,6 +1279,10 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         self._listening_lock = threading.Lock()
         self.last_tts_error = ""
         self.tts = NeuralTTS(on_error=self._on_tts_error)
+        # The Start-apps list for open_app (core/start_apps.py); main() loads
+        # it in the background, so startup never waits for Get-StartApps.
+        from .start_apps import StartAppsCache
+        self.start_apps = StartAppsCache()
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.12
         self.memory = Memory()
@@ -3437,39 +3441,41 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         """Quote one value for a PowerShell single-quoted string literal."""
         return str(value or "").replace("'", "''")
 
-    def _resolve_app_id(self, name, fresh=False):
-        """Start-apps AppID for ``name`` (Get-StartApps, ~2 s). Hits are cached
-        for this session; ``fresh`` skips and replaces the cached entry."""
-        normalized_name = self._normalize_app_name(name)
-        if len(normalized_name) < 2:
-            return None
-        cache = self.__dict__.setdefault("_app_id_cache", {})
-        key = str(name).strip().lower()
-        if not fresh and key in cache:
-            return cache[key]
-        cache.pop(key, None)
-        try:
-            quoted_name = self._ps_single_quote(name)
-            ps_cmd = (
-                f"$needle = '{quoted_name}'; Get-StartApps | Where-Object {{"
-                "$_.Name -and $_.Name.IndexOf($needle, "
-                "[System.StringComparison]::OrdinalIgnoreCase) -ge 0} "
-                f"| Select-Object -First 1 -ExpandProperty AppID"
-            )
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            app_id = result.stdout.strip()
-            if app_id:
-                cache[key] = app_id
-            return app_id or None
-        except Exception as e:
-            print(f"[ResolveApp] Get-StartApps lookup failed for '{name}': "
-                  f"{e if verbose_logs() else type(e).__name__}")
-            return None
+    # ------------------------------------------------------------
+    # START-APPS CANDIDATES
+    # ------------------------------------------------------------
+    # open_app's Start-apps route: every Start menu entry matching the name,
+    # ranked by core/start_apps.rank (exact > whole word > prefix >
+    # substring; an inbox Windows package first within a tier), from the
+    # in-memory list (StartAppsCache: loaded at startup in the background,
+    # milliseconds per lookup). A parameter that IS an AppID from the list
+    # (the failure message names them) selects exactly that entry.
+
+    def _start_apps_cache(self):
+        cache = self.__dict__.get("start_apps")
+        if cache is None:
+            from .start_apps import StartAppsCache
+
+            cache = self.__dict__["start_apps"] = StartAppsCache()
+        return cache
+
+    def _start_app_candidates(self, name):
+        """Ranked candidate dicts (start_apps.rank) for ``name``; [] for a
+        name too short to match or when nothing matches."""
+        if len(self._normalize_app_name(name)) < 2:
+            return []
+        cache = self._start_apps_cache()
+        wanted = str(name).strip()
+        if "!" in wanted:                             # an AppID chosen from a failure message
+            exact = cache.by_app_id(wanted)
+            if exact:
+                return exact
+        return cache.lookup(wanted)
+
+    def _resolve_app_id(self, name):
+        """The best Start-apps AppID for ``name``, or None."""
+        found = self._start_app_candidates(name)
+        return found[0]["app_id"] if found else None
 
     def _normalize_app_name(self, name):
         """Strip version numbers, bitness suffixes, and non-alphanumeric
@@ -3831,24 +3837,20 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 exe_path = None
             times["launch"] += time.perf_counter() - t
 
-        app_id = None
-        cached = False
         if not exe_path:
-            cached = str(param).strip().lower() in self.__dict__.get("_app_id_cache", {})
-            t = time.perf_counter()
-            app_id = self._resolve_app_id(param)
-            times["lookup"] += time.perf_counter() - t
-            if app_id:
-                t = time.perf_counter()
-                if not self._launch_app_id(app_id):
-                    app_id = None
-                times["launch"] += time.perf_counter() - t
-        route = ("path" if exe_path else "app-id cached" if app_id and cached
-                 else "app-id" if app_id else "start-menu")
+            started = time.perf_counter()
+            candidates = self._start_app_candidates(param)
+            times["lookup"] += time.perf_counter() - started
+            if candidates:
+                cache = self._start_apps_cache()
+                route = "app-id cached" if cache.last_source in ("cache", "stale cache") else "app-id"
+                return self._open_start_app(param, candidates, times, route, started)
+
+        route = "path" if exe_path else "start-menu"
 
         # Start-menu typing is the last resort: only when there was nothing
         # to launch by path or Start-apps ID and no window has appeared.
-        if not exe_path and not app_id and not self._wait_for_app_window(app_lower, timeout=1.5):
+        if not exe_path and not self._wait_for_app_window(app_lower, timeout=1.5):
             try:
                 pyautogui.press("win")
                 time.sleep(0.8)
@@ -3858,46 +3860,18 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             except Exception as e:
                 print(f"[OpenApp] Start-menu fallback failed: {e}")
 
-        # A Store app launched by its AUMID shows its frame within ~1-2s;
-        # waiting longer only delays the honest failure.
         t = time.perf_counter()
-        found = self._wait_for_app_window(app_lower, timeout=5.0 if app_id else 6.0)
+        found = self._wait_for_app_window(app_lower, timeout=6.0)
         times["window"] += time.perf_counter() - t
-        if not found and cached:
-            # A cached AppID brought no window: look it up again once, and
-            # relaunch only when the fresh lookup gives a different ID.
-            t = time.perf_counter()
-            fresh_id = self._resolve_app_id(param, fresh=True)
-            times["lookup"] += time.perf_counter() - t
-            if fresh_id and fresh_id != app_id and self._launch_app_id(fresh_id):
-                app_id, route = fresh_id, "app-id refreshed"
-                t = time.perf_counter()
-                found = self._wait_for_app_window(app_lower, timeout=5.0)
-                times["window"] += time.perf_counter() - t
         if found:
-            t = time.perf_counter()
-            self.switch_to_app(app_lower)
-            time.sleep(0.4)
-            try:
-                pyautogui.hotkey("win", "up")
-            except Exception:
-                pass
-            times["focus"] += time.perf_counter() - t
-            self._last_opened_app = app_lower
-            state, title = self.app_window_state(app_lower)
-            self.last_result_text = f"Launched '{param}' (window '{title[:40]}', {state})"
+            self._finish_open(param, app_lower, times)
             self._log_open_timing(route, times, True)
             return True
         self._log_open_timing(route, times, False)
 
         # Distinguish "never started" from "started but stayed in the tray"
         # so the model doesn't retry the same launch.
-        if app_id:
-            self.last_result_text = (
-                f"'{param}' was launched via its Start-apps ID ({app_id}) but no "
-                f"window appeared within 5s"
-            )
-        elif self.is_app_running(app_lower):
+        if self.is_app_running(app_lower):
             self.last_result_text = (
                 f"'{param}' is running but never showed a window -- it may live "
                 f"in the system tray or be blocked by a login/update dialog"
@@ -3907,14 +3881,101 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         print(f"[OpenApp] {self.last_result_text}")
         return False
 
-    @staticmethod
-    def _launch_app_id(app_id):
-        """Start a Start-apps AppID through the shell; False if that failed."""
+    def _finish_open(self, param, app_lower, times, how=""):
+        """A window appeared: focus and maximize it, set the input target and
+        the result text."""
+        t = time.perf_counter()
+        self.switch_to_app(app_lower)
+        time.sleep(0.4)
         try:
-            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+            pyautogui.hotkey("win", "up")
+        except Exception:
+            pass
+        times["focus"] += time.perf_counter() - t
+        self._last_opened_app = app_lower
+        state, title = self.app_window_state(app_lower)
+        self.last_result_text = f"Launched '{param}' (window '{title[:40]}', {state}){how}"
+
+    # ------------------------------------------------------------
+    # START-APPS LAUNCH CHAIN
+    # ------------------------------------------------------------
+    # The ranked candidates of the best match tier (exact before whole word
+    # before prefix before substring; never a weaker tier), at most
+    # OPEN_APP_MAX_CANDIDATES, each through the Start-apps folder
+    # (explorer.exe shell:AppsFolder\<AppID>); then the first again through
+    # ShellExecute (os.startfile, the other shell route). Each waits for a
+    # window at most OPEN_APP_TRY_WAIT_S, all of it within OPEN_APP_BUDGET_S.
+    # A failure names every try and the weaker matches it did not try, so
+    # the model can pick one (open_app accepts the AppID) instead of
+    # retrying blindly; the Start-apps list is then refreshed.
+
+    OPEN_APP_BUDGET_S = 7.0
+    OPEN_APP_TRY_WAIT_S = 3.0
+    OPEN_APP_MIN_WAIT_S = 0.5
+    OPEN_APP_MAX_CANDIDATES = 3
+
+    def _open_start_app(self, param, candidates, times, route, started):
+        from .start_apps import TIER_LABELS, describe_candidate
+
+        best = candidates[0]["tier"]
+        same = [c for c in candidates if c["tier"] == best][:self.OPEN_APP_MAX_CANDIDATES]
+        weaker = [c for c in candidates if c["tier"] < best]
+        attempts = [(c, "start-apps folder") for c in same] + [(same[0], "ShellExecute")]
+        deadline = started + self.OPEN_APP_BUDGET_S
+        tried = []
+        for i, (cand, how) in enumerate(attempts):
+            left = deadline - time.perf_counter()
+            if left < self.OPEN_APP_MIN_WAIT_S:
+                break
+            t = time.perf_counter()
+            launched = self._launch_app_id(cand["app_id"], how)
+            times["launch"] += time.perf_counter() - t
+            tried.append(f"{describe_candidate(cand)} via the {how}"
+                         + ("" if launched else " (the launch itself failed)"))
+            if not launched:
+                continue
+            last = i == len(attempts) - 1
+            wait = left if last else min(self.OPEN_APP_TRY_WAIT_S, left)
+            t = time.perf_counter()
+            found = self._wait_for_app_window(cand["name"].lower(), timeout=wait)
+            times["window"] += time.perf_counter() - t
+            if found:
+                print(f"[OpenApp] attempt {len(tried)} of {len(attempts)} showed a window "
+                      f"({TIER_LABELS[best]} match, {len(same)} candidate(s))")
+                note = ""
+                if len(tried) > 1:
+                    note = (f" -- the earlier launch(es) showed no window: "
+                            f"{'; '.join(tried[:-1])}. This one was {describe_candidate(cand)}")
+                self._finish_open(param, cand["name"].lower(), times, note)
+                self._log_open_timing(route, times, True)
+                return True
+        self._log_open_timing(route, times, False)
+        print(f"[OpenApp] no window after {len(tried)} attempt(s) "
+              f"({TIER_LABELS[best]} match, {len(same)} candidate(s), {len(weaker)} weaker)")
+        self._start_apps_cache().invalidate()
+        spent = time.perf_counter() - started
+        msg = (f"'{param}' showed no window within {spent:.0f}s. Tried: {'; '.join(tried)}.")
+        if weaker:
+            msg += (" Other Start-menu matches (not tried, weaker): "
+                    + "; ".join(describe_candidate(c) for c in weaker[:3]) + ".")
+        msg += (" Do not retry the same launch: open_app with one of the AppIDs above picks "
+                "that exact entry, or try a different approach.")
+        self.last_result_text = msg
+        return False
+
+    @staticmethod
+    def _launch_app_id(app_id, how="start-apps folder"):
+        """Start a Start-apps AppID through the shell (the Start-apps folder
+        via explorer.exe, or ShellExecute); False if that failed."""
+        target = f"shell:AppsFolder\\{app_id}"
+        try:
+            if how == "ShellExecute":
+                os.startfile(target)
+            else:
+                subprocess.Popen(["explorer.exe", target])
             return True
         except Exception as e:
-            print(f"[OpenApp] Start-Apps launch failed: {e}")
+            print(f"[OpenApp] Start-Apps launch failed ({type(e).__name__})")
             return False
 
     @staticmethod

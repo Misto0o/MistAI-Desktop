@@ -1122,6 +1122,8 @@ class AgentLoop:
                     on_done(result)
             except Exception as e:
                 print(f"[Planner] Fatal: {e if verbose_logs() else type(e).__name__}")
+                # Never a silent end: say something broke (caption, voice).
+                planner.ensure_visible_end(self.api, None, input_mode)
                 if on_error:
                     on_error(str(e))
             finally:
@@ -1153,6 +1155,8 @@ class AgentLoop:
                     on_done(result)
             except Exception as e:
                 print(f"[Planner] Resume fatal: {e if verbose_logs() else type(e).__name__}")
+                # Never a silent end: say something broke (caption, voice).
+                planner.ensure_visible_end(self.api, None, input_mode)
                 if on_error:
                     on_error(str(e))
             finally:

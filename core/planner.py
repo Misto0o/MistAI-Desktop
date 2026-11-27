@@ -28,6 +28,7 @@
 #   19. PARSING THE ROUTE
 #   20. ROUTER MODEL CHOICE
 #   21. CHAT OR TASK DECISION
+#   22. TASK END MESSAGE
 # ============================================================
 
 """
@@ -642,6 +643,7 @@ class PlanRunner:
         result = None
         try:
             result = self._run_goal(goal, model, gender, input_mode, on_step)
+            result = ensure_visible_end(self.api, result, input_mode)
             return result
         finally:
             task_finished(self.api, result)
@@ -660,6 +662,7 @@ class PlanRunner:
         result = None
         try:
             result = self._resume(record, model, gender, input_mode, on_step)
+            result = ensure_visible_end(self.api, result, input_mode)
             return result
         finally:
             task_finished(self.api, result)
@@ -1196,3 +1199,61 @@ def try_chat(api, message, gender="none", model=None):
         f"in {elapsed:.2f}s" + (f" ({label})" if label else "")
     )
     return reply
+
+
+# ============================================================
+# TASK END MESSAGE
+# ============================================================
+
+# Every task ends with something the user can see or hear. A result with
+# no answer and no speech (a stop, the step budget, an agent call or model
+# reply that failed, an unanswered question, a crash) gets one short
+# sentence: "Stopped." for a stop, else the orb's ERROR_REASONS sentence for
+# its outcome (a plain failure adds its short fixed error). It becomes the
+# result's speech (the chat shows it in place of "Error: ..."), is shown in
+# the caption, and is spoken in voice mode. Results that already speak
+# (done, the network sentence, a pause, a decline) are left alone.
+
+STOPPED_SPEECH = "Stopped."
+
+
+def end_message(result):
+    """The sentence for a result that ended without an answer ("" when it
+    succeeded)."""
+    from .floating_orb import ERROR_REASONS, task_outcome
+
+    outcome, reason = task_outcome(result)
+    if outcome == "completed":
+        return ""
+    if outcome == "stopped":
+        return STOPPED_SPEECH
+    if reason == "failed":
+        err = " ".join(str((result or {}).get("error") or "").split()).rstrip(".")
+        if err and len(err) <= 120:
+            return f"I couldn't finish the task: {err}."
+    return ERROR_REASONS.get(reason, ERROR_REASONS["failed"])
+
+
+def ensure_visible_end(api, result, input_mode):
+    """``result`` with a speech when it had none (see the section comment);
+    shows and, in voice mode, speaks it. Never raises; logs a label only."""
+    if isinstance(result, dict) and (result.get("success")
+                                     or str(result.get("speech") or "").strip()):
+        return result
+    try:
+        from .floating_orb import task_outcome
+
+        msg = end_message(result)
+        result = dict(result) if isinstance(result, dict) else {"success": False,
+                                                                 "error": "crash"}
+        result["speech"] = msg
+        outcome, reason = task_outcome(result if result.get("error") != "crash" else None)
+        print(f"[Task] ended without an answer -- told the user ({reason or outcome})")
+        if getattr(api, "caption_window", None) and getattr(api, "captions_enabled", False):
+            api.caption_window.show_error(msg, 5)
+        if input_mode == "voice":
+            api.speak(msg)
+    except Exception as e:
+        print(f"[Task] end message failed ({type(e).__name__})")
+    return result
+

@@ -1431,83 +1431,246 @@ def test_set_clipboard_closes_the_clipboard_when_setting_fails(monkeypatch):
     assert calls == ["open", "empty", "close"]
 
 
-def test_app_lookup_uses_literal_matching_and_rejects_empty_targets(monkeypatch):
+def test_app_lookup_rejects_empty_targets():
     api = Api.__new__(Api)
-    commands = []
-    monkeypatch.setattr(
-        "core.api.subprocess.run",
-        lambda args, **_kwargs: (
-            commands.append(args[-1])
-            or SimpleNamespace(stdout="Example.App\n")
-        ),
-    )
-
-    assert Api._resolve_app_id(api, "Editor*[test]'") == "Example.App"
-    assert "-like" not in commands[0]
-    assert "IndexOf" in commands[0]
-    assert "Editor*[test]''" in commands[0]
-    assert Api._resolve_app_id(api, "") is None
+    api.start_apps = SimpleNamespace(lookup=lambda _n: 1 / 0, by_app_id=lambda _a: 1 / 0)
+    assert Api._start_app_candidates(api, "") == [] and Api._resolve_app_id(api, "x") is None
     assert Api.is_app_running(api, "") is False
 
 
-def _open_app_api(monkeypatch, ids, windows):
-    """A bare Api for _act_open_app: Store-app route, Get-StartApps answers
-    from ``ids`` (in order), each window wait from ``windows``."""
+# -- Start-apps ranking, cache and launch chain (core/start_apps.py) ----------
+
+# This machine's real shape: two entries named exactly "Photos", the OneDrive
+# one first in Get-StartApps order.
+PHOTOS_ENTRIES = [
+    ("OneDrive", "Microsoft.SkyDrive.Desktop"),
+    ("Photos", "Microsoft.OneDrive.Photos_8wekyb3d8bbwe!OneDrive.App"),
+    ("Photos", "Microsoft.Windows.Photos_8wekyb3d8bbwe!App"),
+    ("Photos Legacy", "Microsoft.PhotosLegacy_8wekyb3d8bbwe!App"),
+    ("Adobe Photoshop Express", "AdobeSystemsIncorporated.AdobePhotoshopExpress_ynb6!App"),
+    ("Camera", "Microsoft.WindowsCamera_8wekyb3d8bbwe!App"),
+]
+
+
+def test_an_exact_inbox_match_beats_a_sync_client_entry_of_the_same_name():
+    from core import start_apps as sa
+    ranked = sa.rank("Photos", PHOTOS_ENTRIES)
+    assert [c["app_id"] for c in ranked] == [
+        "Microsoft.Windows.Photos_8wekyb3d8bbwe!App",            # exact, inbox Windows
+        "Microsoft.OneDrive.Photos_8wekyb3d8bbwe!OneDrive.App",  # exact, not inbox
+        "Microsoft.PhotosLegacy_8wekyb3d8bbwe!App",              # whole word
+        "AdobeSystemsIncorporated.AdobePhotoshopExpress_ynb6!App"]  # substring ("photos" in "photoshop")
+    assert [c["tier"] for c in ranked] == [sa.TIER_EXACT, sa.TIER_EXACT, sa.TIER_WORD,
+                                           sa.TIER_SUBSTRING]
+
+
+@pytest.mark.parametrize("needle, name, tier", [
+    ("photos", "Photos", 4), ("PHOTOS ", "photos", 4), ("photos", "Photos Legacy", 3),
+    ("legacy", "Photos Legacy", 3), ("photo", "Photos", 2), ("hotos", "Photos", 1),
+    ("camera", "Photos", 0), ("p", "Photos", 0),
+])
+def test_match_tiers(needle, name, tier):
+    from core import start_apps as sa
+    assert sa.match_tier(needle, name) == tier
+
+
+def test_inbox_packages_are_microsoft_windows_packaged_apps():
+    from core import start_apps as sa
+    assert sa.is_inbox_package("Microsoft.WindowsCamera_8wekyb3d8bbwe!App")
+    assert sa.is_inbox_package("Microsoft.Windows.Photos_8wekyb3d8bbwe!App")
+    assert not sa.is_inbox_package("Microsoft.OneDrive.Photos_8wekyb3d8bbwe!OneDrive.App")
+    assert not sa.is_inbox_package("Microsoft.Windows.Explorer")     # not a packaged AppID
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _cache(entries_seq, clock=None):
+    from core import start_apps as sa
+    loads = []
+
+    def loader():
+        loads.append(1)
+        nxt = entries_seq.pop(0) if len(entries_seq) > 1 else entries_seq[0]
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    return sa.StartAppsCache(loader=loader, clock=clock or _Clock()), loads
+
+
+def test_the_cache_loads_once_and_answers_from_memory():
+    import time as _time
+    cache, loads = _cache([PHOTOS_ENTRIES])
+    assert cache.lookup("camera")[0]["name"] == "Camera" and cache.last_source == "loaded"
+    t0 = _time.perf_counter()
+    for _ in range(50):
+        cache.lookup("photos")
+    assert (_time.perf_counter() - t0) / 50 < 0.005                 # milliseconds
+    assert cache.last_source == "cache" and loads == [1]
+
+
+def test_a_miss_reloads_once_an_old_copy_is_not_brand_new():
+    from core import start_apps as sa
+    clock = _Clock()
+    cache, loads = _cache([PHOTOS_ENTRIES, PHOTOS_ENTRIES + [("Paint", "Microsoft.Paint_8wekyb3d8bbwe!App")]],
+                          clock)
+    cache.lookup("photos")
+    assert cache.lookup("paint") == [] and len(loads) == 1          # just loaded: no reload
+    clock.t += sa.MISS_REFRESH_GAP_S + 1
+    assert cache.lookup("paint")[0]["name"] == "Paint"
+    assert cache.last_source == "refreshed" and len(loads) == 2
+
+
+def test_an_expired_or_invalidated_copy_answers_at_once_and_refreshes_behind(monkeypatch):
+    from core import start_apps as sa
+    started = []
+    monkeypatch.setattr(sa.StartAppsCache, "preload", lambda self: started.append(1))
+    clock = _Clock()
+    cache, loads = _cache([PHOTOS_ENTRIES], clock)
+    cache.lookup("photos")
+    clock.t += sa.CACHE_TTL_S + 1
+    assert cache.lookup("photos") and cache.last_source == "stale cache" and started == [1]
+    cache2, _ = _cache([PHOTOS_ENTRIES])
+    cache2.lookup("photos")
+    cache2.invalidate()
+    assert cache2.lookup("photos") and cache2.last_source == "stale cache"
+
+
+def test_a_failed_load_is_an_empty_answer_not_an_error(capsys):
+    cache, _ = _cache([RuntimeError("powershell missing")])
+    assert cache.lookup("photos") == [] and cache.last_source == "failed"
+    out = capsys.readouterr().out
+    assert "[StartApps] load failed (RuntimeError)" in out and "powershell" not in out
+
+
+def test_preload_runs_in_the_background_and_a_lookup_waits_for_it(monkeypatch):
+    import threading as _th
+    from core import start_apps as sa
+    gate, done = _th.Event(), []
+
+    def slow():
+        gate.wait(5)
+        return PHOTOS_ENTRIES
+
+    cache = sa.StartAppsCache(loader=slow)
+    cache.preload()                                  # returns at once
+    assert not cache.loaded
+    t = _th.Thread(target=lambda: done.append(cache.lookup("camera")))
+    t.start()
+    gate.set()
+    t.join(5)
+    assert done and done[0][0]["name"] == "Camera"
+
+
+def test_load_start_apps_parses_get_start_apps_json(monkeypatch):
+    from core import start_apps as sa
+    out = '[{"Name":"Photos","AppID":"A!App"},{"Name":"","AppID":"x"},{"Name":"Camera","AppID":"C!App"}]'
+    monkeypatch.setattr(sa.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=out))
+    assert sa.load_start_apps() == [("Photos", "A!App"), ("Camera", "C!App")]
+    monkeypatch.setattr(sa.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        stdout='{"Name":"Solo","AppID":"S!App"}'))
+    assert sa.load_start_apps() == [("Solo", "S!App")]
+
+
+def _open_app_api(monkeypatch, entries, windows):
+    """A bare Api for _act_open_app's Start-apps route: the list from
+    ``entries`` (fake loader), each window wait answered from ``windows``."""
+    from core import start_apps as sa
     api = Api.__new__(Api)
-    ids, windows = list(ids), list(windows)
-    api.lookups, api.launched = [], []
-    monkeypatch.setattr("core.api.subprocess.run", lambda args, **_k: (
-        api.lookups.append(1) or SimpleNamespace(stdout=ids.pop(0) if ids else "")))
-    monkeypatch.setattr("core.api.subprocess.Popen", lambda args, **_k: api.launched.append(args[-1]))
+    api.start_apps = sa.StartAppsCache(loader=lambda: list(entries))
+    windows = list(windows)
+    api.launched, api.waits = [], []
+    monkeypatch.setattr("core.api.subprocess.Popen",
+                        lambda args, **_k: api.launched.append(("folder", args[-1])))
+    monkeypatch.setattr("core.api.os.startfile",
+                        lambda target: api.launched.append(("shell", target)), raising=False)
     monkeypatch.setattr("core.api.time.sleep", lambda _s: None)
     monkeypatch.setattr("core.api.pyautogui.hotkey", lambda *_k: None)
     api.app_window_state = lambda _a: ("none", "")
     api._resolve_app_exe = lambda _p: None
-    api._wait_for_app_window = lambda _a, timeout=0: windows.pop(0) if windows else False
+
+    def wait(name, timeout=0):
+        api.waits.append((name, timeout))
+        return windows.pop(0) if windows else False
+
+    api._wait_for_app_window = wait
     api.switch_to_app = lambda _a: True
     api.is_app_running = lambda _a: False
     return api
 
 
-def test_store_app_ids_are_looked_up_once_per_session(monkeypatch, capsys):
-    api = _open_app_api(monkeypatch, ["Microsoft.Calc!App"], [True, True])
-    assert Api._act_open_app(api, "calculator") is True
-    assert Api._act_open_app(api, "Calculator") is True      # same app, cached
-    assert len(api.lookups) == 1 and len(api.launched) == 2
+def test_photos_opens_the_windows_photos_app_first(monkeypatch):
+    api = _open_app_api(monkeypatch, PHOTOS_ENTRIES, [True])
+    assert Api._act_open_app(api, "Photos") is True
+    assert api.launched == [("folder", "shell:AppsFolder\\Microsoft.Windows.Photos_8wekyb3d8bbwe!App")]
+    assert api.waits == [("photos", Api.OPEN_APP_TRY_WAIT_S)]
+
+
+def test_no_window_falls_back_to_the_next_candidate_then_says_so(monkeypatch):
+    api = _open_app_api(monkeypatch, PHOTOS_ENTRIES, [False, True])
+    assert Api._act_open_app(api, "Photos") is True
+    assert [t for _r, t in api.launched] == [
+        "shell:AppsFolder\\Microsoft.Windows.Photos_8wekyb3d8bbwe!App",
+        "shell:AppsFolder\\Microsoft.OneDrive.Photos_8wekyb3d8bbwe!OneDrive.App"]
+    assert "the earlier launch(es) showed no window" in api.last_result_text
+    assert "Microsoft.OneDrive.Photos" in api.last_result_text.split("This one was")[1]
+
+
+def test_all_tries_failing_lists_them_and_the_weaker_matches_within_the_budget(monkeypatch,
+                                                                               capsys):
+    import time as _time
+    api = _open_app_api(monkeypatch, PHOTOS_ENTRIES, [])
+    t0 = _time.perf_counter()
+    assert Api._act_open_app(api, "Photos") is False
+    assert _time.perf_counter() - t0 < 1.0                          # fakes: no real waiting
+    assert [r for r, _t in api.launched] == ["folder", "folder", "shell"]   # 2 candidates + 2nd route
+    msg = api.last_result_text
+    assert msg.startswith("'Photos' showed no window within") and "Tried: 'Photos'" in msg
+    assert "via the ShellExecute" in msg and "via the start-apps folder" in msg
+    assert "Other Start-menu matches (not tried, weaker): 'Photos Legacy'" in msg
+    assert "Do not retry the same launch" in msg
+    assert api.start_apps._stale                                    # refreshed next time
     out = capsys.readouterr().out
-    assert "[OpenApp] timing route=app-id lookup" in out
-    assert "[OpenApp] timing route=app-id cached lookup" in out
+    assert "no window after 3 attempt(s) (exact match, 2 candidate(s), 2 weaker)" in out
+    timing = [l for l in out.splitlines() if "timing route=" in l][0]
+    assert re.fullmatch(r"\[OpenApp\] timing route=app-id( cached)? lookup [\d.]+s launch [\d.]+s "
+                        r"window [\d.]+s focus [\d.]+s no window", timing)
 
 
-def test_a_cached_id_that_brings_no_window_is_looked_up_again(monkeypatch, capsys):
-    api = _open_app_api(monkeypatch, ["Old.Id!App", "New.Id!App"], [True, False, True])
-    assert Api._act_open_app(api, "calculator") is True
-    assert Api._act_open_app(api, "calculator") is True
-    assert api.launched == ["shell:AppsFolder\\Old.Id!App"] * 2 + ["shell:AppsFolder\\New.Id!App"]
-    assert api._app_id_cache == {"calculator": "New.Id!App"}
-    assert "route=app-id refreshed" in capsys.readouterr().out
+def test_a_weaker_match_is_never_launched_on_its_own(monkeypatch):
+    api = _open_app_api(monkeypatch, PHOTOS_ENTRIES, [])
+    Api._act_open_app(api, "Photos")
+    assert not any("Legacy" in t or "Adobe" in t for _r, t in api.launched)
 
 
-def test_a_fresh_lookup_with_the_same_id_does_not_relaunch(monkeypatch):
-    api = _open_app_api(monkeypatch, ["Same!App", "Same!App"], [True, False])
-    Api._act_open_app(api, "calculator")
-    assert Api._act_open_app(api, "calculator") is False
-    assert len(api.launched) == 2 and len(api.lookups) == 2
+def test_the_budget_caps_the_total_wait(monkeypatch):
+    import time as _time
+    api = _open_app_api(monkeypatch, PHOTOS_ENTRIES, [])
+    clock = [0.0]
+    monkeypatch.setattr("core.api.time.perf_counter", lambda: clock[0])
+
+    def wait(name, timeout=0):
+        api.waits.append((name, timeout))
+        clock[0] += timeout                         # a real wait would use all of it
+        return False
+
+    api._wait_for_app_window = wait
+    assert Api._act_open_app(api, "Photos") is False
+    assert clock[0] <= Api.OPEN_APP_BUDGET_S + 1e-6
+    assert [t for _n, t in api.waits] == [3.0, 3.0, 1.0]
 
 
-def test_misses_are_not_cached(monkeypatch):
-    api = _open_app_api(monkeypatch, ["", "Late.Id!App"], [])
-    assert Api._resolve_app_id(api, "calculator") is None
-    assert Api._resolve_app_id(api, "calculator") == "Late.Id!App"
-    assert len(api.lookups) == 2
-
-
-def test_open_app_timing_line_has_numbers_and_labels_only(monkeypatch, capsys):
-    api = _open_app_api(monkeypatch, ["Secret.Name!App"], [False])
-    Api._act_open_app(api, "secretapp")
-    line = [l for l in capsys.readouterr().out.splitlines() if "timing route=" in l][0]
-    assert re.fullmatch(r"\[OpenApp\] timing route=app-id lookup [\d.]+s launch [\d.]+s "
-                        r"window [\d.]+s focus [\d.]+s no window", line)
+def test_an_app_id_from_the_failure_message_opens_exactly_that_entry(monkeypatch):
+    api = _open_app_api(monkeypatch, PHOTOS_ENTRIES, [True])
+    assert Api._act_open_app(api, "Microsoft.PhotosLegacy_8wekyb3d8bbwe!App") is True
+    assert api.launched == [("folder", "shell:AppsFolder\\Microsoft.PhotosLegacy_8wekyb3d8bbwe!App")]
+    assert api.waits[0][0] == "photos legacy"                       # its display name
 
 
 def test_is_app_running_ignores_mistai_own_processes(monkeypatch):

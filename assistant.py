@@ -65,6 +65,9 @@ def main():
     setup_tesseract()
 
     api = Api()
+    # open_app's Start-apps list (Get-StartApps, ~3 s): read in the
+    # background so startup does not wait and lookups take milliseconds.
+    api.start_apps.preload()
     window = webview.create_window(
         f"MistAI v{VERSION}",
         html=HTML,

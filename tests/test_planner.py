@@ -33,6 +33,7 @@
 #   26. ORB SIGNALS FROM THE PLAN RUNNER
 #   27. ORB SIGNALS FROM THE PLAN RUNNER HELPERS
 #   28. ORB SIGNALS FROM THE PLAN RUNNER TESTS
+#   29. TASK END MESSAGE
 # ============================================================
 
 """The planner, the tool registry and the conversation router."""
@@ -1638,3 +1639,92 @@ def test_no_orb_no_signals(monkeypatch):
         agent = _PhaseAgent(api, [(True, "Done.")])
         planner.PlanRunner(api, agent).run_goal("open calculator", "m", "none", "text", None)
         assert sent == [] and planner.events.ORB_SIGNAL not in api.bus.names
+
+
+# ============================================================
+# TASK END MESSAGE
+# ============================================================
+
+# A task never ends silently: a result with no answer and no speech gets one
+# short sentence (shown, captioned, spoken in voice mode).
+
+@pytest.mark.parametrize("result, want", [
+    ({"success": False, "error": "Stopped by user"}, "Stopped."),
+    ({"success": False, "error": "Hit max steps (15)"}, "I ran out of steps before finishing."),
+    ({"success": False, "error": "Agent call failed (ValueError)"},
+     "I couldn't reach the MistAI server."),
+    ({"success": False, "error": "Could not parse LLM response"},
+     "I couldn't understand my own plan."),
+    ({"success": False, "error": "Model responses kept failing to parse (3x in a row)"},
+     "I couldn't understand my own plan."),
+    ({"success": False, "error": "No response to question -- task paused", "speech": ""},
+     "I didn't get an answer, so I paused."),
+    ({"success": False, "error": "file not saved"}, "I couldn't finish the task: file not saved."),
+    ({"success": False, "error": "x" * 200}, "I couldn't finish the task."),
+    (None, "Something broke inside MistAI."),
+    ({"success": True, "speech": ""}, ""),
+])
+def test_every_silent_end_gets_a_short_sentence(result, want):
+    assert planner.end_message(result) == want
+
+
+def _end_api():
+    spoken, captions = [], []
+    return SimpleNamespace(speak=spoken.append, captions_enabled=True,
+                           caption_window=SimpleNamespace(
+                               show_error=lambda m, s: captions.append(m))), spoken, captions
+
+
+def test_a_silent_end_is_shown_and_spoken_in_voice_mode_only(capsys):
+    api, spoken, captions = _end_api()
+    out = planner.ensure_visible_end(api, {"success": False, "error": "Stopped by user"}, "voice")
+    assert out["speech"] == "Stopped." and spoken == ["Stopped."] and captions == ["Stopped."]
+    assert out["error"] == "Stopped by user"                      # the error is kept
+    api, spoken, captions = _end_api()
+    out = planner.ensure_visible_end(api, {"success": False, "error": "Hit max steps (15)"}, "text")
+    assert out["speech"] == "I ran out of steps before finishing." and spoken == []
+    assert "[Task] ended without an answer -- told the user (steps)" in capsys.readouterr().out
+
+
+def test_results_that_already_speak_are_left_alone():
+    api, spoken, captions = _end_api()
+    for r in ({"success": True, "speech": "Done."}, {"success": True},
+              {"success": False, "error": "x", "speech": "I couldn't reach my server."}):
+        assert planner.ensure_visible_end(api, r, "voice") is r
+    assert spoken == [] and captions == []
+
+
+def test_the_plan_runner_ends_a_one_phase_task_with_a_sentence(monkeypatch):
+    api, spoken, _ = _end_api()
+    monkeypatch.setattr(planner, "make_plan",
+                        lambda *a, **k: (SimpleNamespace(nodes={}), ""))
+    agent = SimpleNamespace(_loop=lambda *a, **k: {"success": False, "error": "Stopped by user"})
+    out = planner.PlanRunner(api, agent).run_goal("open photos", "m", "none", "voice", None)
+    assert out["speech"] == "Stopped." and spoken == ["Stopped."]
+
+
+def test_a_crash_in_the_task_thread_is_announced(monkeypatch):
+    from core import agent as agent_mod
+    api, spoken, _ = _end_api()
+
+    class _Inline:
+        def __init__(self, target=None, daemon=None, **_k):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(agent_mod.threading, "Thread", _Inline)
+
+    class _Boom:
+        def __init__(self, *_a):
+            pass
+
+        def run_goal(self, *_a):
+            raise KeyError("x")
+
+    monkeypatch.setattr(agent_mod.planner, "PlanRunner", _Boom)
+    errors = []
+    agent_mod.AgentLoop(api, None).run_project("t", "m", "none", input_mode="voice",
+                                               on_error=errors.append)
+    assert spoken == ["Something broke inside MistAI."] and errors
