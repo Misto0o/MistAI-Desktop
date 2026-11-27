@@ -1499,7 +1499,9 @@ def test_the_note_is_appended_for_untrusted_text(monkeypatch, action):
     assert PAGE in obs[0]                                   # the text itself is not rewritten
 
 
-@pytest.mark.parametrize("action", ["type_text", "click_on_text", "open_app", "write_file"])
+# open_app (and switch_app, uia_click, ui_elements) carry the native control
+# list, whose names are app content: they get the note like other reads.
+@pytest.mark.parametrize("action", ["type_text", "click_on_text", "write_file"])
 def test_no_note_for_other_actions(monkeypatch, action):
     assert not any("instruction-like" in o for o in _injection_flags_run(monkeypatch, action))
 
@@ -1720,8 +1722,13 @@ def test_read_tools_have_large_result_limits_and_others_keep_default():
     for name in ("browser_navigate", "browser_search", "browser_open", "browser_click",
                  "browser_elements", "browser_scroll"):
         assert SPECS[name].result_chars == 8000, name
-    assert SPECS["press_key"].result_chars == 300
-    assert SPECS["open_app"].result_chars == SPECS["switch_app"].result_chars == 800  # APP_NOTES room
+    # Input, clicks and app launches may end with the native control list.
+    for name in ("press_key", "type_text", "hotkey", "uia_click", "click_on_text",
+                 "click_nth", "click_coords", "ui_elements", "open_app", "switch_app"):
+        assert SPECS[name].result_chars == 3500, name
+    assert SPECS["scroll"].result_chars == 300
+    # APP_NOTES room and the native control list
+    assert SPECS["open_app"].result_chars == SPECS["switch_app"].result_chars == 3500
 
 
 # -- AgentLoop truncation and READ shrinking ---------------------------------
@@ -1815,12 +1822,12 @@ def _observations(messages):
 def test_result_is_cut_to_the_tool_limit_with_a_truncation_marker(monkeypatch):
     sent = _loop_with_outputs(
         monkeypatch,
-        [("run_command", "big", "R" * 5000), ("open_app", "notepad", "N" * 1000)],
+        [("run_command", "big", "R" * 5000), ("open_app", "notepad", "N" * 4000)],
     )
     obs = _observations(sent[-1])
     assert "R" * 4000 + " [truncated, 1000 more chars]" in obs[0]
     assert "R" * 4001 not in obs[0]
-    assert "N" * 800 + " [truncated, 200 more chars]" in obs[1]
+    assert "N" * 3500 + " [truncated, 500 more chars]" in obs[1]
 
 
 def test_only_the_two_newest_read_results_stay_full(monkeypatch):
@@ -1829,8 +1836,8 @@ def test_only_the_two_newest_read_results_stay_full(monkeypatch):
         [
             ("run_command", "a", "A" * 5000),
             ("inspect_file", "b", "B" * 5000),
-            # A non-READ result (800 chars) must not evict a real read from
-            # the full window.
+            # A non-READ result (3500 chars, no control list) must not evict
+            # a real read from the full window.
             ("open_app", "c", "C" * 5000),
             ("run_command", "d", "D" * 5000),
         ],
@@ -1839,7 +1846,7 @@ def test_only_the_two_newest_read_results_stay_full(monkeypatch):
     assert "A" * 300 + " [truncated, 4700 more chars]" in obs[0]
     assert "A" * 301 not in obs[0]
     assert "B" * 4000 + " [truncated, 1000 more chars]" in obs[1]
-    assert "C" * 800 + " [truncated, 4200 more chars]" in obs[2]
+    assert "C" * 3500 + " [truncated, 1500 more chars]" in obs[2]
     assert "D" * 4000 + " [truncated, 1000 more chars]" in obs[3]
     # Before the third read arrived, the first was still full.
     assert "A" * 4000 in _observations(sent[3])[0]

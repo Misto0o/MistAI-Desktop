@@ -104,6 +104,61 @@ _POWERSHELL_WRAPPER_RX = re.compile(
     r"\s-(?:command|c)\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+# ------------------------------------------------------------
+# More destroying commands (the guard audit's holes)
+# ------------------------------------------------------------
+# Cmdlet families that delete or clear (Remove-Partition, Clear-Item,
+# Uninstall-Package...): any token with one of these prefixes, except the
+# harmless Clear-Host. And commands that only destroy with a certain argument:
+# git history/working-tree resets, uninstallers, -Force overwrites, download
+# to a file, disk tools, and inline delete calls in python/node one-liners.
+_MUTATING_PREFIXES = ("remove-", "uninstall-", "clear-")
+_HARMLESS_PREFIXED = frozenset({"clear-host"})
+_MUTATING_EXTRA_TOKENS = frozenset({
+    "tee-object", "tee", "expand-archive", "-outfile", "sdelete", "sdelete64", "diskpart",
+    "vssadmin", "bcdedit", "fsutil", "takeown", "mkfs",
+})
+GIT_DESTRUCTIVE_RX = re.compile(
+    r"(?<![\w-])git(?:\.exe)?(?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?\s+"
+    r"(?:clean\b|reset\s+(?:.*\s)?--hard\b|checkout\s+(?:.*\s)?(?:--(?:\s|$)|-f\b|\.(?:\s|$))"
+    r"|restore\b|rm\b|push\b.*\s(?:--force\b|-f\b|--mirror\b|--delete\b)|branch\s+-D\b"
+    r"|stash\s+(?:drop|clear)\b|filter-branch\b|reflog\s+expire\b|gc\s+.*--prune\b"
+    r"|worktree\s+remove\b|update-ref\s+-d\b)",
+    re.IGNORECASE,
+)
+_ARG_MUTATING_RX = re.compile(
+    r"(?<![\w-])(?:"
+    r"(?:winget|choco|scoop|pip3?|npm|pnpm|yarn|dotnet|cargo|gem)(?:\.exe)?\s+(?:[^;|&]*\s)?(?:uninstall|remove)\b"
+    r"|msiexec(?:\.exe)?\s+(?:[^;|&]*\s)?/x\b"
+    r"|(?:new-item|ni)\s+[^;|&]*-force\b"
+    r"|compress-archive\s+[^;|&]*-(?:force|update)\b"
+    r"|(?:curl|wget)(?:\.exe)?\s+(?:[^;|&]*\s)?(?:-o|-O|--output)\b"
+    r"|cipher(?:\.exe)?\s+[^;|&]*/w\b"
+    r"|icacls(?:\.exe)?\s+[^;|&]*/(?:reset|remove|deny|grant|setowner|inheritance)\b"
+    r"|wmic(?:\.exe)?\s+[^;|&]*\bdelete\b"
+    r")",
+    re.IGNORECASE,
+)
+_SCRIPT_DELETE_RX = re.compile(
+    r"\b(?:shutil\.rmtree|shutil\.move|os\.(?:remove|unlink|rmdir|removedirs|replace)"
+    r"|send2trash|rimraf|fs(?:\.promises)?\.(?:rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync"
+    r"|writeFile|writeFileSync))\b|\.(?:unlink|rmdir|rmtree|rmSync|rmdirSync|unlinkSync)\(",
+    re.IGNORECASE,
+)
+
+
+def command_has_extra_mutation(command):
+    """The holes the guard audit found in command_is_mutating's verb list."""
+    raw = str(command or "")
+    for tok in _command_tokens(raw):
+        if tok in _MUTATING_EXTRA_TOKENS:
+            return True
+        if tok.startswith(_MUTATING_PREFIXES) and tok not in _HARMLESS_PREFIXED:
+            return True
+    return bool(GIT_DESTRUCTIVE_RX.search(raw) or _ARG_MUTATING_RX.search(raw)
+                or _SCRIPT_DELETE_RX.search(raw))
+
+
 _DANGEROUS_CLICK_TEXT_RX = re.compile(
     r"\b(send|submit|post|publish|buy|purchase|pay|place\s+order|"
     r"delete|remove|discard|unsubscribe|unfollow|block|confirm)\b",
@@ -187,6 +242,8 @@ def command_is_mutating(command, _depth=0):
     raw = str(command or "")
     if ">" in _outside_quotes(raw):
         return True
+    if command_has_extra_mutation(raw):
+        return True
     for tok in _command_tokens(raw):
         if tok in _MUTATING_VERB_SET or tok in _DYNAMIC_EVAL_TOKENS:
             return True
@@ -252,8 +309,14 @@ def _T(name, **kw):
     return name, ToolSpec(name=name, **kw)
 
 
-# open_app / switch_app: their own text plus an APP_NOTES tip (<= 350 chars).
-APP_RESULT_CHARS = 800
+# open_app / switch_app: their own text plus an APP_NOTES tip (<= 350 chars)
+# and the native control list (60 lines, ~2.2k chars on the largest window
+# measured). Below READ_RESULT_CHARS (they are not reads); the agent shrinks
+# an older result that carries a control list like an old read.
+APP_RESULT_CHARS = 3500
+# Input and click results that may end with the control list (the window
+# changed); ui_elements too.
+CONTROL_LIST_RESULT_CHARS = 3500
 
 # browser_* results that end with the numbered element list (about 6000
 # chars, browser_session.ELEMENT_LIST_CHARS) after their own text and the
@@ -332,6 +395,14 @@ SPECS = dict(
             base_reliability=0.85,
             categories=("click",),
             fallback_tools=("click_on_text",),
+            result_chars=CONTROL_LIST_RESULT_CHARS,
+        ),
+        _T(
+            "ui_elements",
+            settle=0.0,
+            base_confidence=0.98,
+            categories=("perception",),
+            result_chars=CONTROL_LIST_RESULT_CHARS,
         ),
         _T(
             "uia_find_input",
@@ -346,6 +417,7 @@ SPECS = dict(
             base_reliability=0.7,
             categories=("click",),
             verifier="click_landed",
+            result_chars=CONTROL_LIST_RESULT_CHARS,
         ),
         _T(
             "click_nth",
@@ -353,6 +425,7 @@ SPECS = dict(
             base_confidence=0.6,
             categories=("click",),
             verifier="click_landed",
+            result_chars=CONTROL_LIST_RESULT_CHARS,
         ),
         _T(
             "click_coords",
@@ -360,10 +433,12 @@ SPECS = dict(
             base_confidence=0.4,
             base_reliability=0.5,
             categories=("click",),
+            result_chars=CONTROL_LIST_RESULT_CHARS,
         ),
         # -- Typing / keys -------------------------------------------------------
         _T(
-            "type_text", requires_focus=True, base_confidence=0.85, categories=("type",)
+            "type_text", requires_focus=True, base_confidence=0.85, categories=("type",),
+            result_chars=CONTROL_LIST_RESULT_CHARS,
         ),
         _T(
             "type_search",
@@ -372,7 +447,8 @@ SPECS = dict(
             base_confidence=0.8,
             categories=("type",),
         ),
-        _T("hotkey", settle=0.2, base_confidence=0.9, categories=("type",)),
+        _T("hotkey", settle=0.2, base_confidence=0.9, categories=("type",),
+           result_chars=CONTROL_LIST_RESULT_CHARS),
         # The keyboard route through a Save As dialog; it checks the file on
         # disk itself. An existing target file asks first (is_destructive).
         _T(
@@ -383,7 +459,8 @@ SPECS = dict(
             base_confidence=0.95,
             categories=("type", "file"),
         ),
-        _T("press_key", settle=0.2, base_confidence=0.95, categories=("type",)),
+        _T("press_key", settle=0.2, base_confidence=0.95, categories=("type",),
+           result_chars=CONTROL_LIST_RESULT_CHARS),
         _T("scroll", settle=0.2, base_confidence=0.9, categories=("navigation",)),
         _T(
             "quick_message",
@@ -649,9 +726,15 @@ _PLAYBOOK = {
     "minimize_all": ("Minimize all windows (ONLY when the user explicitly asks)", ""),
     "active_app": ("Show the active application", ""),
     "list_apps": ("List running applications", ""),
-    "uia_click": ("Click a native-app element by name via the accessibility tree",
-                  "element name",
-                  'If an edit control field lacks an exact text match, try control type "Edit".'),
+    "uia_click": ("Click a native-app control by list number (or name)",
+                  'number from the list (e.g. "8"), or the control name',
+                  "open_app, switch_app and ui_elements show the numbered list; a number stays "
+                  "with its control while the window keeps it (an old number is refused). The "
+                  "result says what changed, or that nothing did. If an edit field lacks an "
+                  'exact name, try control type "Edit".', "8"),
+    "ui_elements": ("Numbered list of the native window's controls and shortcut keys", "",
+                    "Popups/menus/dialogs first, then on-screen named controls; off-screen and "
+                    "unnamed ones are counted. Says so when the app draws its own UI."),
     "uia_find_input": ("Click into a native app's text input, chat field or search bar "
                        "to focus it", ""),
     "click_on_text": ("Find and click text via OCR/Vision", "text"),

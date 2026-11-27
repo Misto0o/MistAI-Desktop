@@ -55,7 +55,7 @@ import time
 from dataclasses import dataclass, field
 import os
 
-from . import executor as verify, live_state as events
+from . import audit, executor as verify, guard, live_state as events
 from .config import verbose_logs, normalize_window_title
 from .tools import CLICK_FAMILY
 
@@ -316,7 +316,11 @@ def run(name, api, action, param, arg=""):
 # "UIA-unchanged": the UIA action ran but the window's accessibility text did
 # not change afterwards (Api.last_uia_effect is False). Still a success
 # (confidence never overturns a result), reported with less trust.
-METHOD_CONFIDENCE = {"UIA": 0.92, "UIA-unchanged": 0.5, "OCR": 0.74, "Vision": 0.45}
+METHOD_CONFIDENCE = {"UIA": 0.92, "UIA-unchanged": 0.5, "OCR": 0.74, "Vision": 0.45,
+                     # OCR / vision / coordinate clicks after which nothing changed
+                     # (Api.last_click_effect False): less trust than a plain one.
+                     "OCR-unchanged": 0.35, "Vision-unchanged": 0.25,
+                     "direct-unchanged": 0.3}
 
 # Browsers render their content into a canvas/DOM that UIA sees only as a
 # useless generic tree ("document", "group", "Empty"), so UIA-first clicking
@@ -369,6 +373,9 @@ class ExecutionResult:
             return " Resolved by reading on-screen text (OCR)."
         if self.method == "UIA":
             return " Resolved via the accessibility tree."
+        if self.method in ("OCR-unchanged", "Vision-unchanged", "direct-unchanged"):
+            return (" The click ran but nothing visibly changed afterwards -- it probably "
+                    "missed. Use ui_elements and click by number, or a keyboard shortcut.")
         if self.method == "UIA-unchanged":
             return (" Found via the accessibility tree, but the window showed no change "
                     "afterwards -- check the result before relying on it.")
@@ -442,6 +449,27 @@ class Executor:
 
         spec = reg.get(action)
         t0 = time.time()
+
+        # -- Destructive-action guard (core/guard.py) -----------------------
+        # Right before any input is sent: a held action asks (or is refused)
+        # and, when it does not run, nothing is sent and nothing escalates.
+        prepare = getattr(api, "_guard_prepare", None)
+        if callable(prepare):
+            try:
+                prepare(action)
+            except Exception:
+                pass
+        decision, outcome, blocked = guard.gate(api, action, param)
+        if blocked:
+            res = ExecutionResult(
+                action=action, parameter=param, success=False, confidence=0.0,
+                method="guard", verified=None, detail=blocked,
+                duration=round(time.time() - t0, 2), escalated_from=rerouted_from,
+            )
+            self._finalize(res, spec)
+            self._audit(res, decision, outcome)
+            return res
+
         t_start = time.perf_counter()
         try:
             ok = bool(api._exec_sync(action, param))
@@ -456,6 +484,14 @@ class Executor:
         # Settle from tool metadata (replaces AgentLoop._smart_settle) --
         # the UI must catch up BEFORE verification looks at ground truth.
         settle_after(api, action, param, spec, reg.settle(action))
+        # The native control list, read once the UI settled (Api._list_after:
+        # app launches and switches, and input or clicks that changed the window).
+        add_list = getattr(api, "_list_after", None)
+        if callable(add_list):
+            api.last_result_text = detail
+            add_list(action, ok)
+            detail = getattr(api, "last_result_text", "") or detail
+            api.last_result_text = ""
         t_settle = time.perf_counter()
         # Anything but a read may have changed the screen: later vision reads
         # must use a frame captured after this point.
@@ -482,6 +518,8 @@ class Executor:
         method = "direct"
         if action in ("click_on_text", "click_nth"):
             method = getattr(api.click_handler, "last_method", None) or "direct"
+        if action in ("click_on_text", "click_nth", "click_coords") and                 getattr(api, "last_click_effect", None) is False and                 f"{method}-unchanged" in METHOD_CONFIDENCE:
+            method = f"{method}-unchanged"
         elif action == "uia_click":
             method = "UIA-unchanged" if getattr(api, "last_uia_effect", None) is False else "UIA"
 
@@ -499,6 +537,7 @@ class Executor:
         # ToolRegistry.reliability() and to TaskMemory, and every tool with a
         # fallback looked more reliable than it actually is.
         self._finalize(res, spec)
+        self._audit(res, decision, outcome)
 
         # -- Escalation (design doc #6) --------------------------------------
         # ONLY a real failure escalates. Confidence describes how much to
@@ -554,7 +593,52 @@ class Executor:
         Return None to skip that fallback for this parameter."""
         if not param and to_action in ("click_on_text", "uia_click"):
             return None  # nothing to search for
+        if from_action == "uia_click" and callable(getattr(self.api, "_control_ref", None)):
+            try:
+                if self.api._control_ref(param) is not None:
+                    return None  # a list number is not text to find on screen
+            except Exception:
+                pass
         return param     # chains defined so far share the same parameter shape
+
+    # ------------------------------------------------------------
+    # AUDIT TRAIL ENTRY
+    # ------------------------------------------------------------
+    # One local audit.jsonl line per executed or blocked action (core/audit.py):
+    # full arguments (credential-looking tokens scrubbed; typing into a
+    # password field only as a length), the window and control, the result
+    # and the guard's decision. Never printed to the console.
+
+    def _audit(self, res, decision, outcome):
+        try:
+            from .config import scrub_outbound
+
+            args = str(res.parameter or "")
+            if getattr(decision, "password", False):
+                args = f"<{len(args)} chars typed into a password field>"
+            else:
+                args = scrub_outbound(args)[0]
+            window = getattr(decision, "window", "") or ""
+            if not window:
+                try:
+                    window = self.api.live.snapshot.get("foreground_window", "") or ""
+                except Exception:
+                    window = ""
+            if outcome in ("allow", "approved"):
+                result = "ok" if res.success else "failed"
+            else:
+                result = "refused" if outcome == "refused" else "blocked"
+            audit.record(
+                res.action, args, result, window=window,
+                control=getattr(decision, "control", "") or "",
+                detail=scrub_outbound(res.detail or "")[0],
+                guard={"decision": outcome, "reason": getattr(decision, "reason", ""),
+                       "what": getattr(decision, "what", ""),
+                       "protected": getattr(decision, "protected", "")},
+                ms=(res.duration or 0) * 1000,
+            )
+        except Exception:
+            pass
 
     def _finalize(self, res, spec):
         api = self.api

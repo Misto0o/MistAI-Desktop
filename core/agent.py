@@ -16,7 +16,7 @@ import time
 
 import requests
 
-from . import planner
+from . import guard, planner
 from .config import (
     describe_api_error,
     MODEL_LABELS,
@@ -193,6 +193,53 @@ CREDENTIAL_NOTE = (
 # Loop cycle guard (CycleGuard): the note added the first time a cycle of
 # identical steps repeats, and the line spoken when it repeats again.
 LOOP_NOTE = "NOTE: You are repeating the same steps; try a different approach or finish."
+
+
+def loop_note(cycle):
+    """LOOP_NOTE plus what repeated (the cycle's action names) and what to do
+    instead. cycle: CycleGuard.warned, ((action, parameter hash), ...)."""
+    names = " -> ".join(a for a, _h in (cycle or ())) or "the same steps"
+    return (f"{LOOP_NOTE} What repeated: {names}, with the same parameters, twice in a row, "
+            "and nothing came of it. Do not run them again: read the result text you already "
+            "have, use ui_elements and act by number or a keyboard shortcut, or call done "
+            "with an honest report.")
+
+
+# ============================================================
+# VISION READ GUARD
+# ============================================================
+
+# Screen reads answered by vision (analyze_screen; read_screen_text when it
+# did not answer from the window's exact text or a page's DOM text) with no
+# action between them: the second gets vision_read_note, from the fourth
+# they are refused (VISION_REFUSAL) until an action runs or the user answers
+# an ask_user question. ui_elements, other reads and failures do not count.
+VISION_READ_ACTIONS = ("analyze_screen", "read_screen_text")
+CONTROL_LIST_MARK = "UI CONTROLS of '"     # click_handler.CONTROLS_HEADER's start
+VISION_READ_NOTE_AT = 2
+VISION_READ_BLOCK_AT = 4
+_NON_VISION_ANSWERS = ("EXACT UI TEXT", "PAGE TEXT", "UI CONTROLS")
+
+
+def is_vision_read(action, result_text):
+    """A read answered by vision (see the section comment)."""
+    if action == "analyze_screen":
+        return True
+    return action == "read_screen_text" and not str(result_text or "").lstrip().startswith(
+        _NON_VISION_ANSWERS)
+
+
+def vision_read_note(count):
+    return (f"NOTE: {count} screen reads by vision in a row with no action between them. Use "
+            "the control list (ui_elements, then uia_click by number) or a keyboard shortcut "
+            "instead of reading the screen again.")
+
+
+VISION_REFUSAL = (
+    f"REFUSED: {VISION_READ_BLOCK_AT - 1} vision reads in a row already ran with no action "
+    "between them, so this read was not run. Act on what you know (ui_elements, then uia_click "
+    "by number; a keyboard shortcut), ask the user (ask_user), or call done with an honest "
+    "report.")
 LOOP_SPEECH = "I got stuck going in circles, so I stopped."
 
 # The last message of every agent request while batched steps are on.
@@ -218,6 +265,49 @@ PARSE_RETRY_REASONS = {
                      'written as \\"; for a browser element, use its number as the parameter)'),
     "no-action": "was JSON without an \"action\" field",
 }
+
+
+# ------------------------------------------------------------
+# REPLY JSON
+# ------------------------------------------------------------
+# The reply as JSON, before any other recovery: the whole text first (a
+# valid object whose speech mentions ``` must not be cut at the backticks);
+# then the inside of a ```json fence (up to its LAST closing fence); then
+# with lone backslashes escaped (an unescaped Windows path, C:\Users, is
+# otherwise invalid JSON). strict=False keeps raw newlines in strings.
+
+_LONE_BACKSLASH_RX = re.compile(r'\\(?![\\"/bfnrt]|u[0-9a-fA-F]{4})')
+_FENCE_RX = re.compile(r"```(?:json|JSON)?\s*(.*)```", re.DOTALL)
+
+
+def _loads(text):
+    try:
+        return json.loads(text, strict=False)
+    except Exception:
+        return None
+
+
+def reply_json(raw):
+    """(cleaned text, parsed value or None) of a model reply."""
+    text = str(raw or "").strip()
+    parsed = _loads(text)
+    if parsed is not None:
+        return text, parsed
+    if "```" in text:
+        m = _FENCE_RX.search(text)
+        inner = (m.group(1) if m else text.split("```", 1)[1]).strip()
+        if inner.lower().startswith("json"):
+            inner = inner[4:].strip()
+        parsed = _loads(inner)
+        if parsed is not None:
+            return inner, parsed
+        text = inner if "{" in inner else text
+    fixed = _LONE_BACKSLASH_RX.sub(r"\\\\", text)
+    if fixed != text:
+        parsed = _loads(fixed)
+        if parsed is not None:
+            return fixed, parsed
+    return text, None
 
 
 def _first_json_object(text):
@@ -266,7 +356,9 @@ UNSUBMITTED_READ_NOTE = (
 # files, command output); instruction-like wording in them gets a note.
 UNTRUSTED_TEXT_ACTIONS = frozenset(
     {"browser_get_text", "browser_search", "browser_navigate", "browser_open", "browser_click",
-     "browser_elements", "browser_scroll", "read_screen_text", "inspect_file", "run_command"})
+     "browser_elements", "browser_scroll", "read_screen_text", "inspect_file", "run_command",
+     # the native control list (control names are app content)
+     "ui_elements", "open_app", "switch_app", "uia_click"})
 
 
 # ============================================================
@@ -534,6 +626,19 @@ class AgentLoop:
         else:
             verdict = confirmation_answer(answer)
         print(f"  [Confirm] answer={verdict} ({source}){' (retry)' if retry else ''}")
+        return verdict
+
+    # ------------------------------------------------------------
+    # DESTRUCTIVE GUARD QUESTIONS
+    # ------------------------------------------------------------
+    # The guard's question (core/guard.py gate) as a normal confirmation:
+    # Yes/No buttons, voice in voice mode, one retry on an unclear answer.
+    # "yes" | "no" | "unclear" | None (stopped); anything but yes is a no.
+
+    def _guard_answer(self, question, input_mode):
+        verdict = self._ask_confirmation(question, input_mode)
+        if verdict == "unclear":
+            verdict = self._ask_confirmation(CONFIRM_RETRY_QUESTION, input_mode, retry=True)
         return verdict
 
     def _remember_send(self, parameter):
@@ -1265,6 +1370,7 @@ class AgentLoop:
         tool_fail = (None, 0)  # (action, consecutive failures); reads don't break it
         blocked_tools = set()  # tools refused after TOOL_FAIL_BLOCK_AT failures
         empty_lists = 0        # browser results in a row whose list stayed empty
+        vision_reads = 0       # vision screen reads in a row with no action between
         declined_signatures = set()
         declined_questions = []   # ask_user questions the user said no to
         cycle_guard = CycleGuard()
@@ -1632,6 +1738,15 @@ class AgentLoop:
                 history.append({"role": "user", "content": f"[OBSERVATION] {refuse}"})
                 continue
 
+            # --- VISION READS: a 4th in a row with no action is refused ------
+            if action in VISION_READ_ACTIONS and vision_reads >= VISION_READ_BLOCK_AT - 1:
+                print(f"  [Refused] {action}: {vision_reads} vision reads in a row")
+                if on_step:
+                    on_step(steps_taken, "refused", str(param), "")
+                history.append({"role": "assistant", "content": json.dumps(cmd)})
+                history.append({"role": "user", "content": f"[OBSERVATION] {VISION_REFUSAL}"})
+                continue
+
             # --- EMPTY LISTS: listing an empty page again is refused --------
             if action in EMPTY_LIST_TOOLS and empty_lists >= EMPTY_LIST_BLOCK_AT:
                 print(f"  [Refused] {action}: the page listed nothing "
@@ -1729,8 +1844,14 @@ class AgentLoop:
             if needs_confirm and action == "quick_message":
                 needs_confirm, deferred_send, offer_remember = self._send_gate(
                     param, input_mode, on_step, steps_taken)
+            gate_confirmed = False
             if needs_confirm:
                 confirm_q = self._confirmation_question(action, param)
+                # The destructive guard's own wording ("Delete 'x' and its
+                # contents?") when it would hold this step too: one question.
+                held = guard.preview(self.api, action, param)
+                if held.verdict == "confirm" and held.question:
+                    confirm_q = held.question
                 verdict = self._ask_confirmation(confirm_q, input_mode,
                                                  offer_remember=offer_remember)
                 if verdict == "unclear":
@@ -1780,6 +1901,7 @@ class AgentLoop:
                     self.api.memory.add_action("confirm_declined", False)
                     continue
 
+                gate_confirmed = True
                 history.append({"role": "assistant", "content": json.dumps(cmd)})
                 history.append(
                     {
@@ -1950,6 +2072,7 @@ class AgentLoop:
                 blocked_tools.clear()
                 tool_fail = (None, 0)
                 empty_lists = 0
+                vision_reads = 0
                 if established:
                     history.append(
                         {
@@ -1994,9 +2117,16 @@ class AgentLoop:
             t0 = time.monotonic()
             if deferred_send is not None:
                 self.api._send_confirm = deferred_send["hook"]
+            # The destructive guard (core/guard.py, in Executor.run) asks
+            # through this phase's confirmation flow; a step this gate already
+            # confirmed is not asked about twice.
+            self.api._guard_ask = lambda q: self._guard_answer(q, input_mode)
+            self.api._guard_preapproved = (action, str(param)) if gate_confirmed else None
             try:
                 res = self.api.executor.run(action, param)
             finally:
+                self.api._guard_ask = None
+                self.api._guard_preapproved = None
                 if deferred_send is not None:
                     self.api._send_confirm = None
             self.record_time("exec", time.monotonic() - t0, step_times)
@@ -2261,6 +2391,15 @@ class AgentLoop:
                 if tool_fail[1] >= TOOL_FAIL_BLOCK_AT:
                     blocked_tools.add(action)
 
+            # Vision reads in a row with no action between (VISION READ GUARD).
+            if success and is_vision_read(executed_action, result_str):
+                vision_reads += 1
+                if vision_reads >= VISION_READ_NOTE_AT:
+                    print(f"  [Repeat] {vision_reads} vision reads in a row")
+                    obs += f" {vision_read_note(vision_reads)}"
+            elif not (self._categories(executed_action) & {"perception", "info"}):
+                vision_reads = 0
+
             # Empty element lists in a row (any browser tool; see EMPTY ELEMENT LISTS).
             if BROWSER_EMPTY_LIST_MARK in result_str:
                 empty_lists += 1
@@ -2282,15 +2421,19 @@ class AgentLoop:
                 return {"success": False, "error": "loop", "speech": LOOP_SPEECH,
                         "steps": steps_taken}
             if loop_verdict == "warn":
-                print("  [Loop] repeating steps; note added")
-                obs += f" {LOOP_NOTE}"
+                print(f"  [Loop] repeating steps; note added "
+                      f"({len(cycle_guard.warned or ())}-step cycle)")
+                obs += f" {loop_note(cycle_guard.warned)}"
 
             batch_ok = bool(
                 success and res.verified is not False and loop_verdict != "warn"
                 and not result_str.startswith(("WARNING", "NOT SENT")))
             history.append({"role": "assistant", "content": json.dumps(cmd)})
             history.append({"role": "user", "content": f"[OBSERVATION] {obs}"})
-            if shown_result and result_limit >= READ_RESULT_CHARS:
+            # Reads, and results that carry a native control list (an old list
+            # is stale): only the newest KEEP_FULL_READS stay in full.
+            if shown_result and (result_limit >= READ_RESULT_CHARS
+                                 or CONTROL_LIST_MARK in shown_result):
                 full_reads.append(
                     (len(history) - 1, shown_result, self._clip_result(result_text, 300))
                 )
@@ -2336,7 +2479,11 @@ class AgentLoop:
         exact = self._exact_text_context()
         if exact:
             return exact
-        why = why or getattr(self, "_exact_skip", "") or "no text"
+        controls = self._controls_context()
+        if controls:
+            return controls
+        why = (why or getattr(self, "_controls_skip", "") or getattr(self, "_exact_skip", "")
+               or "no text")
         if self.api.vision.ready:
             print(f"  [Screen] vision read ({why})")
             try:
@@ -2360,6 +2507,39 @@ class AgentLoop:
         fw = snap.get("foreground_window", "Unknown")
         apps = ", ".join(snap.get("open_apps", [])[:3])
         return f"Window: {fw} | Apps: {apps}"
+
+    def _controls_context(self):
+        """The per-step context from the native window's numbered control list
+        (Api._read_control_list) when it names enough controls, so no vision
+        call is made; "" otherwise (no reader, a browser or MistAI's window,
+        a LOW INFORMATION window: vision decides). Never raises."""
+        self._controls_skip = ""
+        pick = getattr(self.api, "_native_list_window", None)
+        read = getattr(self.api, "_read_control_list", None)
+        if not uia_first_enabled() or not (callable(pick) and callable(read)):
+            return ""
+        try:
+            target = pick(need_target=False)
+            if not target:
+                return ""
+            text, got, _sig = read(*target)
+        except Exception as e:
+            self._controls_skip = f"control list error {type(e).__name__}"
+            return ""
+        if not got.get("rows") or "LOW INFORMATION" in text:
+            self._controls_skip = "few named controls"
+            return ""
+        kinds = injection_flags(text)
+        note = f" | {injection_note(kinds)}" if kinds else ""
+        if kinds:
+            print(f"  [Injection] instruction-like text: {', '.join(kinds)}")
+        snap = self.api.live.snapshot
+        fw = snap.get("foreground_window", "Unknown")
+        apps = describe_open_apps(snap, limit=10) or "none"
+        print("  [Screen] native window: control list, no vision")
+        return (f"Window: {fw} | Open apps: {apps} | {text}{note} | (No screenshot was taken "
+                "for this read -- the list is the window's accessibility tree; call "
+                "analyze_screen only if you need to see pixels.)")
 
     def _exact_text_context(self):
         """The per-step context from the foreground native window's own
@@ -2620,8 +2800,8 @@ TOOL PRIORITY -- try tools in this order (cheapest and most reliable first):
 1. run_command (PowerShell) -- your DEFAULT for ANY operation or fact on this computer (dates, disk space, processes, files); if a one-liner can do it, do NOT click UI. Live or changing information from the internet comes from browser_search / browser_navigate + browser_get_text, not from web APIs called with run_command.
 2. Check "Open apps" before open_app: if the app is listed, use switch_app (its real process identity), never a guessed window title.
 3. INSIDE A BROWSER PAGE use the browser_* actions: they use the page's real structure (DOM) and either find the element or say they couldn't. NEVER use click_on_text, uia_click or read_screen_text inside a browser page.
-4. In a focused NATIVE Windows app (Notepad, Explorer, Settings, Task Manager): enter text and keys with type_text / press_key / hotkey before any clicking; for controls use uia_click / uia_find_input. Input boxes are often unlabeled (control type "Edit") or share names with other content: focus them with uia_find_input, not a guessed uia_click name. Electron chat apps (Discord, Slack...) have misleading accessibility trees: there prefer click_on_text for the person's name AND the message box.
-5. click_on_text / click_nth (OCR+Vision) -- the last resort: native apps when keys and UIA cannot do it, or a canvas-only page with no DOM.
+4. In a focused NATIVE Windows app: enter text and keys with type_text / press_key / hotkey before any clicking. open_app, switch_app and ui_elements give a numbered control list: act by number (uia_click 8), prefer a shortcut key it shows, and read the result text (it says what changed) instead of re-reading the screen; click_on_text or vision only when the list is empty, says LOW INFORMATION or the control is unnamed. Unlabeled input boxes (control type "Edit"): focus them with uia_find_input, not a guessed name. Electron chat apps (Discord, Slack...) have misleading accessibility trees: there prefer click_on_text for the person's name AND the message box.
+5. click_on_text / click_nth (OCR+Vision) -- the last resort (see 4), or a canvas-only page with no DOM.
 6. click_coords -- LAST RESORT ONLY, with coordinates verified via read_screen_text.
 
 OPERATING RULES:
@@ -2797,17 +2977,7 @@ RESPONSE FORMAT (JSON ONLY):
 
         # API adapters can return null/non-text on an upstream failure. Treat
         # that as malformed model JSON rather than crashing the agent thread.
-        cleaned = str(raw or "").strip()
-        for fence in ["```json", "```"]:
-            if fence in cleaned:
-                cleaned = cleaned.split(fence)[1].split("```")[0]
-        cleaned = cleaned.strip()
-        try:
-            # strict=False: a raw newline inside a string (multi-line
-            # "thinking") is still the model's object, not malformed JSON.
-            parsed = json.loads(cleaned, strict=False)
-        except Exception:
-            parsed = None
+        cleaned, parsed = reply_json(raw)
         # The reply's shape, never its content: shows on real runs whether the
         # model ever sends a batch (and in which form).
         shape = ("steps" if isinstance(parsed, dict) and "steps" in parsed

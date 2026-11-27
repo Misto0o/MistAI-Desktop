@@ -77,6 +77,7 @@
 #   69. BACKEND URL AND KEY
 #   70. CRASH LOG
 #   71. COMTYPES CACHE
+#   72. DESTRUCTIVE GUARD AND AUDIT TRAIL
 # ============================================================
 
 """
@@ -1887,3 +1888,55 @@ def configure_comtypes_cache(folder=None, memory_only=False, comtypes_client=Non
         _COMTYPES_STATE["mode"] = mode
         print(f"[COMCache] generated COM modules: {'user cache' if mode == 'dir' else 'memory only'}")
     return mode
+
+
+# ============================================================
+# DESTRUCTIVE GUARD AND AUDIT TRAIL
+# ============================================================
+# core/guard.py holds input that would delete, erase or overwrite something
+# (a Delete key on a file list, a click on a destructive button, Enter on a
+# delete dialog, a deleting command). Protected locations need a second,
+# explicit yes naming the path. All settings are read at call time.
+#
+# Protected locations, built at call time (core/guard.py protected_entries):
+#   "tree" (the folder and everything inside it): MistAI's own repo (the
+#     folder holding core/), every sibling of it whose name, letters and
+#     digits only, starts with one of PROTECTED_NAME_PREFIXES (other MistAI
+#     repos, backup zips, quarantine folders), MistAI's data folder (~/MistAI),
+#     and every entry of MISTAI_PROTECTED_PATHS (";"-separated).
+#   "root" (the folder itself and anything above it, not files inside):
+#     the user profile, every drive root, the known folders
+#     (PROTECTED_KNOWN_FOLDERS, OneDrive-redirected ones included), OneDrive
+#     roots, the process's working directory and the workspace project root.
+PROTECTED_NAME_PREFIXES = ("mistai",)
+PROTECTED_KNOWN_FOLDERS = ("Desktop", "Personal", "My Pictures", "My Music", "My Video",
+                           "{374DE290-123F-4565-9164-39C4925E467B}")   # Downloads
+PROTECTED_PATHS_ENV = "MISTAI_PROTECTED_PATHS"
+
+# Unattended runs (the scenario harness, live checks): a held action is
+# refused without asking anyone.
+UNATTENDED_ENV = "MISTAI_UNATTENDED"
+
+# The local audit trail (core/audit.py): append-only JSONL, never uploaded.
+# Rotation keeps the current file and one older one, each up to half the
+# limits below, so about AUDIT_MAX_BYTES and AUDIT_MAX_DAYS in total.
+AUDIT_PATH_ENV = "MISTAI_AUDIT_PATH"
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_MAX_DAYS = 7
+
+
+def unattended_mode():
+    """True when nobody can answer a question (MISTAI_UNATTENDED=1)."""
+    return os.environ.get(UNATTENDED_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def extra_protected_paths():
+    """MISTAI_PROTECTED_PATHS entries (";"-separated), expanded."""
+    raw = os.environ.get(PROTECTED_PATHS_ENV, "")
+    return [os.path.expandvars(os.path.expanduser(p.strip())) for p in raw.split(";") if p.strip()]
+
+
+def audit_path():
+    """The audit file: MISTAI_AUDIT_PATH, else ~/MistAI/audit.jsonl."""
+    return os.environ.get(AUDIT_PATH_ENV) or os.path.join(
+        os.path.expanduser("~"), "MistAI", "audit.jsonl")

@@ -39,7 +39,13 @@ Scenario keys beyond the obvious: "needs": ["network", "browser"] SKIPs in --stu
 scenario's tmp folder on 127.0.0.1 at "{tmp_url}" (stopped after the scenario);
 expect "file_contains" / "file_not_contains": [{"path", "text", "ignore_case"}] read
 the file as UTF-8 (BOM and CRLF tolerated); both fail when the file is missing;
-expect "browser_url_contains": "text" checks the page MistAI's own browser ended on.
+expect "browser_url_contains": "text" checks the page MistAI's own browser ended on;
+expect "log_contains": ["text"] needs each text in the run's log. Setup
+{"launch_fixture": {"script", "args", "wait_title"}} starts a fixture script
+(sys.executable, arguments expanded like the scenario) and waits for a window whose
+title contains wait_title (SKIP after 10 s); the harness stops it after the scenario.
+Scenarios tagged "guard" (the destructive-guard fixture) run only with --tag guard
+or --only <name>, like "realistic".
 
 Isolation: memory/tasks/tool stats go to a fresh throwaway SQLite file per
 scenario (MISTAI_DB_PATH), and the workspace and live state are reset before
@@ -47,7 +53,10 @@ each one; each scenario gets its own folder under %TEMP% ("{tmp}" in
 the scenario) and only that folder is deleted afterwards; the only processes
 closed are ones whose names are listed in cleanup AND that did not exist
 before the scenario started. Confirmations are answered from the scenario's
-"answers" (default "no"). Logs: ~/MistAI/logs/scenarios-<timestamp>/.
+"answers" (default "no"). Runs are unattended (MISTAI_UNATTENDED=1): the
+destructive guard (core/guard.py) refuses what it holds without asking, and its
+audit trail goes to the run's temp folder (MISTAI_AUDIT_PATH), never to
+~/MistAI/audit.jsonl or the shared logs. Logs: ~/MistAI/logs/scenarios-<timestamp>/.
 """
 
 import argparse
@@ -84,9 +93,13 @@ MODE_ENV_KEYS = ("MISTAI_VISION_GATING", "MISTAI_LAZY_VISION")
 # What a scenario may need that --stub cannot honestly give it (it SKIPs there).
 NEEDS = {"network", "browser"}
 REALISTIC_TAG = "realistic"  # only run with --tag realistic or --only <name>
+GUARD_TAG = "guard"          # the destructive-guard fixture: --tag guard or --only
+OPT_IN_TAGS = (REALISTIC_TAG, GUARD_TAG)
 # Scenario logs carry content (typed text, steps' parameters) so expectations
 # such as executed_with_param can check it; each run's log says so up top.
 VERBOSE_ENV = "MISTAI_VERBOSE_LOGS"
+UNATTENDED_ENV = "MISTAI_UNATTENDED"
+AUDIT_ENV = "MISTAI_AUDIT_PATH"
 
 
 # -- Scenario file -----------------------------------------------------------------
@@ -320,6 +333,9 @@ def check_desktop(expect, outcome):
             fails.append(f"{want['action']} with {want['contains']!r} never actually ran")
     if "max_steps" in expect and len(parsed["steps"]) > expect["max_steps"]:
         fails.append(f"{len(parsed['steps'])} steps > max {expect['max_steps']}")
+    for s in expect.get("log_contains", []):
+        if s not in outcome["log"]:
+            fails.append(f"log lacks expected text {s!r}")
     for s in expect.get("log_not_contains", []):
         if s in outcome["log"]:
             fails.append(f"log contains forbidden text {s!r}")
@@ -613,6 +629,58 @@ def remove_scenario_dir(path, prefix=TMP_PREFIX):
     shutil.rmtree(real, ignore_errors=True)
 
 
+# ------------------------------------------------------------
+# FIXTURE PROCESSES
+# ------------------------------------------------------------
+# Setup "launch_fixture" starts a small script of this repo (tools/fixtures/)
+# with the scenario's arguments; stop_fixtures() ends every one the harness
+# started, after the scenario (it never touches other processes).
+
+LAUNCHED = []
+FIXTURE_WAIT_S = 10.0
+
+
+def _window_title_present(part):
+    try:
+        import win32gui
+
+        found = []
+
+        def cb(h, _):
+            if win32gui.IsWindowVisible(h) and part in win32gui.GetWindowText(h):
+                found.append(h)
+            return True
+
+        win32gui.EnumWindows(cb, None)
+        return bool(found)
+    except Exception:
+        return False
+
+
+def launch_fixture(spec):
+    """Start the fixture; a skip reason when its window never appears."""
+    import subprocess
+
+    script = os.path.join(REPO, spec["script"])
+    proc = subprocess.Popen([sys.executable, script, *spec.get("args", [])])
+    LAUNCHED.append(proc)
+    title = spec.get("wait_title", "")
+    if title and not wait_pumping(lambda: _window_title_present(title), FIXTURE_WAIT_S):
+        return f"fixture window {title!r} did not appear within {FIXTURE_WAIT_S:.0f}s"
+    return None
+
+
+def stop_fixtures():
+    while LAUNCHED:
+        proc = LAUNCHED.pop()
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+        except Exception as e:
+            print(f"[Harness] could not stop a fixture ({type(e).__name__})")
+
+
 def run_setup(steps):
     """Returns a skip reason, or None."""
     for step in steps or []:
@@ -629,6 +697,10 @@ def run_setup(steps):
             os.makedirs(step["mkdir"], exist_ok=True)
         elif "serve_tmp" in step:
             pass  # started by Runner.run_desktop before {tmp_url} is expanded
+        elif "launch_fixture" in step:
+            reason = launch_fixture(step["launch_fixture"])
+            if reason:
+                return reason
         elif "require_empty_window" in step:
             spec = step["require_empty_window"]
             reason = probe_restored_session(spec["process"], spec["launch"])
@@ -1014,6 +1086,7 @@ class Runner:
                 # ponytail: one window_text list shared by all alternatives;
                 # per-process lists if alternatives ever read different apps.
                 end_state["window_text"] = window_texts(text_procs[0])
+            stop_fixtures()
             try:
                 closed = close_new_processes(cleanup.get("close_new_processes", []), before)
                 if closed:
@@ -1267,15 +1340,18 @@ def main(argv=None, api_factory=None):
     scenarios = load_scenarios(args.scenarios, only)
     if args.tag:
         scenarios = [s for s in scenarios if args.tag in s.get("tags", [])]
-    elif not only:  # the realistic tier never runs (or counts) in a plain run
-        scenarios = [s for s in scenarios if REALISTIC_TAG not in s.get("tags", [])]
+    elif not only:  # the opt-in tiers never run (or count) in a plain run
+        scenarios = [s for s in scenarios if not set(OPT_IN_TAGS) & set(s.get("tags", []))]
 
     log_dir = os.path.join(args.log_root, f"scenarios-{datetime.now():%Y%m%d-%H%M%S}")
     os.makedirs(log_dir, exist_ok=True)
     run_tmp = make_scenario_dir()
-    saved_env = {k: os.environ.get(k) for k in ("MISTAI_DB_PATH", VERBOSE_ENV) + MODE_ENV_KEYS}
+    saved_env = {k: os.environ.get(k) for k in ("MISTAI_DB_PATH", VERBOSE_ENV, UNATTENDED_ENV,
+                                                AUDIT_ENV) + MODE_ENV_KEYS}
     os.environ["MISTAI_DB_PATH"] = os.path.join(run_tmp, "memory.db")
     os.environ[VERBOSE_ENV] = "1"
+    os.environ[UNATTENDED_ENV] = "1"          # the guard refuses; nobody is asked
+    os.environ[AUDIT_ENV] = os.path.join(run_tmp, "audit.jsonl")
 
     if not args.stub:
         try:

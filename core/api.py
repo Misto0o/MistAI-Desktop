@@ -3403,6 +3403,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 return self._act_browser_import_cookies(param)
             elif action == "browser_use_daily_profile":
                 return self._act_browser_use_daily_profile(param)
+            elif action == "ui_elements":
+                return self._act_ui_elements(param)
             elif action == "describe_action":
                 from .tools import SPECS, describe_action
                 self.last_result_text = describe_action(param)
@@ -3997,12 +3999,16 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
     # until it differs from before (a changed display, a checked box...).
     UIA_EFFECT_WAITS = (0.15, 0.25, 0.35)
     last_uia_effect = None      # True changed | False unchanged | None not checked
+    last_click_effect = None    # the same for OCR / vision / coordinate clicks
 
     def _act_uia_click(self, param):
         """Find and click an element by its accessible name using UIA --
         reads the real UI tree instead of guessing pixel coordinates from a
         screenshot. Try this before click_on_text for anything inside a
         normal desktop app."""
+        ref = self._control_ref(param)
+        if ref is not None:
+            return self._uia_click_number(ref)
         fw = self.live.snapshot.get("foreground_window", "")
         if not fw or fw == "Unknown":
             self.last_result_text = "No foreground window to search."
@@ -4090,6 +4096,287 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             print(f"[UIA] name match: {label}"
                   + (f", ambiguous ({len(ambiguous)})" if ambiguous else ""))
         return (info.element if info else None), list(ambiguous or [])
+
+    # ------------------------------------------------------------
+    # NATIVE CONTROL LIST
+    # ------------------------------------------------------------
+    # The numbered list of the native window in front (click_handler
+    # read_controls / order_controls / format_control_list): ui_elements
+    # returns it; open_app and switch_app append it when their window is
+    # in front; input actions and clicks append it only when the window's
+    # controls changed since its last list. Never for browsers (browser_*
+    # lists the page), MistAI's own windows or a window other than the
+    # phase's app (list_after). Logs counts and timing, never names.
+
+    LIST_ALWAYS_ACTIONS = ("open_app", "switch_app")
+    LIST_ON_CHANGE_ACTIONS = ("uia_click", "press_key", "type_text", "hotkey",
+                              "click_on_text", "click_nth", "click_coords")
+
+    def _control_numbers(self):
+        from .click_handler import ControlNumbers
+
+        nums = self.__dict__.get("_control_nums")
+        if nums is None:
+            nums = self.__dict__["_control_nums"] = ControlNumbers()
+        return nums
+
+    def _native_list_window(self, need_target=True):
+        """(hwnd, title) of the native window in front that may be listed,
+        else None: not a browser, not MistAI's (or its Playwright) window,
+        and with need_target the app this phase opened or switched to."""
+        from .executor import BROWSER_HINTS
+
+        try:
+            import win32gui
+            import win32process
+
+            hwnd = clip.foreground_for_reading()[0]
+            if not hwnd:
+                return None
+            if need_target:
+                target = getattr(self, "_last_opened_app", None)
+                if not target or not self._window_belongs_to(hwnd, target):
+                    return None
+            title = win32gui.GetWindowText(hwnd) or ""
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            if is_self_process(psutil.Process(pid).name(), pid):
+                return None
+            if hwnd == clip.playwright_window() or any(h in title.lower() for h in BROWSER_HINTS):
+                return None
+            return hwnd, title
+        except Exception:
+            return None
+
+    def _read_control_list(self, hwnd, title, reader=None):
+        """(list text, read dict, signature): one read, numbered and
+        formatted; the window's signature is remembered for list_after."""
+        from .click_handler import (control_signature, format_control_list, order_controls,
+                                    read_controls)
+
+        got = (reader or read_controls)(hwnd)
+        listed, counts = order_controls(got["rows"], title=title)
+        numbered = self._control_numbers().stamp(hwnd, listed)
+        sig = control_signature(got["rows"])
+        self.__dict__.setdefault("_control_sigs", {})[hwnd] = sig
+        print(f"[UIA] list: {len(numbered)} listed, {counts['unnamed']} unnamed, "
+              f"{counts['offscreen']} off-screen, {got['ms']:.0f} ms"
+              + (", cut by the time budget" if got.get("timed_out") else "")
+              + (f", read failed ({got['error']})" if got.get("error") else ""))
+        return format_control_list(numbered, counts, title, got.get("timed_out")), got, sig
+
+    def _act_ui_elements(self, param=""):
+        """ui_elements: a fresh numbered list of the native window in front."""
+        target = self._native_list_window(need_target=False)
+        if not target:
+            self.last_result_text = (
+                "ui_elements: the window in front is not a native app window (a page in "
+                "MistAI's browser is listed by browser_elements; MistAI's own window is "
+                "never listed).")
+            return False
+        text, got, _sig = self._read_control_list(*target)
+        if not got["rows"] and got.get("error"):
+            self.last_result_text = (
+                f"ui_elements: the window's accessibility tree could not be read "
+                f"({got['error']}). Use the app's keyboard shortcuts, or vision.")
+            return False
+        self.last_result_text = text
+        return True
+
+    def _list_after(self, action, ok):
+        """Append the control list to the result of ``action`` (see the
+        section comment). Returns ok unchanged; never raises."""
+        if action not in self.LIST_ALWAYS_ACTIONS + self.LIST_ON_CHANGE_ACTIONS:
+            return ok
+        try:
+            target = self._native_list_window(need_target=True)
+            if not target:
+                return ok
+            hwnd, title = target
+            old = self.__dict__.get("_control_sigs", {}).get(hwnd)
+            if action in self.LIST_ON_CHANGE_ACTIONS:
+                from .click_handler import control_signature, read_controls
+
+                got = read_controls(hwnd)
+                if not got["rows"] or (old is not None
+                                       and control_signature(got["rows"]) == old):
+                    return ok                         # unreadable or unchanged: no list
+                text, _got, _sig = self._read_control_list(hwnd, title,
+                                                           reader=lambda _h: got)
+            else:
+                text, got, _sig = self._read_control_list(hwnd, title)
+                if not got["rows"]:
+                    return ok                         # nothing readable: no empty list
+            self.last_result_text = (str(self.last_result_text or "") + "\n" + text).strip()
+        except Exception as e:
+            print(f"[UIA] list not added ({type(e).__name__})")
+        return ok
+
+    # ------------------------------------------------------------
+    # CLICK EFFECT PROBE
+    # ------------------------------------------------------------
+    # Before/after facts for a click on the phase's app (its window in
+    # front): the foreground window and title, the process's top-level
+    # windows, the focused element and the controls' signature
+    # (click_handler.describe_click_effect). With no known target the click
+    # is not probed (nothing to compare reliably), as before.
+
+    CLICK_EFFECT_WAITS = (0.15, 0.25, 0.35)
+
+    def _click_probe(self, hwnd=None):
+        """A probe dict of the listable window in front (or ``hwnd``), else None."""
+        from .click_handler import control_signature, read_controls
+
+        try:
+            import win32gui
+            import win32process
+
+            if hwnd is None:
+                target = self._native_list_window(need_target=True)
+                if not target:
+                    return None
+                hwnd = target[0]
+            fg = win32gui.GetForegroundWindow()
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            wins = []
+
+            def cb(h, _):
+                if win32gui.IsWindowVisible(h):
+                    try:
+                        if win32process.GetWindowThreadProcessId(h)[1] == pid:
+                            wins.append(h)
+                    except Exception:
+                        pass
+                return True
+
+            win32gui.EnumWindows(cb, None)
+            focus = None
+            try:
+                from pywinauto.uia_defines import IUIA
+
+                f = IUIA().iuia.GetFocusedElement()
+                focus = (tuple(f.GetRuntimeId()), f.CurrentName)
+            except Exception:
+                pass
+            return {"hwnd": hwnd, "fg": fg, "title": win32gui.GetWindowText(fg),
+                    "windows": frozenset(wins), "focus": focus,
+                    "sig": control_signature(read_controls(hwnd)["rows"])}
+        except Exception:
+            return None
+
+    def _click_effect(self, before):
+        """(sentence, changed) after a click, polling CLICK_EFFECT_WAITS until
+        something differs; ("", None) without a probe."""
+        from .click_handler import describe_click_effect
+
+        if not before:
+            return "", None
+        sentence, changed = "", None
+        for wait in self.CLICK_EFFECT_WAITS:
+            time.sleep(wait)
+            sentence, changed = describe_click_effect(before, self._click_probe(before["hwnd"]))
+            if changed:
+                break
+        return sentence, changed
+
+    def _report_click_effect(self, before):
+        """Set last_click_effect and add the effect to the result text."""
+        sentence, changed = self._click_effect(before)
+        self.last_click_effect = changed
+        if not sentence:
+            return
+        print(f"[Click] effect: {'changed' if changed else 'no visible change'}")
+        note = (f" Effect: {sentence}." if changed else
+                f" Effect: {sentence} -- the click may have missed. Do not repeat it blindly: "
+                "use ui_elements and click by number, or the app's keyboard shortcut.")
+        self.last_result_text = (str(self.last_result_text or "") + note).strip()
+
+    # ------------------------------------------------------------
+    # UIA CLICK BY NUMBER
+    # ------------------------------------------------------------
+    # uia_click <number> from the latest control list: acts through the
+    # element's UIA pattern (activate_element), then reports the effect.
+    # A number from an older list, or a control that left the window, fails
+    # clearly and asks for a fresh ui_elements.
+
+    _CONTROL_REF_RX = re.compile(r"^\s*(?:\[\s*(\d+)\s*\]|#?(\d+))(?:\s+\S.*)?\s*$")
+
+    def _control_ref(self, param):
+        """The list number in a uia_click parameter ("8", "[8]", "#8", or a
+        pasted list line), else None. A bare number counts only once a list
+        was issued and when no listed control is literally named that
+        number (a Calculator digit is a name, never a list number)."""
+        m = self._CONTROL_REF_RX.match(str(param or ""))
+        if not m:
+            return None
+        num = int(m.group(1) or m.group(2))
+        bare = m.group(2) is not None and not str(param).strip().startswith("#")
+        nums = self._control_numbers()
+        if bare:
+            if not nums.was_issued(num):
+                return None
+            live = getattr(nums, "_live", {})
+            if any(r.get("name") == str(param).strip() for _h, r in live.values()):
+                return None
+        return num
+
+    def _uia_click_number(self, num):
+        from .click_handler import CONTROL_TYPES
+
+        got = self._control_numbers().get(num)
+        if got is None:
+            self.last_uia_effect = None
+            self.last_result_text = (
+                f"[{num}] is from an older control list (the window changed since) -- call "
+                "ui_elements for fresh numbers; nothing was clicked."
+                if self._control_numbers().was_issued(num) else
+                f"No control has number {num} -- call ui_elements for the list; nothing was "
+                "clicked.")
+            return False
+        hwnd, row = got
+        label = f'[{num}] {CONTROL_TYPES.get(row["type"], row["type"])} "{row["name"][:60]}"'
+        try:
+            el = row["el"]
+            _ = el.CurrentName                         # raises when the control is gone
+            from pywinauto.controls.uiawrapper import UIAWrapper
+            from pywinauto.uia_element_info import UIAElementInfo
+
+            wrapper = UIAWrapper(UIAElementInfo(el))
+        except Exception:
+            self.last_uia_effect = None
+            self.last_result_text = (f"{label} is no longer in the window -- call ui_elements "
+                                     "for fresh numbers; nothing was clicked.")
+            return False
+        if not row.get("enabled", True):
+            self.last_uia_effect = None
+            self.last_result_text = f"{label} is disabled; nothing was clicked."
+            return False
+        before = self._click_probe(hwnd)
+        activate = getattr(self.uia_nav, "activate_element", None)
+        how = activate(wrapper) if callable(activate) else ""
+        if not how:
+            self.last_uia_effect = None
+            self.last_result_text = f"Found {label} but the UIA action failed."
+            return False
+        try:
+            rect = row.get("rect")
+            if rect:
+                from .caption import get_indicator
+
+                get_indicator().show((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2,
+                                     method="UIA", label=row["name"][:40])
+        except Exception:
+            pass
+        route = {"invoke": "UIA Invoke", "toggle": "UIA Toggle", "select": "UIA Select",
+                 "click": "a mouse click (no UIA pattern)"}.get(how, how)
+        sentence, changed = self._click_effect(before)
+        self.last_uia_effect = changed
+        print(f"[UIA] {how} by number; effect "
+              f"{'changed' if changed else 'unchanged' if changed is False else 'not checked'}")
+        self.last_result_text = f"Clicked {label} via {route}" + (
+            f"; effect: {sentence}." if changed else
+            f"; but {sentence}, so it may not have taken effect -- check before relying on it."
+            if changed is False else ".")
+        return True
 
     def _act_uia_find_input(self, param=""):
         fw = self.live.snapshot.get("foreground_window", "")
@@ -4803,6 +5090,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     if refusal:
                         self.last_result_text = refusal
                         return False
+                    self.last_click_effect = None
+                    before = self._click_probe()
                     pyautogui.moveTo(x, y, duration=0.2)
                     time.sleep(0.08)
                     pyautogui.click()
@@ -4812,7 +5101,10 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                         get_indicator().show(x, y, method="coords")   # after the click
                     except Exception:
                         pass  # debug-only; never block the real click
-                    time.sleep(0.3)
+                    if before:
+                        self._report_click_effect(before)
+                    else:
+                        time.sleep(0.3)
                     return True
             return False
         except ValueError:
@@ -4829,11 +5121,17 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         return self._handler_click(self.click_handler.click_nth_element, item_type, n)
 
     def _handler_click(self, click, *args):
-        """Run a ClickHandler click; a target-window refusal becomes the result text."""
+        """Run a ClickHandler click; a target-window refusal becomes the result
+        text. A click that ran on the phase's app reports its effect (and
+        last_click_effect False lowers the executor's confidence)."""
+        self.last_click_effect = None
+        before = self._click_probe()
         ok = click(*args)
         refusal = getattr(self.click_handler, "last_refusal", "")
         if not ok and refusal:
             self.last_result_text = refusal
+        if ok:
+            self._report_click_effect(before)
         return ok
 
     def _click_target_rect(self):
@@ -4914,6 +5212,28 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         except Exception:
             return None
         return None
+
+    # ------------------------------------------------------------
+    # DESTRUCTIVE GUARD HOOKS
+    # ------------------------------------------------------------
+    # Executor.run calls _guard_prepare, then core/guard.py reads the UI
+    # through _guard_ui_context. Keyboard input goes to the phase's app, so
+    # that app is brought to the front first (the same single switch
+    # _ensure_input_target makes, which then finds it in front): the guard
+    # reads the window that will get the keys.
+
+    def _guard_prepare(self, action):
+        from .guard import KEY_ACTIONS
+
+        target = getattr(self, "_last_opened_app", None)
+        if action in KEY_ACTIONS and target and not self._foreground_process_matches(target):
+            self.switch_to_app(target)
+            time.sleep(0.4)
+
+    def _guard_ui_context(self):
+        from .guard import read_ui_context
+
+        return read_ui_context()
 
     def _ensure_input_target(self, what):
         """(report, on_target) for input about to be sent. When this phase

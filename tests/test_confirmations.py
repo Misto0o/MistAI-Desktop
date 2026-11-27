@@ -76,6 +76,9 @@
 #   69. OWN DIALOG KEYS HELPERS
 #   70. OWN DIALOG KEYS TESTS
 #   71. DECLINE GUARD
+#   72. DESTRUCTIVE GUARD CLASSIFIER
+#   73. DESTRUCTIVE GUARD GATE
+#   74. AUDIT TRAIL
 # ============================================================
 
 """Confirmations (typed, spoken, buttons), ask before sending, remembered approvals and quick_message checks."""
@@ -2662,3 +2665,430 @@ def test_an_answer_that_says_no_and_more_is_an_answer_not_a_decline():
     for answer in ("no, use Documents", "not sure, maybe the Downloads one", "yes",
                    "the blue one", "", None):
         assert not is_decline_answer(answer), answer
+
+
+# ============================================================
+# DESTRUCTIVE GUARD CLASSIFIER
+# ============================================================
+# core/guard.py classify() on fake UI contexts: what is held (confirm),
+# refused outright, or allowed. No desktop: contexts are built here.
+
+import os
+
+from core import guard as guard_mod
+from core.guard import UIContext, classify
+
+
+def _delete_dialog(focus_type="Button", focus_name="Move to Recycle Bin", text=None, title="Visual Studio Code"):
+    text = text or "Are you sure you want to delete 'Mist.AI' and its contents?"
+    return UIContext(known=True, hwnd=7, title=title, cls="#32770", is_dialog=True,
+                     dialog_text=f"{title}\n{text}\nMove to Recycle Bin\nCancel",
+                     buttons=("Move to Recycle Bin", "Cancel"),
+                     focus_type=focus_type, focus_name=focus_name)
+
+
+def _window(focus_type="Edit", focus_name="Text editor", title="notes.txt - Notepad"):
+    return UIContext(known=True, hwnd=3, title=title, cls="Notepad", is_dialog=False,
+                     focus_type=focus_type, focus_name=focus_name)
+
+
+def test_guard_delete_key_on_a_file_list_is_held_but_not_in_a_text_field():
+    held = classify("press_key", "delete", _window("ListItem", "report.docx", "Downloads - File Explorer"))
+    assert held.verdict == "confirm" and held.reason == "delete key on a list item"
+    assert "report.docx" in held.question
+    tree = classify("hotkey", "shift+delete", _window("TreeItem", "Mist.AI", "Explorer"))
+    assert tree.verdict == "confirm" and "permanently delete" in tree.what
+    for action, key in (("press_key", "delete"), ("hotkey", "ctrl+delete"),
+                        ("hotkey", "shift+delete"), ("press_key", "backspace")):
+        assert classify(action, key, _window("Edit")).verdict == "allow", (action, key)
+        assert classify(action, key, _window("Document", "Text editor")).verdict == "allow"
+    # nothing known about focus: Delete is left to the agent's own gate
+    assert classify("press_key", "delete", UIContext()).verdict == "allow"
+
+
+def test_guard_enter_on_a_delete_dialog_is_held_and_backing_out_is_not():
+    d = classify("press_key", "enter", _delete_dialog())
+    assert d.verdict == "confirm" and d.reason == "delete dialog in front"
+    assert d.question == "Delete 'Mist.AI' and its contents?"
+    for action, param in (("press_key", "space"), ("press_key", "y"), ("hotkey", "alt+m"),
+                          ("click_coords", "100,200"), ("type_text", "yes")):
+        assert classify(action, param, _delete_dialog(focus_name="")).held, (action, param)
+    for action, param in (("press_key", "escape"), ("press_key", "tab"), ("uia_click", "Cancel"),
+                          ("click_on_text", "Cancel"), ("hotkey", "alt+f4")):
+        assert classify(action, param, _delete_dialog()).verdict == "allow", (action, param)
+    # Enter while focus is on Cancel cancels
+    assert classify("press_key", "enter", _delete_dialog(focus_name="Cancel")).verdict == "allow"
+
+
+def test_guard_clicks_on_destructive_controls_are_held_and_cancel_is_not():
+    plain = _window("Pane", "", "Downloads - File Explorer")
+    for name in ("Delete", "Move to Recycle Bin", "Empty Recycle Bin", "Uninstall", "Erase",
+                 "Permanently delete", "Discard changes", "Reset this PC", "Clear browsing data",
+                 "Format disk", "Overwrite", "Don't save"):
+        assert classify("uia_click", name, plain).verdict == "confirm", name
+        assert classify("click_on_text", name, plain).verdict == "confirm", name
+    assert classify("uia_click", "Cancel", plain).verdict == "allow"
+    # by number: the numbered control's real name decides, not the digits
+    row = {"type": "Button", "name": "Move to Recycle Bin", "popup": True}
+    assert classify("uia_click", "8", plain, row=row).verdict == "confirm"
+    assert classify("uia_click", "9", plain, row={"type": "Button", "name": "Cancel"}).verdict == "allow"
+    focused = _window("Button", "Delete", "Confirm")
+    assert classify("press_key", "enter", focused).verdict == "confirm"
+
+
+def test_guard_permanent_delete_wording_is_held():
+    ctx = UIContext(known=True, title="Delete File", cls="#32770", is_dialog=True,
+                    dialog_text="Delete File\nAre you sure you want to permanently delete this file?\nYes\nNo",
+                    buttons=("Yes", "No"), focus_type="Button", focus_name="Yes")
+    d = classify("press_key", "enter", ctx)
+    assert d.verdict == "confirm" and "permanently delete" in d.what
+    assert classify("uia_click", "No", ctx).verdict == "allow"
+    assert classify("uia_click", "Yes", ctx).verdict == "confirm"
+    assert "Erase all data" in guard_mod.plain_what("This action cannot be undone. Erase all data on this disk?")
+
+
+def test_guard_typing_into_a_list_item_is_refused_not_asked():
+    """The incident: type_text's own Ctrl+A + Delete sent to a tree item."""
+    d = classify("type_text", "Mist.AI", _window("TreeItem", "Mist.AI", "Visual Studio Code"))
+    assert d.verdict == "refuse" and d.refusal.startswith("NOT SENT")
+    assert "Delete" in d.refusal and "Mist.AI" in d.refusal
+    assert classify("type_search", "x", _window("ListItem", "a.txt")).verdict == "refuse"
+    assert classify("type_text", "hello", _window("Button", "Delete", "Confirm")).verdict == "refuse"
+    # a text field, a document, a canvas-like pane, or nothing known: typed as before
+    for ctx in (_window("Edit"), _window("Document"), _window("Pane", ""), UIContext()):
+        assert classify("type_text", "hello", ctx).verdict == "allow"
+
+
+def test_guard_look_alike_benign_input_passes():
+    calc = UIContext(known=True, title="Calculator", is_dialog=True,
+                     dialog_text="Calculator\nClear\nClear entry\nBackspace\nEquals",
+                     buttons=("Clear", "Clear entry", "Backspace", "Equals"),
+                     focus_type="Button", focus_name="Equals")
+    for action, param in (("uia_click", "Clear"), ("uia_click", "Clear entry"), ("press_key", "enter"),
+                          ("type_text", "12+7="), ("press_key", "backspace")):
+        assert classify(action, param, calc).verdict == "allow", (action, param)
+    doc = _window("Document", "Text editor", "draft.txt - Notepad")
+    for action, param in (("type_text", "Please delete the old files and remove the cache."),
+                          ("press_key", "enter"), ("press_key", "delete"), ("hotkey", "ctrl+a")):
+        assert classify(action, param, doc).verdict == "allow", (action, param)
+    for name in ("Format", "Replace", "Replace All", "Clear formatting", "Removed items view",
+                 "Clear", "Formatting"):
+        assert classify("uia_click", name, doc).verdict == "allow", name
+    save = UIContext(known=True, title="Notepad", cls="#32770", is_dialog=True,
+                     dialog_text="Notepad\nDo you want to save changes to draft.txt?\nSave\nDon't save\nCancel",
+                     buttons=("Save", "Don't save", "Cancel"), focus_type="Button", focus_name="Save")
+    assert classify("uia_click", "Save", save).verdict == "allow"
+    assert classify("press_key", "enter", save).verdict == "allow"          # focus on Save
+    assert classify("uia_click", "Don't save", save).verdict == "confirm"
+    # a destructive button with focus (or focus unknown): Enter/Space would press it
+    save.focus_name = "Don't save"
+    assert classify("press_key", "space", save).verdict == "confirm"
+    save.focus_type, save.focus_name = "", ""
+    assert classify("press_key", "enter", save).verdict == "confirm"
+    assert classify("press_key", "escape", save).verdict == "allow"
+
+
+def test_guard_protected_locations(tmp_path, monkeypatch):
+    repo = tmp_path / "MistAI Desktop"
+    sibling = tmp_path / "Mist.AI"
+    for p in (repo, sibling, tmp_path / "Desktop"):
+        p.mkdir()
+    (repo / "notes.txt").write_text("x", encoding="utf-8")
+    entries = [(guard_mod._norm(repo), "tree"), (guard_mod._norm(sibling), "tree"),
+               (guard_mod._norm(tmp_path / "Desktop"), "root"), (guard_mod._norm(tmp_path), "root")]
+    d = classify("run_command", f"Remove-Item -Recurse '{sibling}'", entries=entries)
+    assert d.verdict == "confirm" and d.protected
+    assert classify("run_command", f"Remove-Item '{tmp_path}' -Recurse", entries=entries).protected
+    assert classify("run_command", f"Remove-Item {tmp_path}\\Mist*", entries=entries).protected
+    assert classify("run_command", f"Remove-Item {tmp_path}\\Desktop", entries=entries).protected
+    assert classify("run_command", "git clean -fdx", entries=entries, cwd=str(repo)).protected
+    assert classify("run_command", "Remove-Item notes.txt", entries=entries, cwd=str(repo)).protected
+    assert classify("write_file", f"{repo}\\notes.txt|||new", entries=entries).protected
+    # a file inside a root folder (not the folder itself) and read-only commands pass
+    for cmd in (f"Remove-Item {tmp_path}\\Desktop\\old.txt", f"Remove-Item {tmp_path}\\Desktop\\*.tmp",
+                f"Get-ChildItem '{repo}'", f"Copy-Item a.txt {tmp_path}\\Desktop"):
+        assert not classify("run_command", cmd, entries=entries).held, cmd
+    # a dialog naming a protected folder, a selected protected item
+    dialog = _delete_dialog()
+    assert classify("press_key", "enter", dialog, entries=entries).protected == guard_mod.display(
+        guard_mod._norm(sibling))
+    item = _window("TreeItem", "Mist.AI", "Explorer")
+    assert classify("press_key", "delete", item, entries=entries).protected
+
+
+def test_guard_protected_list_is_general_and_configurable(tmp_path, monkeypatch):
+    extra = tmp_path / "keep-me"
+    monkeypatch.setenv("MISTAI_PROTECTED_PATHS", f"{extra};")
+    entries = dict(guard_mod.static_protected_entries())
+    assert entries[guard_mod._norm(guard_mod.repo_root())] == "tree"
+    assert entries[guard_mod._norm(extra)] == "tree"
+    assert entries[guard_mod._norm(os.path.expanduser("~"))] == "root"
+    assert entries[guard_mod._norm(os.path.join(os.path.expanduser("~"), "MistAI"))] == "tree"
+    # siblings of the repo whose letters start with "mistai": repos, backups
+    for name in ("Mist.AI", "mistai-backup-x.zip", "MistAI-quarantine"):
+        assert guard_mod._letters(name).startswith("mistai")
+    assert not guard_mod._letters("Mistral notes").startswith("mistai")
+
+
+def test_command_holes_found_by_the_guard_audit_now_ask():
+    from core.tools import command_is_mutating
+
+    for cmd in ("git clean -fdx", "git reset --hard HEAD~1", "git checkout -- .",
+                "git push --force origin main", "git branch -D old", "git stash clear",
+                "winget uninstall Spotify", "msiexec /x {1234}", "Remove-AppxPackage x",
+                "Uninstall-Package y", "Clear-Item x", "New-Item a.txt -Force",
+                "Invoke-WebRequest https://x -OutFile a.zip", "curl.exe -o a.zip https://x",
+                "cipher /w:C:\\", "vssadmin delete shadows /all",
+                "python -c \"import shutil; shutil.rmtree('x')\"",
+                "node -e \"require('fs').rmSync('x')\"", "Expand-Archive a.zip b -Force"):
+        assert command_is_mutating(cmd), cmd
+    for cmd in ("git status", "git log -5", "git checkout main", "git push origin main",
+                "Clear-Host", "winget list", "pip list", "icacls x", "curl https://example.com",
+                "Get-Process | Format-Table"):
+        assert not command_is_mutating(cmd), cmd
+
+
+# ============================================================
+# DESTRUCTIVE GUARD GATE
+# ============================================================
+# Executor.run with the guard: deny, timeout (no answer), stop, no prompt
+# and unattended all send nothing; approve sends once; a protected location
+# needs a second yes. The handler (_exec_sync) records what was sent.
+
+from core.executor import Executor as _GuardExecutor
+
+
+def _guard_api(ctx, answers=(), row=None, ask=True):
+    sent, asked = [], []
+    answers = list(answers)
+    api = SimpleNamespace(
+        tools=ToolRegistry(db_path=":memory:"),
+        last_result_text="",
+        live=SimpleNamespace(snapshot={"foreground_window": ctx.title}),
+        memory=SimpleNamespace(add_action=lambda *a: None),
+        _guard_ui_context=lambda: ctx,
+    )
+
+    def exec_sync(action, param):
+        sent.append((action, param))
+        api.last_result_text = "done"
+        return True
+
+    api._exec_sync = exec_sync
+    if ask:
+        def guard_ask(q):
+            asked.append(q)
+            return answers.pop(0) if answers else "no"
+        api._guard_ask = guard_ask
+    if row is not None:
+        api._control_ref = lambda p: 8
+        api._control_numbers = lambda: SimpleNamespace(get=lambda n: (1, row))
+    return api, sent, asked
+
+
+def _guard_exec(monkeypatch, api, action, param):
+    monkeypatch.setattr("core.executor.time.sleep", lambda _s: None)
+    return _GuardExecutor(api).run(action, param)
+
+
+def test_guard_deny_timeout_stop_no_prompt_and_unattended_send_nothing(monkeypatch):
+    for answers in (["no"], ["unclear"], [None]):
+        api, sent, asked = _guard_api(_delete_dialog(focus_name=""), answers)
+        res = _guard_exec(monkeypatch, api, "press_key", "enter")
+        assert sent == [] and res.success is False and res.method == "guard", answers
+        assert res.detail.startswith("BLOCKED: this would delete 'Mist.AI' and its contents")
+        assert asked == ["Delete 'Mist.AI' and its contents?"]
+        assert res.escalate_to_user is False
+    api, sent, _ = _guard_api(_delete_dialog(focus_name=""), ask=False)
+    res = _guard_exec(monkeypatch, api, "uia_click", "Move to Recycle Bin")
+    assert sent == [] and "no way to ask" in res.detail
+    monkeypatch.setenv("MISTAI_UNATTENDED", "1")
+    api, sent, asked = _guard_api(_delete_dialog(focus_name=""), ["yes"])
+    api._guard_preapproved = ("press_key", "enter")      # even a yes from the agent's gate
+    res = _guard_exec(monkeypatch, api, "press_key", "enter")
+    assert sent == [] and asked == [] and "unattended" in res.detail
+
+
+def test_guard_approve_sends_once_and_does_not_escalate(monkeypatch):
+    api, sent, asked = _guard_api(_window("Pane", "", "Explorer"), ["yes"])
+    res = _guard_exec(monkeypatch, api, "uia_click", "Delete")
+    assert sent == [("uia_click", "Delete")] and res.success is True
+    assert asked == ["Click 'Delete'? It may delete or remove something."]
+    # refused: uia_click's fallback (click_on_text) is never tried
+    api, sent, _ = _guard_api(_window("Pane", "", "Explorer"), ["no"])
+    _guard_exec(monkeypatch, api, "uia_click", "Delete")
+    assert sent == []
+    # preapproved by the agent's own gate with the same question: not asked again
+    api, sent, asked = _guard_api(_window("ListItem", "a.txt", "Explorer"), [])
+    api._guard_preapproved = ("press_key", "delete")
+    _guard_exec(monkeypatch, api, "press_key", "delete")
+    assert sent == [("press_key", "delete")] and asked == []
+
+
+def test_guard_protected_location_needs_a_second_yes(monkeypatch, tmp_path):
+    target = tmp_path / "Mist.AI"
+    target.mkdir()
+    monkeypatch.setattr(guard_mod, "protected_entries", lambda api=None: [(guard_mod._norm(target), "tree")])
+    ctx = _delete_dialog(focus_name="")
+    api, sent, asked = _guard_api(ctx, ["yes", "no"])
+    _guard_exec(monkeypatch, api, "press_key", "enter")
+    assert sent == [] and len(asked) == 2 and "protected location" in asked[1]
+    assert str(target).lower() in asked[1].lower()
+    api, sent, asked = _guard_api(ctx, ["yes", "yes"])
+    _guard_exec(monkeypatch, api, "press_key", "enter")
+    assert sent == [("press_key", "enter")] and len(asked) == 2
+    # a command on a protected folder after the agent's yes still asks the second question
+    api, sent, asked = _guard_api(UIContext(), ["no"])
+    api._guard_preapproved = ("run_command", f"Remove-Item -Recurse '{target}'")
+    _guard_exec(monkeypatch, api, "run_command", f"Remove-Item -Recurse '{target}'")
+    assert sent == [] and len(asked) == 1 and "protected location" in asked[0]
+
+
+def test_guard_type_text_into_a_tree_item_sends_nothing(monkeypatch):
+    api, sent, asked = _guard_api(_window("TreeItem", "Mist.AI", "Visual Studio Code"))
+    res = _guard_exec(monkeypatch, api, "type_text", "Mist.AI")
+    assert sent == [] and asked == [] and res.detail.startswith("NOT SENT")
+
+
+def test_guard_uia_click_by_number_reads_the_numbered_control(monkeypatch):
+    row = {"type": "MenuItem", "name": "Delete", "popup": True}
+    api, sent, asked = _guard_api(_window("MenuItem", "Delete", "Explorer"), ["no"], row=row)
+    _guard_exec(monkeypatch, api, "uia_click", "8")
+    assert sent == [] and asked and "Delete" in asked[0]
+
+
+def test_guard_questions_go_through_the_agent_confirmation_flow(monkeypatch):
+    """The real AgentLoop + Executor: Enter in an Enter-safe app (no question
+    from the agent's gate) on a delete dialog is asked by the guard through
+    the Yes/No prompt; a no sends nothing and the model sees BLOCKED."""
+    ctx = _delete_dialog(focus_name="")
+    replies = iter(json.dumps(r) for r in (
+        {"action": "press_key", "parameter": "enter"},
+        {"action": "done", "speech": "I did not confirm it."}))
+    asked, sent, requests = [], [], []
+    api = SimpleNamespace(
+        task_memory=SimpleNamespace(get_hints_for_task=lambda _t: [], record=lambda *a: None),
+        caption_window=None, captions_enabled=False, _stop_requested=threading.Event(),
+        live=SimpleNamespace(snapshot={"open_apps": [], "screen_resolution": (1, 1),
+                                       "foreground_window": ctx.title}),
+        api_manager=SimpleNamespace(get_headers=lambda: {},
+                                    get_api_url=lambda: "https://example.invalid/a",
+                                    get_fallback_url=lambda: "https://example.invalid/b"),
+        tools=ToolRegistry(db_path=":memory:"),
+        memory=SimpleNamespace(add_action=lambda *a: None),
+        _resolve_path_placeholders=lambda p: p, speak=lambda t, **_k: None,
+        tts=SimpleNamespace(speaking=False),
+        _get_text_answer=lambda q, timeout=60: (asked.append(q), "no")[1],
+        _normalize_utterance=lambda t: " ".join(str(t or "").lower().split()),
+        _VOICE_STOP_WORDS={"stop"}, stop_current_task=lambda: None,
+        _last_opened_app="code", enter_target_is_safe=lambda: True,
+        _guard_ui_context=lambda: ctx, last_result_text="",
+    )
+
+    def exec_sync(action, param):
+        sent.append((action, param))
+        return True
+
+    api._exec_sync = exec_sync
+    api.executor = _GuardExecutor(api)
+
+    def fake_post(*_a, json=None, **_k):
+        requests.append(json)
+        return SimpleNamespace(ok=True, status_code=200, json=lambda: {"response": next(replies)})
+
+    monkeypatch.setattr("core.agent.requests.post", fake_post)
+    monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
+    monkeypatch.setattr("core.executor.time.sleep", lambda _s: None)
+    bind_confirmation(api)
+    loop = AgentLoop(api, None)
+    monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
+    monkeypatch.setattr(loop, "_current_foreground_key", lambda: (7, ctx.title))
+    loop._loop("confirm the dialog", "m", "none", "text", None)
+    assert sent == []
+    assert asked == ["Delete 'Mist.AI' and its contents?"]
+    seen = " ".join(m["content"] for m in requests[-1]["messages"] if m.get("role") == "user")
+    assert "BLOCKED: this would delete 'Mist.AI' and its contents" in seen
+    assert api._guard_ask is None and api._guard_preapproved is None
+
+
+# ============================================================
+# AUDIT TRAIL
+# ============================================================
+# core/audit.py: every executed or blocked action is one JSON line with its
+# full arguments, window, control, result and guard decision; rotation keeps
+# two files; the CLI prints the last N.
+
+from core import audit as audit_mod
+
+
+def test_audit_records_executed_and_blocked_actions(monkeypatch, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MISTAI_AUDIT_PATH", str(path))
+    api, _sent, _ = _guard_api(_delete_dialog(focus_name=""), ["no"])
+    _guard_exec(monkeypatch, api, "press_key", "enter")
+    api2, _sent2, _ = _guard_api(_window("Edit", "Search"))
+    _guard_exec(monkeypatch, api2, "type_text", "hello world")
+    rows = audit_mod.tail(10, str(path))
+    assert [r["tool"] for r in rows] == ["press_key", "type_text"]
+    blocked, typed = rows
+    assert blocked["result"] == "blocked" and blocked["guard"]["decision"] == "denied"
+    assert blocked["guard"]["what"] == "delete 'Mist.AI' and its contents"
+    assert blocked["window"] == "Visual Studio Code" and blocked["args"] == "enter"
+    assert typed["result"] == "ok" and typed["args"] == "hello world"
+    assert typed["guard"]["decision"] == "allow" and typed["control"] == "Search"
+
+
+def test_audit_never_keeps_password_text_or_tokens(monkeypatch, tmp_path):
+    path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MISTAI_AUDIT_PATH", str(path))
+    ctx = _window("Edit", "Password")
+    ctx.focus_password = True
+    api, _sent, _ = _guard_api(ctx)
+    _guard_exec(monkeypatch, api, "type_text", "hunter2-secret")
+    token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    api2, _s, _ = _guard_api(UIContext())
+    _guard_exec(monkeypatch, api2, "run_command", f"echo {token}")
+    text = path.read_text(encoding="utf-8")
+    assert "hunter2" not in text and "<14 chars typed into a password field>" in text
+    assert token not in text and "REDACTED" in text
+
+
+def test_audit_rotates_by_size_and_age(tmp_path, monkeypatch):
+    path = str(tmp_path / "audit.jsonl")
+    monkeypatch.setenv("MISTAI_AUDIT_PATH", path)
+    monkeypatch.setattr(audit_mod, "AUDIT_MAX_BYTES", 400)
+    for i in range(6):
+        assert audit_mod.record("press_key", f"key{i}", "ok")
+    assert os.path.exists(audit_mod.older_path(path))
+    assert os.path.getsize(path) < 400
+    names = [r["args"] for r in audit_mod.tail(100, path)]
+    assert names[-1] == "key5" and names == sorted(names)          # oldest first, across files
+    # age: a first entry older than half the day limit rotates
+    old = audit_mod.make_entry("hotkey", "ctrl+s", "ok")
+    old["ts"] = "2000-01-01T00:00:00.000"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(old) + "\n")
+    monkeypatch.setattr(audit_mod, "AUDIT_MAX_BYTES", 10 ** 9)
+    assert audit_mod.needs_rotation(path)
+    audit_mod.record("hotkey", "ctrl+z", "ok")
+    assert [r["args"] for r in audit_mod.tail(1, path)] == ["ctrl+z"]
+    assert audit_mod.tail(1, audit_mod.older_path(path))[0]["args"] == "ctrl+s"
+
+
+def test_audit_cli_prints_the_last_entries(tmp_path, capsys):
+    path = str(tmp_path / "a.jsonl")
+    for i in range(3):
+        audit_mod.append(audit_mod.make_entry("uia_click", f"ctl{i}", "blocked", window="W",
+                                              guard={"decision": "denied", "reason": "r"}), path)
+    assert audit_mod.main(["-n", "2", "--path", path]) == 0
+    out = capsys.readouterr().out
+    assert "ctl1" in out and "ctl2" in out and "ctl0" not in out and "guard=denied" in out
+    assert audit_mod.main(["--path", str(tmp_path / "none.jsonl")]) == 0
+    assert "No audit entries" in capsys.readouterr().out
+
+
+def test_audit_write_failure_never_breaks_an_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("MISTAI_AUDIT_PATH", str(tmp_path))        # a folder: cannot be opened
+    api, sent, _ = _guard_api(_window("Edit"))
+    res = _guard_exec(monkeypatch, api, "type_text", "x")
+    assert res.success and sent == [("type_text", "x")]

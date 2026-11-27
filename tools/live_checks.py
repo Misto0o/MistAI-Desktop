@@ -27,7 +27,9 @@ memory.db is never opened), its own %TEMP%\\mist_live_* folder (the only thing
 removed afterwards), and an action allowlist: any other action the model picks
 is blocked and recorded. Settings and MISTAI_* variables a check changes are
 restored in a finally. MISTAI_VERBOSE_LOGS is unset for the run, and
-summary.md copies only allowlisted, content-free log lines.
+summary.md copies only allowlisted, content-free log lines. The run is
+unattended (MISTAI_UNATTENDED=1: the destructive guard refuses instead of
+asking) and its audit trail goes to the run's temp folder (MISTAI_AUDIT_PATH).
 A check that FAILed only on infrastructure errors (timeouts, HTTP 5xx/429,
 the fixed network sentence) and with no safety violation is INFRA: retried
 once after INFRA_RETRY_SECONDS, listed first in summary.md, not a failure.
@@ -98,6 +100,14 @@ ALLOWED_LOG_LINES = [re.compile(p) for p in (
     r"\[Timing\] (Phase|Task): [\d.]+s total( \| \w+ [\d.]+s(/\d+)?)*",
     r"\[Conversation\] route=(chat|task) in [\d.]+s( \((timeout|no reply|unparsable|no chat reply|error)\))?",
     r"\[Reply\] shape=(object|steps|text|text with a steps list|array of \d+)",
+    r"\[UIA\] list: \d+ listed, \d+ unnamed, \d+ off-screen, \d+ ms"
+    r"(, cut by the time budget)?(, read failed \(\w+\))?",
+    r"\[UIA\] (invoke|toggle|select|click) by number; effect (changed|unchanged|not checked)",
+    r"\[Click\] effect: (changed|no visible change)",
+    r"\[Screen\] native window: (control list|accessibility text), no vision",
+    r"\[Repeat\] \d+ vision reads in a row",
+    r"\[Refused\] (analyze_screen|read_screen_text): \d+ vision reads in a row",
+    r"\[Loop\] repeating steps; note added \(\d+-step cycle\)",
     r"\[AgentLoop\] System prompt: \d+ chars",
     r"\[Model\] Set to [a-z]+ \(applies from the next request\)",
     r"\[Timing\] (Router|Planning) LLM: [\d.]+s mode=(message|agent)",
@@ -1457,6 +1467,10 @@ def main(argv=None, api_factory=None):
     saved_env = {k: v for k, v in os.environ.items() if k.startswith("MISTAI_")}
     os.environ.pop(rs.VERBOSE_ENV, None)
     os.environ["MISTAI_DB_PATH"] = os.path.join(run_tmp, "memory.db")
+    # Unattended: the destructive guard refuses what it holds without asking;
+    # its audit trail stays in the run's temp folder, out of summary.md.
+    os.environ[rs.UNATTENDED_ENV] = "1"
+    os.environ[rs.AUDIT_ENV] = os.path.join(run_tmp, "audit.jsonl")
 
     closed_problem = {}
     if args.live:
