@@ -479,6 +479,7 @@ function showPttNote(text){
 }
 function handleListenState(state,message){
   pttState=(state==='waiting'||state==='listening')?state:'idle';
+  kickFastSync(FAST_SYNC_HOLD_MS);
   btnPtt.classList.toggle('active',pttState!=='idle');
   // While listening, a second press ends the listen (Api.push_to_talk).
   pttLabel.textContent=pttState==='listening'?'Done':'Talk';
@@ -787,6 +788,7 @@ async function send() {
 
   const msg = inp.value.trim();
   if (!msg || busy) return;
+  kickFastSync(FAST_SYNC_HOLD_MS);
 
   if (typeof pywebview.api.ask_mistai !== 'function') {
     addMsg('System not fully ready yet — try again in a second.', 'error');
@@ -869,12 +871,30 @@ function setBusy(b){
 // Reconcile the UI with the runtime's actual agent state. Voice-initiated
 // tasks have no promise in flight, so this is the only way the UI learns
 // about them; for UI-initiated tasks it also confirms a Stop has completed.
+// The 1.5 s check above is the idle baseline. While something is happening
+// (a task, Mist's voice, a push-to-talk turn, or FAST_SYNC_HOLD_MS after a
+// send / a listen ending, which is when a chat reply starts speaking) this
+// faster check runs too, so the speaking look starts with the speech; it
+// stops by itself when all of that is over (no loop runs when idle).
+const FAST_SYNC_MS=250,FAST_SYNC_HOLD_MS=20000;
+let fastSyncTimer=null,fastUntil=0;
+function wantFastSync(){return busy||speaking||pttState!=='idle'||Date.now()<fastUntil;}
+function kickFastSync(holdMs){
+  if(holdMs)fastUntil=Math.max(fastUntil,Date.now()+holdMs);
+  if(fastSyncTimer===null)fastSyncTimer=setTimeout(fastSyncTick,0);
+}
+async function fastSyncTick(){
+  fastSyncTimer=null;
+  await syncBusy();
+  if(wantFastSync()&&fastSyncTimer===null)fastSyncTimer=setTimeout(fastSyncTick,FAST_SYNC_MS);
+}
 async function syncBusy(){
   if(!ready)return;
   try{
     const s=await pywebview.api.is_agent_busy();
     speaking=!!s.speaking;
     setOrb();
+    if(s.busy||s.speaking)kickFastSync(0);
     if(s.busy){
       if(!busy && inp.dataset.answering!=="true") setBusy(true);
     }else{
@@ -1033,7 +1053,7 @@ def _orb_still_rules(w):
     """The static looks for wrapper selector ``w``: no motion, but every state
     keeps its shape, glyph and tint (reduced motion, Windows animations off)."""
     return (
-        f"{w},{w} .disc,{w} .ring,{w} .arc,{w} .ripple,{w} .halo,{w} .burst,{w} .scan,"
+        f"{w},{w} .disc,{w} .disc::after,{w} .ring,{w} .arc,{w} .ripple,{w} .halo,{w} .burst,{w} .scan,"
         f"{w} .heart,{w} .nodes i,{w} .bars i{{animation:none !important}}"
         f'{w}[data-state="listening"] .ring{{opacity:.8;transform:scale(.95)}}'
         f'{w}[data-state="listening"] .ring.r2{{opacity:.45;transform:scale(.8)}}'
@@ -1077,6 +1097,12 @@ def orb_css():
         "border-radius:50%;pointer-events:none}"
         f".disc{{background:radial-gradient(circle,{t['center']} 0%,{t['mid']} 58%,{t['edge']} 100%);"
         f"border:1px solid {t['border']};box-sizing:border-box;"
+        "}"
+        # The idle breath: a white film over the disc whose opacity moves
+        # (compositor-only). It replaces a filter:brightness animation, which
+        # repainted the disc on every frame.
+        ".disc::after{content:'';position:absolute;inset:0;border-radius:50%;"
+        "background:rgba(255,255,255,.07);opacity:0;will-change:opacity;"
         "animation:breathe 3.2s ease-in-out infinite}"
         ".tint{opacity:0;transition:opacity .35s ease}"
         # The audio-driven core: 52% of the disc at rest, at most 62% (scale 1.2).
@@ -1117,7 +1143,7 @@ def orb_css():
         f".g-excl{{flex-direction:column;gap:{u('.04')}}}"
         f".g-excl i{{display:block;width:{u('.08')};border-radius:{u('.04')};background:{e_ink}}}"
         f".g-excl i:first-child{{height:{u('.26')}}}.g-excl i:last-child{{height:{u('.08')}}}"
-        "@keyframes breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.08)}}"
+        "@keyframes breathe{0%,100%{opacity:0}50%{opacity:1}}"
         "@keyframes heart{0%,100%{transform:scale(.84)}50%{transform:scale(1.02)}}"
         "@keyframes pulse{0%{transform:scale(.7);opacity:.9}100%{transform:scale(1.05);opacity:0}}"
         "@keyframes spin{to{transform:rotate(360deg)}}"
@@ -1147,6 +1173,10 @@ def orb_css():
         '.orb-wrap[data-state="error"]{animation:shake .45s ease-in-out 1}'
         '.orb-wrap[data-state="error"] .g-excl{display:flex}'
         + tint
+        # A hidden or minimized page (the orb pages set data-hidden) pauses
+        # every animation: nothing is composited for a window nobody sees.
+        + '.orb-wrap[data-hidden="1"],.orb-wrap[data-hidden="1"] *,'
+        '.orb-wrap[data-hidden="1"] .disc::after{animation-play-state:paused !important}'
         + "@media (prefers-reduced-motion: reduce){" + _orb_still_rules(".orb-wrap") + "}"
         + _orb_still_rules('.orb-wrap[data-motion="still"]')
     )
@@ -1270,7 +1300,11 @@ window.addEventListener('pywebviewready',()=>{
   const POLL_MS=""" + str(ORB_POLL_MS) + """,FAST_POLL_MS=""" + str(ORB_FAST_POLL_MS) + """;
   const LIVE=['listening','speaking'];
   const lvl=orbLevel(wrap);
+  const HIDDEN_POLL_MS=2000;
+  let timer=null;
+  const hidden=()=>document.visibilityState==='hidden';
   async function poll(){
+    timer=null;
     try{
       const s=await pywebview.api.orb_state();
       const st=String(s&&s.state||'idle');
@@ -1278,8 +1312,16 @@ window.addEventListener('pywebviewready',()=>{
       wrap.dataset.motion=(s&&s.still)?'still':'on';
       lvl.set(LIVE.includes(wrap.dataset.state)&&s&&'level' in s?s.level:0);
     }catch(e){}
-    setTimeout(poll,LIVE.includes(wrap.dataset.state)?FAST_POLL_MS:POLL_MS);
+    if(timer===null)timer=setTimeout(poll,hidden()?HIDDEN_POLL_MS
+      :LIVE.includes(wrap.dataset.state)?FAST_POLL_MS:POLL_MS);
   }
+  // Hidden / minimized: animations pause and the poll slows; coming back
+  // shows the current state at once. One pending timer at any time.
+  document.addEventListener('visibilitychange',()=>{
+    wrap.dataset.hidden=hidden()?'1':'0';
+    if(!hidden()){clearTimeout(timer);timer=null;poll();}
+  });
+  wrap.dataset.hidden=hidden()?'1':'0';
   poll();
   // Hold to talk: a press held HOLD_MS without moving starts push-to-talk and
   // the release sends it; a quick tap toggles (start, then a second tap

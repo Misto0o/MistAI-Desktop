@@ -3598,7 +3598,7 @@ def test_reduced_motion_and_windows_animations_off_freeze_every_state():
     reduced = css.split("@media (prefers-reduced-motion: reduce){", 1)[1]
     still = '.orb-wrap[data-motion="still"]'
     for block, w in ((reduced, ".orb-wrap"), (css, still)):
-        assert f"{w},{w} .disc,{w} .ring" in block and "animation:none !important" in block
+        assert f"{w},{w} .disc,{w} .disc::after,{w} .ring" in block and "animation:none !important" in block
         assert f'{w}[data-state="reading"] .scan{{opacity:.9' in block
         assert f'{w}[data-state="planning"] .nodes i:nth-child(2){{opacity:1}}' in block
     # glyphs and tints are not animations: they stay in both
@@ -3894,3 +3894,41 @@ def test_the_shared_still_rules_freeze_the_core_too():
     assert ".orb-wrap .heart," in rules and ".orb-wrap .heart{transform:scale(.9)" in rules
     assert ('.orb-wrap[data-motion="still"] .heart{transform:scale(.9)' in
             _orb_still_rules('.orb-wrap[data-motion="still"]'))
+
+
+# ============================================================
+# ORB STAGE 1.5: IDLE COST AND SPEAKING LAG
+# ============================================================
+
+def test_idle_breath_is_compositor_only_and_looks_the_same():
+    from ui.html import orb_css
+    css = orb_css()
+    assert "filter" not in css                          # no per-frame repaint
+    assert "@keyframes breathe{0%,100%{opacity:0}50%{opacity:1}}" in css
+    assert ".disc::after{" in css and "will-change:opacity" in css
+    assert "animation:breathe 3.2s ease-in-out infinite" in css
+    assert "box-shadow" not in css and "drop-shadow" not in css   # nothing outside the circle
+
+
+def test_hidden_orb_page_pauses_animations_and_slows_its_poll():
+    from ui.html import orb_css
+    assert 'animation-play-state:paused' in orb_css()
+    assert '.orb-wrap[data-hidden="1"]' in orb_css()
+    assert "visibilitychange" in ORB_HTML and "HIDDEN_POLL_MS=2000" in ORB_HTML
+    assert ORB_HTML.count("setTimeout(poll,") == 1        # still one pending poll at a time
+    assert "clearTimeout(timer)" in ORB_HTML
+
+
+def test_main_page_speaking_look_does_not_wait_for_the_slow_check():
+    # the idle baseline is unchanged ...
+    assert "setInterval(syncBusy,1500)" in HTML
+    # ... and a short fast check runs only while there is activity
+    assert "FAST_SYNC_MS=250" in HTML and "function wantFastSync()" in HTML
+    assert "busy||speaking||pttState!=='idle'||Date.now()<fastUntil" in HTML
+    assert "if(wantFastSync()&&fastSyncTimer===null)" in HTML      # stops itself, never doubles
+    i = HTML.index("function handleListenState")
+    assert "kickFastSync(FAST_SYNC_HOLD_MS)" in HTML[i:i + 200]
+    j = HTML.index("async function send()")
+    assert "kickFastSync(FAST_SYNC_HOLD_MS)" in HTML[j:j + 400]
+    k = HTML.index("async function syncBusy()")
+    assert "kickFastSync(0)" in HTML[k:k + 500]
