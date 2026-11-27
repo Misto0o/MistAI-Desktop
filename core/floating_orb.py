@@ -41,34 +41,35 @@
 #   32. ORB STATE SIGNALS
 #   33. ORB SIGNAL MODEL
 #   34. ORB STATE FROM PYTHON FACTS
-#   35. ORB PAGE BRIDGE
-#   36. HOME PLACEMENT ON THE PRIMARY MONITOR
-#   37. ROUND REGION BOX
-#   38. ORB SIZE PER STATE
-#   39. WIN32 CALLS
-#   40. MOVING AND RESIZING THE WINDOW
-#   41. FRAME PACING
-#   42. TEST FRAME PACER
-#   43. TIMER RESOLUTION BOOST STATE
-#   44. TIMER RESOLUTION BOOST ON
-#   45. TIMER RESOLUTION BOOST OFF
-#   46. FLIGHT PLAYER
-#   47. NO-ACTIVATE MOUSE ANSWER
-#   48. NO-ACTIVATE WINDOW SUBCLASS
-#   49. TASKBAR HIDING
-#   50. WIN32 FAILURE LOGGING
-#   51. ORB WINDOW HARDENING
-#   52. CREATE-TIME CORNER POSITION
-#   53. ORB CONTROLLER
-#   54. TASK PANELS
-#   55. TASK PANEL SETTINGS
-#   56. STEP LABELS
-#   57. TOOL CATEGORY LOOKUP
-#   58. PANEL MODEL
-#   59. PANEL PAGE BRIDGE
-#   60. PANEL WINDOW HARDENING
-#   61. PANEL ROUNDED CORNERS
-#   62. PANEL WINDOWS
+#   35. AUDIO LEVEL PER STATE
+#   36. ORB PAGE BRIDGE
+#   37. HOME PLACEMENT ON THE PRIMARY MONITOR
+#   38. ROUND REGION BOX
+#   39. ORB SIZE PER STATE
+#   40. WIN32 CALLS
+#   41. MOVING AND RESIZING THE WINDOW
+#   42. FRAME PACING
+#   43. TEST FRAME PACER
+#   44. TIMER RESOLUTION BOOST STATE
+#   45. TIMER RESOLUTION BOOST ON
+#   46. TIMER RESOLUTION BOOST OFF
+#   47. FLIGHT PLAYER
+#   48. NO-ACTIVATE MOUSE ANSWER
+#   49. NO-ACTIVATE WINDOW SUBCLASS
+#   50. TASKBAR HIDING
+#   51. WIN32 FAILURE LOGGING
+#   52. ORB WINDOW HARDENING
+#   53. CREATE-TIME CORNER POSITION
+#   54. ORB CONTROLLER
+#   55. TASK PANELS
+#   56. TASK PANEL SETTINGS
+#   57. STEP LABELS
+#   58. TOOL CATEGORY LOOKUP
+#   59. PANEL MODEL
+#   60. PANEL PAGE BRIDGE
+#   61. PANEL WINDOW HARDENING
+#   62. PANEL ROUNDED CORNERS
+#   63. PANEL WINDOWS
 # ============================================================
 
 """
@@ -88,8 +89,8 @@ talks to Python only through OrbBridge (orb_state, talk), never the full Api.
 A WM_MOUSEACTIVATE subclass answers MA_NOACTIVATE so a click never activates
 it. A control thread (tick, 4 Hz) resizes it about its center per state
 (config ORB_SIZE_BIG/MEDIUM/SMALL), flies it beside the task's window when
-"Orb follows the task" is on (core/orb_layout.py), and drives the task
-panels (core/orb_panels.py).
+"Orb follows the task" is on (ORB LAYOUT GEOMETRY below), and drives the
+task panels (TASK PANELS below).
 
 The window is opaque and cut to a circle with a window region rather than
 using pywebview's transparent mode, which is unreliable with WebView2.
@@ -124,10 +125,10 @@ from .config import (
 # ORB LAYOUT GEOMETRY
 # ============================================================
 
-# core/orb_layout.py — pure geometry for the floating orb and its panels.
+# Pure geometry for the floating orb and its panels.
 # Everything here is physical pixels; rects are (l, t, r, b), the orb is a
-# square (x, y, side). No Win32, no threads: core/floating_orb.py and
-# core/orb_panels.py apply the results.
+# square (x, y, side). No Win32, no threads: the ORB CONTROLLER and TASK
+# PANELS sections below apply the results.
 
 # ============================================================
 # RESIZE ABOUT THE CENTER
@@ -559,7 +560,7 @@ def answer_spot(panel, side, work, gap=12):
 # ORB MOTION
 # ============================================================
 
-# core/orb_motion.py — pure motion for the floating orb's flights: a 2-D damped
+# Pure motion for the floating orb's flights: a 2-D damped
 # spring with a closed-form solution, so a flight's position is a function of
 # the time since take-off only (a dropped frame skips ahead, it never bends the
 # path), plus the frame-timing statistics. No Win32, no threads, no logging:
@@ -1105,6 +1106,29 @@ def orb_state(api, signals=None, docked=False):
 
 
 # ============================================================
+# AUDIO LEVEL PER STATE
+# ============================================================
+
+LEVEL_STATES = ("listening", "speaking")
+
+
+def state_level(api, state):
+    """The audio level the orb's core follows in this state: the mic's
+    (Api.audio_level()["mic"]) while listening, the voice's ("tts", None for
+    the fallback voice) while speaking, else 0.0. Never raises."""
+    try:
+        levels = api.audio_level()
+    except Exception:
+        return 0.0 if state != "speaking" else None
+    if state == "listening":
+        return float(levels.get("mic") or 0.0)
+    if state == "speaking":
+        v = levels.get("tts")
+        return None if v is None else float(v)
+    return 0.0
+
+
+# ============================================================
 # ORB PAGE BRIDGE
 # ============================================================
 
@@ -1120,13 +1144,18 @@ class OrbBridge:
 
     def orb_state(self):
         """{"state"}; plus "still": true when Windows animation effects are
-        off (the page then freezes its motion, like prefers-reduced-motion)."""
+        off (the page then freezes its motion, like prefers-reduced-motion);
+        plus "level" while listening (the mic) or speaking (the voice, None
+        when the fallback voice has no level): see state_level."""
         orb = self._orb
         if orb is None:
-            return {"state": orb_state(self._api)}
-        out = {"state": orb.state()}
-        if not orb.animations_on():
-            out["still"] = True
+            out = {"state": orb_state(self._api)}
+        else:
+            out = {"state": orb.state()}
+            if not orb.animations_on():
+                out["still"] = True
+        if out["state"] in LEVEL_STATES:
+            out["level"] = state_level(self._api, out["state"])
         return out
 
     def talk(self, kind):
@@ -1590,7 +1619,7 @@ def _boost_exit(win, prev):
 class Tween:
     """Plays flight segments [(from, to, seconds, bow), ...] on a worker
     thread, one frame per display refresh (FramePacer). A segment that keeps
-    the size is a spring move (core/orb_motion.Flight, MISTAI_ORB_MOTION read
+    the size is a spring move (Flight above, MISTAI_ORB_MOTION read
     per play): one SetWindowPos per frame and nothing else; its ``seconds`` is
     only the caller's estimate. A segment that changes the size is a short
     timed resize step (smoothstep), the region recut per frame. Positions come
@@ -1942,7 +1971,7 @@ class FloatingOrb:
         self.click_through = False
         self._cur_target = None   # this tick's target dict or None
         self._logged_target = None
-        self.panels = None        # core.orb_panels.OrbPanels once used
+        self.panels = None        # OrbPanels (TASK PANELS) once used
         self.aborted = False      # the task failed, paused or was stopped
         self._was_busy = False
         self._busy_since = 0.0
@@ -2514,7 +2543,7 @@ class FloatingOrb:
             pass
 
         def run_on_ui(fn):
-            from System import Action  # pythonnet, as pywebview uses on Windows
+            from System import Action  # pyright: ignore[reportMissingImports]  (pythonnet, as pywebview uses on Windows)
 
             self.window.native.Invoke(Action(fn))
 
@@ -2534,10 +2563,10 @@ class FloatingOrb:
 # TASK PANELS
 # ============================================================
 
-# core/orb_panels.py — task panels beside the floating orb (Settings "Task
+# Task panels beside the floating orb (Settings "Task
 # panels" / MISTAI_ORB_PANELS, default off; needs the floating orb shown).
 #
-# Up to four small frameless windows built like the orb (core/floating_orb.py):
+# Up to four small frameless windows built like the orb window (above):
 # excluded from capture, never activated (WS_EX_NOACTIVATE), untitled, in
 # MistAI's own process (so Open apps and process lookups skip them), listed in
 # the orb's handles() (so the OCR mask blacks them out and input is refused

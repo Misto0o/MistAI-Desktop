@@ -28,6 +28,13 @@
 #   21. SEARCH, PROCESS AND TIMING HELPERS (3)
 #   22. SEARCH, PROCESS AND TIMING TESTS (4)
 #   23. BROWSER START RETRY
+#   24. BROWSER ELEMENT LIST
+#   25. BROWSER ELEMENT LIST API
+#   26. BROWSER PROFILE SETTING
+#   27. BROWSER FIXTURE PAGES
+#   28. BROWSER FIXTURE TESTS
+#   29. PAGE READINESS, DOWNLOADS AND FILL
+#   30. BROWSER LIST SPEED AND EMPTY PAGES
 # ============================================================
 
 """browser_search engines and fallback, search/process matching and timing."""
@@ -824,7 +831,7 @@ def test_tts_skips_edge_tts_for_a_while_after_a_failure(monkeypatch):
     engine._neural_down_until = 0.0
     neural_calls, fallback_calls = [], []
 
-    def failing_neural(text, gen):
+    def failing_neural(text, gen, retry=False):
         neural_calls.append(text)
         raise OSError("self-signed certificate in certificate chain")
 
@@ -837,12 +844,12 @@ def test_tts_skips_edge_tts_for_a_while_after_a_failure(monkeypatch):
     engine._speak_one(0, "two")
     now[0] += tts.NeuralTTS.NEURAL_COOLDOWN - 1
     engine._speak_one(0, "three")
-    assert neural_calls == ["one"]
+    assert neural_calls == ["one", "one"]          # the first try and its one retry
     assert fallback_calls == ["one", "two", "three"]
 
     now[0] += 2  # cooldown over: the network is tried again
     engine._speak_one(0, "four")
-    assert neural_calls == ["one", "four"]
+    assert neural_calls == ["one", "one", "four", "four"]
 
 
 @pytest.mark.parametrize(
@@ -1068,3 +1075,1222 @@ def test_start_phase_line_is_numbers_only(tmp_path, monkeypatch, capsys):
     lines = [l for l in capsys.readouterr().out.splitlines() if "start phases" in l]
     assert len(lines) == 1 and re.fullmatch(
         r"\[Browser\] start phases: seed [\d.]+s driver [\d.]+s launch [\d.]+s page [\d.]+s", lines[0])
+
+
+# ============================================================
+# BROWSER ELEMENT LIST
+# ============================================================
+
+# core/browser_session.py: the numbered element list (order, format, dedupe),
+# text matching, the click-effect sentence and short error labels. Pure
+# functions, no browser.
+
+import core.browser_session as bs
+
+
+def _el(num, role="link", name="x", v=1, l="main", order=None, **kw):
+    e = {"num": num, "r": role, "n": name, "v": v, "l": l, "order": (0, num if order is None else order),
+         "t": 0 if v else 900, "h": "", "s": "", "c": "", "ad": 0, "frame": 0}
+    e.update(kw)
+    return e
+
+
+def test_the_dialog_comes_first_then_main_then_the_rest_and_off_screen_is_counted():
+    entries = [_el(1, name="Home", l="nav"), _el(2, name="Result one"), _el(3, name="Far", v=0),
+               _el(4, "button", "Accept all", l="dialog"), _el(5, name="Up there", v=0, t=-500)]
+    groups = bs.order_elements(entries, has_main=True)
+    text, count = bs.format_element_list(groups, unreadable_frames=1)
+    lines = text.splitlines()
+    assert lines[0] == bs.ELEMENTS_HEADER and count == 3
+    assert lines[1:] == [
+        bs.DIALOG_HEADER, '[4] button "Accept all"',
+        bs.MAIN_HEADER, '[2] link "Result one"',
+        bs.OTHER_HEADER, '[1] link "Home"',
+        "1 more below the fold (use browser_scroll, then browser_elements); 1 above "
+        "(scrolled past); 1 iframe(s) not readable."]
+
+
+def test_without_a_main_landmark_everything_but_menus_is_main_content():
+    groups = bs.order_elements([_el(1, name="A", l="other"), _el(2, name="B", l="footer")],
+                               has_main=False)
+    assert [e["num"] for e in groups[1]] == [1] and [e["num"] for e in groups[2]] == [2]
+
+
+def test_duplicate_names_get_their_host_and_exact_repeats_are_dropped():
+    entries = bs.dedupe_elements([_el(1, name="Read more", h="a.example"),
+                                  _el(2, name="Read more", h="b.example"),
+                                  _el(3, name="Read more", h="b.example")])
+    assert [e["num"] for e in entries] == [1, 2]
+    text, _ = bs.format_element_list(bs.order_elements(entries))
+    assert '[1] link "Read more" (a.example)' in text and '[2] link "Read more" (b.example)' in text
+
+
+def test_lines_carry_state_cover_and_ad_and_names_are_cut():
+    line = bs.element_line(_el(7, "checkbox", "N" * 80, s="checked", c="dialog 'Cookies'", ad=1))
+    assert line == f'[7] checkbox "{"N" * 59}…" (checked) (covered by dialog \'Cookies\') (ad)'
+
+
+def test_the_list_is_capped_by_items_and_characters():
+    entries = [_el(i, name=f"Link number {i}") for i in range(1, 101)]
+    text, count = bs.format_element_list(bs.order_elements(entries))
+    assert count == bs.ELEMENT_LIST_MAX and "40 more on screen not listed." in text
+    text, count = bs.format_element_list(bs.order_elements(entries), max_chars=300)
+    assert len(text) <= 300 + 60 and count < 15
+
+
+def test_a_page_with_nothing_clickable_says_so():
+    text, count = bs.format_element_list(([], [], [], [], []))
+    assert count == 0 and "(no clickable elements are visible)" in text
+
+
+def test_matching_prefers_exact_then_visible_links_and_reports_ties():
+    entries = [_el(1, "clickable", "python", v=1, order=1),
+               _el(2, "link", "Python docs", v=0, order=2),
+               _el(3, "link", "Python docs", v=1, order=3),
+               _el(4, "link", "Learn Python docs fast", v=1, order=4)]
+    assert [e["num"] for e in bs.match_elements(entries, "python docs")] == [3, 2]
+    assert [e["num"] for e in bs.match_elements(entries, "PYTHON")] == [1]
+    assert bs.match_elements(entries, "docs fast|x") == []
+    assert [e["num"] for e in bs.match_elements(entries, "python docs", role="link")] == [3, 2]
+    assert bs.match_elements(entries, "python", role="button") == []
+
+
+def test_short_targets_match_only_whole_words():
+    entries = [_el(1, name="52 results"), _el(2, name="Page 2")]
+    assert [e["num"] for e in bs.match_elements(entries, "2")] == [2]
+
+
+def test_covered_matches_rank_after_uncovered_ones():
+    entries = [_el(1, name="Article", c="dialog 'x'"), _el(2, name="Article")]
+    assert bs.match_elements(entries, "article")[0]["num"] == 2
+
+
+def test_no_match_names_the_closest_elements():
+    entries = [_el(3, name="Requests: HTTP for Humans"), _el(7, name="Quickstart"),
+               _el(9, name="Zebra")]
+    msg = bs.no_match_message("requests http humans guide", bs.closest_elements(entries, "requests http humans guide"))
+    assert msg.startswith("no element matches 'requests http humans guide'. Closest: [3] link")
+    assert "Zebra" not in msg
+    assert "Nothing on the page is close" in bs.no_match_message("qq", [])
+
+
+SIG = {"url": "http://h/a", "title": "A", "n": 10, "t": 100, "sy": 0, "dlg": [], "media": "",
+       "ex": 0, "chk": 0, "act": "BODY#"}
+
+
+@pytest.mark.parametrize("change, expected, changed", [
+    ({"url": "http://h/b", "title": "B"}, 'the page changed to h/b (title "B")', True),
+    ({"title": "Done"}, 'the title changed to "Done"', True),
+    ({"dlg": ["Cookies"]}, "a dialog appeared ('Cookies')", True),
+    ({"url": "http://h/a#s2"}, "the page jumped to 's2' on the same page", True),
+    ({"media": "1"}, "media on the page started playing", True),
+    ({"n": 12}, "the page changed in place (content or a menu updated)", True),
+    ({"sy": 300}, "the page scrolled", True),
+    ({}, "but the page did not change (no navigation, new tab, download or visible change)", False),
+])
+def test_click_effects_are_named(change, expected, changed):
+    assert bs.describe_effect(SIG, dict(SIG, **change)) == (expected, changed)
+
+
+def test_click_effects_for_tabs_downloads_dialogs_closing_and_state():
+    assert bs.describe_effect(dict(SIG, dlg=["Cookies"]), SIG) == ("the dialog 'Cookies' closed", True)
+    assert bs.describe_effect(SIG, SIG, download="report.pdf")[0].startswith(
+        "a download started: report.pdf")
+    assert bs.describe_effect(SIG, SIG, download="x")[1] is False
+    assert bs.describe_effect(SIG, SIG, new_tab=("https://www.b.example/p?q=1", "B")) == (
+        'it opened a new tab: b.example/p (title "B"); the browser now works in that tab', True)
+    assert bs.describe_effect(SIG, None) == ("the page started navigating away", True)
+    assert bs.describe_effect(SIG, SIG, "a", "b")[0].startswith("the clicked element changed state")
+    assert bs.describe_effect(SIG, dict(SIG, act="INPUT#q"), target_role="searchbox") == (
+        "the field is now focused", True)
+
+
+def test_click_errors_are_one_short_line_never_the_call_log():
+    log = ("Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for get_by_text\n"
+           "  - <div> intercepts pointer events")
+    assert bs.short_click_error(Exception(log)) == "something on top of it intercepts the click"
+    assert bs.short_click_error(bs.PlaywrightTimeout("Timeout 3000ms exceeded.")) == (
+        "it did not become clickable within 3s")
+    assert bs.is_closed_error(Exception("Target page, context or browser has been closed"))
+    assert bs.CLICK_TIMEOUT_MS == 3000
+
+
+def test_dismiss_candidates_are_the_dialogs_accept_reject_close_buttons():
+    entries = [_el(1, "button", "Accept all cookies", l="dialog"), _el(2, "link", "Privacy policy", l="dialog"),
+               _el(3, "button", "Reject all", l="dialog"), _el(4, "button", "Close", l="main")]
+    assert [e["num"] for e in bs.dismiss_candidates(entries)] == [1, 3]
+
+
+def test_links_to_one_target_merge_into_the_best_named_one_in_the_first_place():
+    entries = bs.dedupe_elements([
+        _el(1, name="Now playing", k=7, order=1), _el(2, name="https://a.example › x", k=8, order=2),
+        _el(3, name="lofi hip hop radio - beats to relax", k=7, order=3),
+        _el(4, name="Requests: HTTP for Humans", k=8, order=4)])
+    assert [(e["num"], e["order"]) for e in entries] == [(3, (0, 1)), (4, (0, 2))]
+    assert bs._better_link_name("A title", "https://x") and not bs._better_link_name("https://x", "T")
+
+
+def test_main_content_off_screen_lets_the_other_on_screen_items_count_as_main():
+    entries = [_el(1, name="Hero link", l="other"), _el(2, name="Docs", l="nav"),
+               _el(3, name="Article", l="main", v=0)]
+    groups = bs.order_elements(entries, has_main=True)
+    assert [e["num"] for e in groups[1]] == [1] and [e["num"] for e in groups[2]] == [2]
+
+
+def test_the_real_check_script_refuses_a_missing_or_used_profile(tmp_path, monkeypatch):
+    import tools.browser_real_check as rc
+    monkeypatch.delenv("MISTAI_BROWSER_SEED_PROFILE", raising=False)
+    with pytest.raises(SystemExit, match="does not exist"):
+        rc.require_empty_profile(str(tmp_path / "missing"))
+    used = tmp_path / "used"
+    used.mkdir()
+    (used / "cookies.sqlite").write_text("x")
+    with pytest.raises(SystemExit, match="not empty"):
+        rc.require_empty_profile(str(used))
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    rc.require_empty_profile(str(empty))
+    monkeypatch.setenv("MISTAI_BROWSER_SEED_PROFILE", "1")
+    with pytest.raises(SystemExit, match="MISTAI_BROWSER_SEED_PROFILE"):
+        rc.require_empty_profile(str(empty))
+    src = inspect.getsource(rc.main)
+    assert "firefox_signins=None" in src and "require_empty_profile(profile)" in src
+
+
+def _page_read_api(monkeypatch, in_front=True, text="Beta body text " * 10):
+    import core.api as api_mod
+    api = Api.__new__(Api)
+    api.browser = SimpleNamespace(running=True, page_text=lambda timeout=2.0: ("Beta", text))
+    monkeypatch.setattr(api_mod.clip, "foreground_for_reading", lambda *a: (5, "Beta"))
+    monkeypatch.setattr(api_mod.clip, "playwright_window", lambda: 5 if in_front else 6)
+    monkeypatch.delenv("MISTAI_UIA_FIRST", raising=False)
+    return api
+
+
+def test_a_screen_read_of_mistais_browser_page_uses_the_page_text_not_vision(monkeypatch, capsys):
+    api = _page_read_api(monkeypatch)
+    out = api._browser_page_answer("what does the page say about beta")
+    assert out.startswith("PAGE TEXT of MistAI's browser page 'Beta' (DOM, exact; no screenshot")
+    assert "browser_elements" in out
+    assert "no vision call" in capsys.readouterr().out
+    assert api._browser_page_answer("what colour is the header") == ""      # about looks: vision
+    assert _page_read_api(monkeypatch, in_front=False)._browser_page_answer("q") == ""
+    assert _page_read_api(monkeypatch, text="tiny")._browser_page_answer("q") == ""
+
+
+# ============================================================
+# BROWSER ELEMENT LIST API
+# ============================================================
+
+class _ListBrowser:
+    """A stand-in session with element lists: click answers are scripted."""
+
+    def __init__(self, click_result=None):
+        self.click_result = click_result or {"ok": True, "changed": True, "message": "Clicked [3] x: done."}
+        self.calls, self.lists, self.note = [], 0, ""
+        self.running, self.last_url, self.last_nav_still_loading = True, "https://h/a", False
+
+    def click(self, target="", role=None, ref=None):
+        self.calls.append((target, role, ref))
+        return self.click_result
+
+    def elements_text(self, still_loading=None):
+        self.lists += 1
+        return "PAGE ELEMENTS (...):\n[3] link \"x\""
+
+    def take_note(self):
+        note, self.note = self.note, ""
+        return note
+
+    def navigate(self, url):
+        return url, "T"
+
+    def get_text(self, _s=""):
+        return "Some page text"
+
+    def scroll(self, d):
+        return True, 40
+
+
+def _list_api(browser):
+    api = Api.__new__(Api)
+    api.browser, api.spoken, api.last_result_text = browser, [], ""
+    api.speak = api.spoken.append
+    return api
+
+
+@pytest.mark.parametrize("param, call", [
+    ("12", ("", None, 12)), ("[12]", ("", None, 12)), ("#7", ("", None, 7)),
+    ("Subscribe|button", ("Subscribe", "button", None)), ("lofi hip hop", ("lofi hip hop", None, None)),
+])
+def test_browser_click_takes_a_number_or_text(param, call):
+    b = _ListBrowser()
+    assert Api._act_browser_click(_list_api(b), param) is True
+    assert b.calls == [call]
+
+
+def test_a_changed_page_gets_the_fresh_list_once_with_the_tip():
+    b = _ListBrowser()
+    api = _list_api(b)
+    Api._act_browser_click(api, "3")
+    assert api.last_result_text.startswith("Clicked [3] x: done.\nPAGE ELEMENTS")
+    assert api.last_result_text.endswith(config.BROWSER_NOTE)
+    Api._act_browser_click(api, "3")
+    assert config.BROWSER_NOTE not in api.last_result_text      # once per phase
+    assert len(config.BROWSER_NOTE) <= 400
+
+
+def test_no_change_and_downloads_get_no_list_and_failures_do():
+    b = _ListBrowser({"ok": True, "changed": False, "message": "Clicked [3] x but the page did not change."})
+    api = _list_api(b)
+    assert Api._act_browser_click(api, "3") is True
+    assert b.lists == 0 and "did not change" in api.last_result_text
+    b.click_result = {"ok": False, "changed": False, "stale": True, "message": "element [3] is no longer on the page"}
+    assert Api._act_browser_click(api, "3") is False
+    assert b.lists == 1 and "PAGE ELEMENTS" in api.last_result_text
+
+
+def test_a_reopened_browser_is_said_before_the_result():
+    b = _ListBrowser()
+    b.note = bs.BrowserSession.REOPENED_NOTE
+    api = _list_api(b)
+    Api._act_browser_click(api, "3")
+    assert api.last_result_text.startswith("NOTE: the browser had been closed; reopened. Clicked")
+
+
+def test_a_click_exception_is_one_line():
+    b = _ListBrowser()
+    b.click = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Locator.click: boom\nCall log:\n - x"))
+    api = _list_api(b)
+    assert Api._act_browser_click(api, "3") is False
+    assert api.last_result_text == "browser_click failed: Locator.click: boom"
+
+
+def test_navigate_and_scroll_append_the_list_and_a_stalled_load_says_so():
+    b = _ListBrowser()
+    api = _list_api(b)
+    assert Api._act_browser_navigate(api, "h/a") is True
+    assert "\nPAGE ELEMENTS" in api.last_result_text and "still loading" not in api.last_result_text
+    b.last_nav_still_loading = True                 # listed at the cap, still going
+    assert Api._act_browser_navigate(api, "h/a") is True
+    assert "The page is still loading; here is what is on it so far." in api.last_result_text
+    assert "load was stopped" not in api.last_result_text
+    b.last_nav_stopped = True                       # nothing to list until 20 s: stopped
+    assert Api._act_browser_navigate(api, "h/a") is True
+    assert "The page was still loading after 20s; the load was stopped. Here is what is on it." in (
+        api.last_result_text)
+    b.get_text = lambda _s="": ""
+    assert Api._act_browser_navigate(api, "h/a") is False
+    assert "did not load within 20s" in api.last_result_text
+    b.last_nav_stopped = False                      # partial with no text yet: still a page
+    assert Api._act_browser_navigate(api, "h/a") is True
+    assert Api._act_browser_scroll(api, "down") is True
+    assert api.last_result_text.startswith("Scrolled down; the bottom of the screen is now at about 40%")
+    assert Api._act_browser_scroll(api, "sideways") is False
+
+
+def test_browser_elements_never_starts_the_browser():
+    b = _ListBrowser()
+    b.running = False
+    api = _list_api(b)
+    assert Api._act_browser_elements(api, "") is False
+    assert "not open" in api.last_result_text and b.lists == 0
+    b.running = True
+    assert Api._act_browser_elements(api, "") is True and b.lists == 1
+
+
+def test_the_new_browser_actions_are_registered_and_read_sized():
+    from core.tools import action_entry, READ_RESULT_CHARS
+    for name in ("browser_elements", "browser_scroll"):
+        assert name in SPECS and SPECS[name].result_chars >= READ_RESULT_CHARS
+    assert "never silently clicks the wrong thing" not in action_entry("browser_click")
+    assert SPECS["browser_elements"].categories == ("browser", "perception")
+
+
+# ============================================================
+# BROWSER PROFILE SETTING
+# ============================================================
+
+# Settings "Use my Firefox sign-ins" (user_profile browser_seed_profile, env
+# MISTAI_BROWSER_SEED_PROFILE, default off): off = a clean MistAI profile and
+# nothing read from the user's Firefox profile; on = the old seeding.
+
+
+class _Profile:
+    def __init__(self):
+        self.rows = {}
+
+    def get_profile(self, key, default=None):
+        return self.rows.get(key, default)
+
+    def set_profile(self, key, value):
+        self.rows[key] = value
+
+
+def _signins_api():
+    api = Api.__new__(Api)
+    api.memory = _Profile()
+    return api
+
+
+def test_firefox_signins_are_off_by_default_saved_and_env_overridable(monkeypatch, capsys):
+    monkeypatch.delenv("MISTAI_BROWSER_SEED_PROFILE", raising=False)
+    api = _signins_api()
+    assert api.get_firefox_signins() is False
+    assert api.set_firefox_signins(True) == {"success": True, "enabled": True}
+    assert api.memory.rows["browser_seed_profile"] == "on"
+    assert "applies to the next browser start" in capsys.readouterr().out
+    monkeypatch.setenv("MISTAI_BROWSER_SEED_PROFILE", "0")
+    assert api.get_firefox_signins() is False
+    monkeypatch.setenv("MISTAI_BROWSER_SEED_PROFILE", "1")
+    api.set_firefox_signins(False)
+    assert api.get_firefox_signins() is True
+    assert config.browser_seed_profile_enabled("on") is True
+
+
+def _start_without_launching(monkeypatch, session):
+    monkeypatch.setattr(bs, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(bs.threading, "Thread", lambda **k: SimpleNamespace(
+        start=lambda: session._ready.set(), is_alive=lambda: True))
+    session.ensure_started()
+
+
+def test_off_uses_the_clean_profile_and_never_reads_the_firefox_profile(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
+
+    def never(*_a, **_k):
+        raise AssertionError("the user's Firefox profile was read")
+
+    monkeypatch.setattr(bs, "clone_daily_profile", never)
+    monkeypatch.setattr(bs, "find_default_firefox_profile", never)
+    for fn in (None, lambda: False, lambda: 1 / 0):        # no setting, off, a broken getter
+        s = bs.BrowserSession(firefox_signins=fn)
+        _start_without_launching(monkeypatch, s)
+        assert s.profile_dir == os.path.join(str(tmp_path), "MistAI", "browser_profile_clean")
+    out = capsys.readouterr().out
+    assert out.count("[Browser] profile: clean") == 3 and str(tmp_path) not in out
+    s = bs.BrowserSession(firefox_signins=lambda: False)
+    for refused in (s.use_daily_profile_copy, lambda: s.import_cookies("a.example")):
+        with pytest.raises(RuntimeError, match="Use my Firefox sign-ins"):
+            refused()
+
+
+def test_on_seeds_a_missing_profile_once_like_before(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
+    copies = []
+
+    def clone(dest):
+        copies.append(dest)
+        os.makedirs(dest)
+        return "C:\\secret\\profile", ["cookies.sqlite", "storage"]
+
+    monkeypatch.setattr(bs, "clone_daily_profile", clone)
+    seeded = os.path.join(str(tmp_path), "MistAI", "browser_profile_from_daily")
+    s = bs.BrowserSession(firefox_signins=lambda: True)
+    _start_without_launching(monkeypatch, s)
+    assert s.profile_dir == seeded and copies == [seeded]
+    s2 = bs.BrowserSession(firefox_signins=lambda: True)
+    _start_without_launching(monkeypatch, s2)             # the folder exists now: reused
+    assert copies == [seeded]
+    out = capsys.readouterr().out
+    assert out.count("[Browser] profile: seeded from Firefox (opt-in)") == 2
+    assert "secret" not in out and "[Browser] Auto-seeded profile (2 item(s))" in out
+
+
+def test_an_explicit_profile_folder_is_never_seeded(tmp_path, monkeypatch):
+    monkeypatch.setattr(bs, "clone_daily_profile", lambda d: (_ for _ in ()).throw(AssertionError))
+    s = bs.BrowserSession(profile_dir=str(tmp_path / "empty"))
+    _start_without_launching(monkeypatch, s)
+    assert s.profile_dir == str(tmp_path / "empty") and not os.path.exists(s.profile_dir)
+
+
+def test_the_api_hands_the_setting_to_the_browser_session():
+    init = inspect.getsource(Api.__init__)
+    assert "BrowserSession(firefox_signins=self.get_firefox_signins)" in init
+
+
+def test_the_sidebar_switch_is_built_like_the_others():
+    from ui.html import HTML
+    assert ('<div class="toggle-row" id="row-firefox_signins"><span>Use my Firefox sign-ins</span>'
+            '<div class="sw" id="sw-firefox_signins" title="Copies your Firefox profile (cookies '
+            "and saved logins) into MistAI's own browser so it can use sites you are signed in "
+            "to. Off by default. Takes effect the next time MistAI's browser starts.\"></div></div>"
+            ) in HTML
+    js = HTML.split("<script>")[-1]
+    assert "['sw-firefox_signins','Use my Firefox sign-ins']" in js
+    assert "runStep('signins',loadFirefoxSignins);" in js
+    load = re.search(r"async function loadFirefoxSignins\(\)\{.*?\n\}\n", js, re.S).group(0)
+    assert "pywebview.api.set_firefox_signins(!sw.classList.contains('on'))" in load
+    assert "setSw(sw,!!(r&&r.enabled));" in load
+
+
+# ============================================================
+# BROWSER FIXTURE PAGES
+# ============================================================
+
+# Real headless Playwright Firefox against local pages on 127.0.0.1 (no real
+# sites), with a fresh EMPTY profile folder; skipped when Playwright or its
+# Firefox is not installed. "{other}" is the same server under another host
+# name (localhost), so an iframe from it is cross-origin.
+
+FIXTURE_PAGES = {
+    "/links.html": "<title>Links</title><main><a href='/a.html'>Alpha page</a> "
+                   "<a href='/b.html'>Beta page</a></main>",
+    "/a.html": "<title>Alpha</title><main><h1>Alpha</h1><a href='/links.html'>Back to links</a></main>",
+    "/b.html": "<title>Beta</title><main><h1>Beta</h1><p>Beta body text for reading.</p></main>",
+    "/dupes.html": "<title>Dupes</title><main><a href='/a.html'>Read more</a> "
+                   "<a href='{other}/b.html'>Read more</a></main>",
+    "/hidden.html": "<title>Hidden</title><main><div style='display:none'><a href='/b.html'>python docs"
+                    "</a></div><a href='/a.html'>python docs</a></main>",
+    "/fold.html": "<title>Fold</title><main><a href='/b.html'>Top link</a><div style='height:4000px'></div>"
+                  "<a href='/a.html'>Far link</a></main>",
+    "/modal.html": "<title>Modal</title><main><a href='/a.html'>Article</a></main>"
+                   "<div id='m' role='dialog' aria-label='Cookie consent' style='position:fixed;inset:0;"
+                   "background:#fff'><button onclick=\"document.getElementById('m').remove()\">Accept all"
+                   "</button><button>Settings</button></div>",
+    "/iframe.html": "<title>Frame</title><main><a href='/a.html'>Headline</a></main>"
+                    "<iframe id='f' title='Privacy Center' src='{other}/consent.html' style='position:fixed;"
+                    "top:0;left:0;width:100%;height:100%;border:0'></iframe><script>addEventListener("
+                    "'message',()=>document.getElementById('f').remove())</script>",
+    "/consent.html": "<title>Consent</title><body style='background:#fff'><button onclick=\"parent."
+                     "postMessage('ok','*')\">Consent and continue</button></body>",
+    "/shadow.html": "<title>Shadow</title><main><x-card></x-card></main><script>customElements.define("
+                    "'x-card',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'})"
+                    ".innerHTML=\"<button onclick=\\\"document.title='Shadow clicked'\\\">Shadow button</button>\";}})"
+                    "</script>",
+    "/newtab.html": "<title>Tabs</title><main><a href='/b.html' target='_blank'>Open beta in a new tab</a></main>",
+    "/download.html": "<title>Files</title><main><a href='/file.pdf'>Get the report</a></main>",
+    "/toggle.html": "<title>Toggle</title><main><label><input type='checkbox' id='c'> Remember me</label>"
+                    "<button>Does nothing</button></main>",
+    # Results rendered by script after a slow fetch: the header link is there at once.
+    "/late.html": "<title>Late</title><header><a href='/a.html'>Home</a></header><main id='m'></main>"
+                  "<script>fetch('/late.json').then(r=>r.json()).then(d=>{const a=document."
+                  "createElement('a');a.href='/b.html';a.textContent=d.name;document.getElementById"
+                  "('m').append(a);});</script>",
+    # Never settles: a node is added every 100 ms.
+    "/busy.html": "<title>Busy</title><main><a href='/a.html'>Busy link</a><div id='t'></div></main>"
+                  "<script>setInterval(()=>{const s=document.createElement('span');s.textContent='.';"
+                  "document.getElementById('t').append(s);},100)</script>",
+    "/form.html": "<title>Form</title><main><label for='q'>Search the site</label><input id='q'>"
+                  "<input placeholder='Your email'><a href='/a.html'>Help</a></main>",
+}
+
+
+class _FixtureHandler(__import__("http.server").server.BaseHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/file.pdf":
+            body = b"%PDF-1.4 fixture"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="report.pdf"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/late.json":
+            __import__("time").sleep(0.8)
+            body = b'{"name": "Late result"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/slowtext.html":     # text but nothing to click, then it stalls
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<title>Slow text</title><p>Plain text that arrived before the "
+                             b"stall, long enough to be read as a page.</p>" + b" " * 2048)
+            for _ in range(40):
+                if self.server.stopping.wait(0.25):
+                    break
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except OSError:
+                    break
+            return
+        if path == "/slow.html":         # never finishes: part of the page, then nothing
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<title>Slow</title><main><a href='/a.html'>Loaded part</a> some text "
+                             b"that arrived before the stall, enough to read.</main>" + b" " * 2048)
+            for _ in range(40):
+                if self.server.stopping.wait(0.25):
+                    break
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except OSError:
+                    break
+            return
+        page = FIXTURE_PAGES.get(path)
+        if page is None:
+            self.send_error(404)
+            return
+        body = page.replace("{other}", self.server.other).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture(scope="module")
+def fixture_site():
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FixtureHandler)
+    srv.daemon_threads = True
+    srv.stopping = threading.Event()
+    port = srv.server_address[1]
+    srv.other = f"http://localhost:{port}"
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.stopping.set()
+    srv.shutdown()
+
+
+@pytest.fixture(scope="module")
+def live(tmp_path_factory, fixture_site):
+    if not bs.PLAYWRIGHT_AVAILABLE:
+        pytest.skip("Playwright not installed")
+    profile = tmp_path_factory.mktemp("pw_profile_empty")
+    assert os.listdir(profile) == []                  # a fresh, EMPTY profile, never a copy
+    s = bs.BrowserSession(profile_dir=str(profile), headless=True)
+    s.ensure_started()
+    if s._start_error:
+        pytest.skip(f"Playwright Firefox could not start ({s._start_error[:80]})")
+    s.base = fixture_site
+    yield s
+    s.close()
+
+
+def _num(text, role, name):
+    m = re.search(r"\[(\d+)\] " + role + ' "' + re.escape(name) + '"', text)
+    assert m, text
+    return int(m.group(1))
+
+
+def _live_api(session, downloads=None):
+    import tempfile
+    api = _list_api(session)
+    api.__dict__["_app_notes_given"] = set()
+    # Never the user's real Downloads folder in a test.
+    folder = str(downloads) if downloads else os.path.join(tempfile.gettempdir(),
+                                                           "mist_test_downloads")
+    api._downloads_dir = lambda: folder
+    return api
+
+
+# ============================================================
+# BROWSER FIXTURE TESTS
+# ============================================================
+
+def test_live_normal_links_are_listed_and_clicked_by_number(live):
+    live.navigate(live.base + "/links.html")
+    text = live.elements_text()
+    alpha = _num(text, "link", "Alpha page")
+    res = live.click(ref=alpha)
+    assert res["ok"] and res["changed"]
+    assert res["message"].startswith(f'Clicked [{alpha}] link "Alpha page": the page changed to '
+                                     '127.0.0.1')
+    assert '/a.html (title "Alpha")' in res["message"] and live.last_url.endswith("/a.html")
+
+
+def test_live_duplicate_names_are_told_apart_by_host(live):
+    live.navigate(live.base + "/dupes.html")
+    text = live.elements_text()
+    assert '"Read more" (127.0.0.1' in text and '"Read more" (localhost' in text
+    res = live.click("Read more")
+    assert res["message"].startswith("2 matches; clicked [")
+
+
+def test_live_a_hidden_first_match_is_skipped_for_the_visible_one(live):
+    live.navigate(live.base + "/hidden.html")
+    text = live.elements_text()
+    assert text.count('"python docs"') == 1
+    res = live.click("python docs")
+    assert res["ok"] and "/a.html" in res["message"]
+
+
+def test_live_below_the_fold_is_counted_and_still_clickable_by_text(live):
+    live.navigate(live.base + "/fold.html")
+    text = live.elements_text()
+    assert "Far link" not in text and "1 more below the fold" in text
+    res = live.click("Far link")
+    assert res["ok"] and "/a.html" in res["message"]
+
+
+def test_live_a_modal_comes_first_and_a_covered_target_is_not_clicked(live):
+    live.navigate(live.base + "/modal.html")
+    text = live.elements_text()
+    lines = text.splitlines()
+    assert lines[1] == bs.DIALOG_HEADER and "Accept all" in lines[2]
+    article = _num(text, "link", "Article")
+    assert "(covered by dialog 'Cookie consent')" in text
+    res = live.click(ref=article)
+    accept = _num(text, "button", "Accept all")
+    assert not res["ok"] and res["message"].startswith(
+        f'[{article}] link "Article" is covered by dialog \'Cookie consent\'; it was not clicked.')
+    assert f'[{accept}] button "Accept all" probably dismisses it' in res["message"]
+    assert live.last_url.endswith("/modal.html")
+    res = live.click(ref=accept)
+    assert res["ok"] and res["changed"] and "the dialog 'Cookie consent' closed" in res["message"]
+    assert live.click(ref=article)["ok"]
+
+
+def test_live_a_consent_dialog_in_a_cross_origin_iframe(live):
+    live.navigate(live.base + "/iframe.html")
+    text = live.elements_text()
+    assert bs.DIALOG_HEADER in text and '"Consent and continue"' in text
+    headline = _num(text, "link", "Headline")
+    res = live.click(ref=headline)
+    assert not res["ok"] and "is covered by iframe 'Privacy Center'" in res["message"]
+    consent = _num(text, "button", "Consent and continue")
+    assert f"[{consent}]" in res["message"]
+    res = live.click(ref=consent)
+    assert res["ok"] and res["changed"], res
+    assert live.click(ref=headline)["ok"]
+
+
+def test_live_open_shadow_dom_elements_are_listed_and_clickable(live):
+    live.navigate(live.base + "/shadow.html")
+    text = live.elements_text()
+    res = live.click(ref=_num(text, "button", "Shadow button"))
+    assert res["ok"] and 'the title changed to "Shadow clicked"' in res["message"]
+
+
+def test_live_a_new_tab_is_adopted(live):
+    live.navigate(live.base + "/newtab.html")
+    res = live.click("Open beta in a new tab")
+    assert res["ok"] and "it opened a new tab: 127.0.0.1" in res["message"]
+    assert "/b.html" in res["message"] and live.current_url().endswith("/b.html")
+    assert "Beta body text" in live.get_text("")
+
+
+def test_live_a_download_is_named_and_not_called_a_plain_click(live):
+    live.navigate(live.base + "/download.html")
+    res = live.click("Get the report")
+    assert res["ok"] and not res["changed"]
+    assert "a download started: report.pdf" in res["message"]
+
+
+def test_live_state_changes_and_no_change_are_reported(live):
+    live.navigate(live.base + "/toggle.html")
+    text = live.elements_text()
+    assert 'checkbox "Remember me" (not checked)' in text
+    res = live.click(ref=_num(text, "checkbox", "Remember me"))
+    assert "changed state" in res["message"]
+    res = live.click("Does nothing")
+    assert res["ok"] and not res["changed"] and "but the page did not change" in res["message"]
+
+
+def test_live_no_match_fails_fast_with_the_closest_names(live):
+    import time as _time
+    live.navigate(live.base + "/links.html")
+    t0 = _time.monotonic()
+    res = live.click("Alpha pages overview")
+    assert _time.monotonic() - t0 < 2.0
+    assert not res["ok"] and "no element matches 'Alpha pages overview'. Closest: [" in res["message"]
+    assert '"Alpha page"' in res["message"]
+
+
+def test_live_a_stale_number_after_a_page_change_is_refused_clearly(live):
+    api = _live_api(live)
+    assert Api._act_browser_navigate(api, live.base + "/links.html") is True
+    alpha = _num(api.last_result_text, "link", "Alpha page")
+    beta = _num(api.last_result_text, "link", "Beta page")
+    assert Api._act_browser_click(api, str(beta)) is True
+    assert "\nPAGE ELEMENTS" in api.last_result_text           # the page changed: fresh list
+    assert Api._act_browser_click(api, str(alpha)) is False
+    assert api.last_result_text.startswith(
+        f"element [{alpha}] is no longer on the page (the page changed since that list)")
+    assert live.last_url.endswith("/b.html")
+
+
+def test_live_a_page_that_never_finishes_returns_at_the_cap_with_what_it_has(live):
+    import time as _time
+    api = _live_api(live)
+    t0 = _time.monotonic()
+    assert Api._act_browser_navigate(api, live.base + "/slow.html") is True
+    assert _time.monotonic() - t0 < bs.READY_CAP_S + 1.5
+    assert "The page is still loading; here is what is on it so far." in api.last_result_text
+    assert '"Loaded part"' in api.last_result_text and "was still loading; this is what" in (
+        api.last_result_text)
+    t1 = _time.monotonic()
+    live.navigate(live.base + "/b.html")                       # not queued behind the stall
+    assert _time.monotonic() - t1 < 3 and not live.last_nav_still_loading
+
+
+def test_live_a_page_with_nothing_to_list_is_stopped_at_the_nav_timeout(live, monkeypatch):
+    import time as _time
+    monkeypatch.setattr(bs, "NAV_TIMEOUT_MS", 4000)
+    api = _live_api(live)
+    t0 = _time.monotonic()
+    assert Api._act_browser_navigate(api, live.base + "/slowtext.html") is True
+    assert 3.5 < _time.monotonic() - t0 < 9
+    assert "The page was still loading after" in api.last_result_text and "load was stopped" in (
+        api.last_result_text)
+    assert live.last_nav_stopped
+
+
+def test_live_a_closed_page_and_a_closed_browser_are_reopened_once(live):
+    live.navigate(live.base + "/links.html")
+    live._call(lambda: live._page.close())
+    assert live.navigate(live.base + "/a.html")[1] == "Alpha"
+    assert live.take_note() == bs.BrowserSession.REOPENED_NOTE
+    live._call(lambda: live._context.close())
+    api = _live_api(live)
+    assert Api._act_browser_navigate(api, live.base + "/b.html") is True
+    assert api.last_result_text.startswith("NOTE: the browser had been closed; reopened. Navigated to")
+    assert "has been closed" not in api.last_result_text
+
+
+# ============================================================
+# PAGE READINESS, DOWNLOADS AND FILL
+# ============================================================
+
+def _sample(n=5, rs="complete", q=1000, title="New", url="https://h/new"):
+    return {"url": url, "title": title, "rs": rs, "n": n, "q": q}
+
+
+def test_ready_verdict_needs_a_listable_settled_page():
+    v = bs.ready_verdict
+    assert v(None, None, 0) == "nothing"
+    assert v(_sample(n=0, rs="interactive"), None, 0) == "nothing"       # nothing to list yet
+    assert v(_sample(n=0), _sample(n=0), 0) == "ready"                  # a complete, plain page
+    assert v(_sample(rs="loading"), _sample(rs="loading"), 0) == "partial"
+    assert v(_sample(), None, 0) == "partial"                          # one sample: not stable
+    assert v(_sample(n=6), _sample(n=5), 0) == "partial"              # still adding elements
+    assert v(_sample(q=100), _sample(q=50), 0) == "usable"            # DOM changed 100 ms ago
+    assert v(_sample(), _sample(), 1) == "usable"                     # a script/fetch pending
+    assert v(_sample(), _sample(), 0) == "ready"
+    assert v(_sample(q=-1), _sample(q=-1), 0) == "ready"              # no observer: not a reason
+
+
+def test_ready_verdict_waits_for_the_new_url_and_a_settled_title():
+    v = bs.ready_verdict
+    old = "https://h/old"
+    assert v(_sample(url=old), _sample(url=old), 0, need_url_change_from=old) == "nothing"
+    assert v(_sample(), _sample(), 0, need_url_change_from=old) == "ready"
+    # A single-page app's interim title (the site's bare name, part of the old title).
+    assert v(_sample(title="YouTube"), _sample(title="YouTube"), 0,
+             before_title="lofi - YouTube") == "usable"
+    assert v(_sample(title="Old - Site"), _sample(title="Old - Site"), 0,
+             before_title="Old - Site") == "usable"
+    assert v(_sample(title="Old - Site"), _sample(title="Old - Site"), 0,
+             before_title="Old - Site", same_title_ok=True) == "ready"
+    assert v(_sample(url="about:blank"), _sample(url="about:blank"), 0, skip_blank=True) == "nothing"
+    # Only a page still loading or still adding elements is called "still loading".
+    assert [bs.still_loading(x) for x in ("ready", "usable", "partial", "nothing")] == [
+        False, False, True, True]
+
+
+def test_a_still_loading_page_change_says_so():
+    before = {"url": "https://h/a", "title": "A"}
+    after = {"url": "https://h/b", "title": "B"}
+    text, changed = bs.describe_effect(before, after, still_loading=True)
+    assert changed and text.endswith(bs.STILL_LOADING_NOTE)
+    assert bs.STILL_LOADING_NOTE not in bs.describe_effect(before, after)[0]
+    assert "still loading" in bs.describe_effect(before, before, new_tab=("https://h/c", "C"),
+                                                 still_loading=True)[0]
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("report.pdf", "report.pdf"), ("..\\..\\evil.exe", "evil.exe"), ("a/b/c.txt", "c.txt"),
+    ('bad:<name>?.txt', "bad__name__.txt"), ("CON.txt", "_CON.txt"), ("", "download"),
+    ("...", "download"), ("x" * 300 + ".zip", "x" * 146 + ".zip"),
+])
+def test_download_names_are_plain_safe_file_names(raw, want):
+    assert bs.safe_download_name(raw) == want
+
+
+def test_a_saved_download_never_overwrites(tmp_path):
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"new")
+    folder = tmp_path / "Downloads"
+    folder.mkdir()
+    (folder / "report.pdf").write_bytes(b"old")
+    (folder / "report (1).pdf").write_bytes(b"old1")
+    path = bs.save_download_copy(str(src), str(folder), "report.pdf")
+    assert os.path.basename(path) == "report (2).pdf" and open(path, "rb").read() == b"new"
+    assert (folder / "report.pdf").read_bytes() == b"old"
+    assert (folder / "report (1).pdf").read_bytes() == b"old1"
+
+
+class _DlBrowser(_ListBrowser):
+    """A stand-in whose clicks start a download; saves are recorded."""
+
+    def __init__(self):
+        super().__init__({"ok": True, "changed": False,
+                          "message": "Clicked [3] x: a download started: r.pdf (the page did not change)."})
+        self.last_download = None
+        self.last_nav_download = None
+        self.saved = []
+
+    def click(self, target="", role=None, ref=None):
+        self.last_download = object()
+        return self.click_result
+
+    def save_download(self, folder, timeout=None):
+        self.saved.append(folder)
+        self.last_download = None
+        return os.path.join(folder, "r (1).pdf")
+
+
+def test_only_clicks_and_navigations_that_start_a_download_save_it():
+    b = _DlBrowser()
+    api = _list_api(b)
+    api._downloads_dir = lambda: "DL"
+    assert Api._act_browser_click(api, "3") is True
+    assert b.saved == ["DL"] and api.last_result_text.endswith(
+        "Saved it to the Downloads folder as r (1).pdf.")
+    assert b.lists == 0
+    b.last_nav_download = "r.pdf"
+    b.last_download = object()
+    assert Api._act_browser_navigate(api, "h/r.pdf") is True
+    assert api.last_result_text.startswith("browser_navigate: that address is a file download (r.pdf)")
+    assert len(b.saved) == 2
+    # Any other action never saves one.
+    b.last_download = object()
+    Api._act_browser_scroll(api, "down")
+    assert len(b.saved) == 2
+
+
+def test_a_failed_or_slow_download_save_is_said_plainly():
+    b = _DlBrowser()
+    api = _list_api(b)
+    api._downloads_dir = lambda: "DL"
+
+    def slow(folder, timeout=None):
+        raise RuntimeError("Browser action timed out after 30s (page may be stuck loading)")
+    b.save_download = slow
+    Api._act_browser_click(api, "3")
+    assert api.last_result_text.endswith(
+        "It is still downloading; it will be saved to the Downloads folder when it finishes.")
+    b.save_download = lambda folder, timeout=None: (_ for _ in ()).throw(OSError("disk full"))
+    Api._act_browser_click(api, "3")
+    assert "It could not be saved to the Downloads folder: disk full." in api.last_result_text
+
+
+def test_a_pasted_list_line_is_read_as_its_number():
+    b = _ListBrowser()
+    assert Api._act_browser_click(_list_api(b), '[12] link "lofi hip hop radio"') is True
+    assert b.calls == [("", None, 12)]
+    b = _ListBrowser()
+    Api._act_browser_click(_list_api(b), '12 Monkeys "film"')
+    assert b.calls == [('12 Monkeys "film"', None, None)]
+
+
+def test_live_a_page_changing_click_returns_soon_after_the_new_page_can_be_listed(live):
+    import time as _time
+    api = _live_api(live)
+    Api._act_browser_navigate(api, live.base + "/links.html")
+    num = _num(api.last_result_text, "link", "Alpha page")
+    t0 = _time.monotonic()
+    assert Api._act_browser_click(api, str(num)) is True
+    assert _time.monotonic() - t0 < 2.0
+    assert "the page changed to 127.0.0.1" in api.last_result_text and '(title "Alpha")' in (
+        api.last_result_text)
+    assert "still loading" not in api.last_result_text
+    assert '"Back to links"' in api.last_result_text
+
+
+def test_live_navigation_waits_for_script_rendered_results_but_not_forever(live):
+    import time as _time
+    api = _live_api(live)
+    t0 = _time.monotonic()
+    assert Api._act_browser_navigate(api, live.base + "/late.html") is True
+    assert _time.monotonic() - t0 < bs.READY_CAP_S + 1.5
+    assert '"Late result"' in api.last_result_text and "still loading" not in api.last_result_text
+    t0 = _time.monotonic()
+    assert Api._act_browser_navigate(api, live.base + "/busy.html") is True
+    assert _time.monotonic() - t0 < bs.READY_CAP_S + 1.5
+    assert '"Busy link"' in api.last_result_text
+    assert "still loading" not in api.last_result_text      # parsed and listable: usable
+
+
+def test_live_a_download_by_click_and_by_navigate_is_saved_numbered(live, tmp_path):
+    api = _live_api(live, downloads=tmp_path)
+    (tmp_path / "report.pdf").write_bytes(b"mine")
+    Api._act_browser_navigate(api, live.base + "/download.html")
+    num = _num(api.last_result_text, "link", "Get the report")
+    assert Api._act_browser_click(api, str(num)) is True
+    assert "a download started: report.pdf" in api.last_result_text
+    assert api.last_result_text.endswith("Saved it to the Downloads folder as report (1).pdf.")
+    assert Api._act_browser_navigate(api, live.base + "/file.pdf") is True
+    assert "is a file download (report.pdf)" in api.last_result_text
+    assert api.last_result_text.endswith("Saved it to the Downloads folder as report (2).pdf.")
+    assert (tmp_path / "report.pdf").read_bytes() == b"mine"
+    assert (tmp_path / "report (2).pdf").read_bytes() == b"%PDF-1.4 fixture"
+
+
+def test_live_fill_by_number_or_name_and_a_missing_field_fails_fast(live):
+    import time as _time
+    api = _live_api(live)
+    Api._act_browser_navigate(api, live.base + "/form.html")
+    text = api.last_result_text
+    q = _num(text, "textbox", "Search the site")
+    assert Api._act_browser_fill(api, f"{q}|lofi") is True
+    assert api.last_result_text.startswith(f'Filled [{q}] textbox "Search the site" (not submitted')
+    assert Api._act_browser_fill(api, "Your email|a@b.c") is True
+    assert live._call(lambda: live._page.input_value("input[placeholder='Your email']")) == "a@b.c"
+    t0 = _time.monotonic()
+    assert Api._act_browser_fill(api, "Password|x") is False
+    assert _time.monotonic() - t0 < 2.0
+    assert "no form field matches 'Password'. Fields on the page: [" in api.last_result_text
+    assert '"Search the site"' in api.last_result_text
+    link = _num(text, "link", "Help")
+    assert Api._act_browser_fill(api, f"{link}|x") is False
+    assert f'[{link}] link "Help" is not a form field.' in api.last_result_text
+
+
+# ============================================================
+# BROWSER LIST SPEED AND EMPTY PAGES
+# ============================================================
+
+# A very large page (shop-like: hidden menus, product cards, shadow roots,
+# frames) lists within its budget with the same items; an empty list gets one
+# short wait and one more read, then says what is likely (blocked, still
+# loading, iframe, text only, blank). Local fixtures only.
+
+def _big_dom(cards=400, menu=1500, shadow=20, frames=4, footer=200):
+    h = ["<title>Big shop</title><style>.card{cursor:pointer;display:inline-block;width:220px;"
+         "margin:4px;vertical-align:top}.menu{display:none}</style><header><nav>"
+         "<input type='search' placeholder='Search the shop'><button>Go</button>"]
+    h += [f"<a href='/c{i}'>Category {i}</a> " for i in range(30)]
+    h.append("<div class='menu'>" + "".join(f"<a href='/m{i}'>Menu item {i}</a>"
+                                           for i in range(menu)) + "</div></nav></header><main>")
+    for i in range(cards):
+        badge = "<span>Sponsored</span>" if i % 9 == 0 else ""
+        h.append(f"<div class='card' onclick=''><div>{badge}<a href='/p{i}'><img alt='Product {i} "
+                 f"photo' width='200' height='120'></a></div><h2><a href='/p{i}'><span>Product "
+                 f"number {i}</span></a></h2><div><span>${i}.99</span></div><div><span "
+                 f"style='cursor:pointer'>See options</span></div><button>Add to cart {i}</button>"
+                 "<div><div><span>Ships soon</span></div></div></div>")
+    h += [f"<x-row data-n='{i}'></x-row>" for i in range(shadow)]
+    h += [f"<iframe src='/bigframe.html?{i}' width='600' height='300'></iframe>" for i in range(frames)]
+    h.append("</main><footer>" + "".join(f"<a href='/f{i}'>Footer link {i}</a> " for i in range(footer))
+             + "</footer><script>customElements.define('x-row',class extends HTMLElement{"
+             "constructor(){super();const n=this.dataset.n;this.attachShadow({mode:'open'})."
+             "innerHTML=Array.from({length:10},(_,j)=>`<button>Shadow ${n}-${j}</button>`)"
+             ".join('');}})</script>")
+    return "".join(h)
+
+
+FIXTURE_PAGES.update({
+    "/bigdom.html": _big_dom(),
+    "/bigframe.html": "<title>F</title>" + "".join(f"<a href='/x{j}'>Frame link {j}</a> "
+                                                   for j in range(200)),
+    # Content added by a timer 2.5 s after load (no request to wait for).
+    "/lateslow.html": "<title>Late timer</title><main id='m'><p>Loading results</p></main><script>"
+                      "setTimeout(()=>{for(let i=0;i<3;i++){const a=document.createElement('a');"
+                      "a.href='/a.html';a.textContent='Late link '+i;document.getElementById('m')"
+                      ".append(a);}},2500)</script>",
+    "/onlyframe.html": "<title>Framed</title><iframe src='{other}/framed_text.html' style='position:"
+                       "fixed;inset:0;width:100%;height:100%;border:0'></iframe>",
+    "/framed_text.html": "<title>Inner</title><p>Only text lives in this frame, nothing to click.</p>",
+    "/challenge.html": "<title>Just a moment...</title><p>Checking your browser before accessing "
+                       "the site. This takes a few seconds.</p>",
+    "/blank.html": "<title>Empty</title><body></body>",
+    "/textonly.html": "<title>Essay</title><main><p>" + "A long essay paragraph. " * 40
+                      + "</p><a href='/a.html'>One link</a></main>",
+})
+
+
+def test_elements_results_are_json_strings_or_dicts():
+    assert bs.decode_elements_read('{"items": [1]}') == {"items": [1]}
+    assert bs.decode_elements_read({"items": []}) == {"items": []}
+    assert bs.decode_elements_read("not json") == {} and bs.decode_elements_read(None) == {}
+
+
+def test_the_list_timing_line_is_counts_and_milliseconds_only():
+    main = {"tm": {"walk": 2, "overlays": 3, "scan": 30, "prune": 31, "ads": 33, "items": 50},
+            "_ms": 60, "nodes": 9000, "cands": 750, "items": [{"n": "Secret name"}] * 3}
+    line = bs._list_timing_line([(None, main, (0, 0), False), (None, {"_ms": 20}, (0, 0), False)],
+                                0.0, 0.1, 0.105, 0.11)
+    assert line.startswith("[Browser] list timing: read 100 ms (main 60: walk 2, overlays 1, "
+                           "scan 27, prune 1, ads 2, items 17; 1 frame(s) 20)")
+    assert "nodes 9000, candidates 750, kept 3" in line and "Secret" not in line
+
+
+def test_counted_only_items_join_the_below_and_above_counts():
+    e = {"r": "link", "n": "A", "v": 1, "l": "main", "num": 1, "order": (0, 0)}
+    text, n = bs.format_element_list(([], [e], [], [], []), extra=(5, 2))
+    assert n == 1 and "5 more below the fold" in text and "2 above (scrolled past)" in text
+    assert "below the fold" not in bs.format_element_list(([], [e], [], [], []))[0]
+
+
+def test_a_sparse_list_is_empty_or_one_item_with_nothing_off_screen():
+    one = [{"v": 1}]
+    assert bs.list_is_sparse(([], [], [], [], []))
+    assert bs.list_is_sparse(([], one, [], [], []))
+    assert not bs.list_is_sparse(([], one * 2, [], [], []))
+    assert not bs.list_is_sparse(([], [], [], one, []))
+    assert not bs.list_is_sparse(([], [], [], [], []), extra=(3, 0))
+
+
+@pytest.mark.parametrize("url, diag, kw, want", [
+    ("https://x/", {"title": "Just a moment...", "text": "Checking your browser before you go"}, {},
+     "blocked"),
+    ("https://x/", {"text": "Verify you are human"}, {"loading": True}, "blocked"),
+    ("https://x/", {"rs": "loading", "text": ""}, {}, "loading"),
+    ("https://x/", {"rs": "complete", "text": ""}, {"pending": 1}, "loading"),
+    ("https://x/", {"rs": "complete", "text": "", "frames": [{"share": 0.9, "src": "https://y/f"}]},
+     {}, "iframe"),
+    ("https://x/", {"rs": "complete", "text": ""}, {"unreadable": 1}, "iframe"),
+    ("https://x/", {"rs": "complete", "text": "word " * 100, "tl": 500}, {}, "text"),
+    ("https://x/", {"rs": "complete", "text": "word " * 20, "tl": 100}, {"listed": 1}, "small"),
+    ("https://x/", {"rs": "complete", "text": ""}, {}, "blank"),
+])
+def test_an_empty_list_names_its_likely_cause(url, diag, kw, want):
+    assert bs.empty_list_kind(url, diag, **kw)[0] == want
+
+
+def test_the_empty_list_message_has_the_mark_title_excerpt_and_next_step():
+    msg = bs.empty_list_message("iframe", {"title": "Framed page", "text": "Inner   text " * 40},
+                                "https://y.example/frame")
+    lines = msg.splitlines()
+    assert lines[0].startswith(f"{config.BROWSER_EMPTY_LIST_MARK} (iframe): ")
+    assert "https://y.example/frame" in lines[0]
+    assert lines[1] == 'Page title: "Framed page".'
+    assert lines[2].startswith('Text on the page: "Inner text Inner text') and len(lines[2]) < 240
+    assert lines[3].startswith("Next step: browser_navigate the frame's address")
+    blank = bs.empty_list_message("blank", {"title": "", "text": ""})
+    assert "Text on the page" not in blank and "Next step:" in blank
+
+
+def test_interstitial_bot_checks_count_as_block_pages():
+    for text in ("Checking if the site connection is secure", "Performing security verification",
+                 "Please enable JavaScript and cookies to continue", "Press & Hold to confirm"):
+        assert config.blocked_page_reason("https://x/", "", text), text
+    assert config.blocked_page_reason("https://x/", "Recipes", "A normal page about bread.") is None
+
+
+def test_live_a_large_page_lists_within_budget_and_counts_the_rest(live, capsys):
+    import time as _time
+    live.navigate(live.base + "/bigdom.html")
+    live.elements_text()                                       # warm-up
+    t0 = _time.perf_counter()
+    text = live.elements_text()
+    took = _time.perf_counter() - t0
+    assert took < 1.5, took                                    # ~0.2-0.5 s here; was 0.45-0.8 s
+    assert '"Product number 0"' in text and "more below the fold" in text
+    log = capsys.readouterr().out
+    assert "[Browser] list timing: read " in log and "candidates" in log
+    timing = [ln for ln in log.splitlines() if "list timing" in ln]
+    assert timing and not any("Product" in ln or "Category" in ln for ln in timing)
+
+
+def test_live_the_bottom_of_a_large_page_is_listed(live):
+    live.navigate(live.base + "/bigdom.html")
+    live.scroll("bottom")
+    text = live.elements_text()
+    # Deep in the DOM, past the scan cap, but on screen: kept and numbered
+    # (the 60 shown lines go to the frames' links in Main content first).
+    footer = [e for e in live._entries if e["n"] == "Footer link 199"]
+    assert footer and footer[0]["v"] and footer[0]["num"]
+    assert "above (scrolled past)" in text
+
+
+def test_live_a_late_rendered_page_is_listed_after_one_wait(live, capsys):
+    live.navigate(live.base + "/lateslow.html")
+    text = live.elements_text()
+    assert '"Late link 0"' in text and config.BROWSER_EMPTY_LIST_MARK not in text
+    assert "element list retried after" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("path, kind", [("/onlyframe.html", "iframe"), ("/challenge.html", "blocked"),
+                                        ("/blank.html", "blank"), ("/textonly.html", "text")])
+def test_live_an_empty_list_says_what_is_likely(live, monkeypatch, capsys, path, kind):
+    monkeypatch.setattr(bs, "EMPTY_WAIT_S", 0.8)
+    live.navigate(live.base + path)
+    text = live.elements_text()
+    assert f"{config.BROWSER_EMPTY_LIST_MARK} ({kind}):" in text and "Next step:" in text
+    assert "Page title:" in text
+    if kind == "iframe":
+        assert "framed_text.html" in text
+    assert f"element list empty after a retry ({kind})" in capsys.readouterr().out
+
+
+def test_live_a_still_loading_empty_page_says_so(live, monkeypatch):
+    monkeypatch.setattr(bs, "NAV_TIMEOUT_MS", 3000)
+    monkeypatch.setattr(bs, "EMPTY_WAIT_S", 0.5)
+    live.navigate(live.base + "/slowtext.html")
+    text = live.elements_text()
+    assert f"{config.BROWSER_EMPTY_LIST_MARK} (loading):" in text
+    assert "Plain text that arrived" in text                   # the excerpt
+
+
+def test_live_a_small_page_with_one_link_is_not_called_empty(live):
+    live.navigate(live.base + "/a.html")
+    text = live.elements_text()
+    assert '"Back to links"' in text and config.BROWSER_EMPTY_LIST_MARK not in text
+
+
+def test_live_a_page_changing_click_lists_the_new_page_once(live):
+    live.navigate(live.base + "/links.html")
+    num = _num(live.elements_text(), "link", "Alpha page")
+    api = _live_api(live)
+    calls = []
+    real = live._collect
+    live._collect = lambda *a, **k: calls.append(1) or real(*a, **k)
+    try:
+        assert Api._act_browser_click(api, str(num)) is True
+    finally:
+        del live._collect
+    assert "the page changed" in api.last_result_text and '"Back to links"' in api.last_result_text
+    assert calls == [1]
+
+
+# -- Page text size: the main content first, with how much is left -----------
+
+FIXTURE_PAGES["/article.html"] = (
+    "<title>Article</title><header><nav>" + "".join(f"<a href='/n{i}'>Menu {i}</a> "
+                                                    for i in range(80))
+    + "</nav></header><main><h1>The story</h1><p>" + "Story sentence about rivers. " * 200
+    + "</p></main><footer>Footer words</footer>")
+
+
+def test_live_main_text_skips_menus_and_reports_the_full_length(live):
+    live.navigate(live.base + "/article.html")
+    got = live.main_text()
+    assert got["src"] == "main" and got["text"].startswith("The story")
+    assert "Menu 3" not in got["text"] and got["total"] > 5000 and got["body"] > got["total"]
+    live.navigate(live.base + "/b.html")
+    assert live.main_text()["src"] == "body"                  # no <main>: the whole page
+
+
+def test_live_the_navigate_excerpt_is_the_main_content_with_what_is_left(live):
+    api = _live_api(live)
+    assert Api._act_browser_navigate(api, live.base + "/article.html") is True
+    text = api.last_result_text
+    excerpt = text.split("if you need more): ", 1)[1]
+    assert excerpt.startswith("The story Story sentence") and "Menu 3 " not in excerpt[:900]
+    assert "more characters; use browser_get_text to read more]" in excerpt
+
+
+def test_the_step_context_prefers_the_main_content(monkeypatch):
+    from core import live_state
+    from core.agent import AgentLoop
+    loop = AgentLoop(SimpleNamespace(live=SimpleNamespace(snapshot={"open_apps": []})), None)
+    loop.api.browser = SimpleNamespace(running=True, main_text=lambda timeout=2.0: {
+        "title": "Article", "src": "main", "text": "Story sentence. " * 200, "total": 9000,
+        "body": 12000})
+    monkeypatch.setattr(live_state, "foreground_for_reading", lambda: (77, "Article", False))
+    monkeypatch.setattr(live_state, "playwright_window", lambda: 77)
+    monkeypatch.delenv("MISTAI_UIA_FIRST", raising=False)
+    loop._phase_task = "summarise the article"
+    ctx, why = loop._browser_page_context()
+    assert why == "" and "PAGE TEXT (the browser page's main content, DOM text): Story" in ctx
+    sent = ctx.split("DOM text): ", 1)[1]
+    left = int(re.search(r"\[cut, (\d+) more characters; use browser_get_text to read more\]",
+                         sent).group(1))
+    assert 9000 - 1500 - 2 <= left <= 9000 - 1500           # the page's whole main text counts

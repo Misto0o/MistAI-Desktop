@@ -7,6 +7,7 @@ psutil
 python-dotenv     # loads MISTAI_API_KEY / COHERE_API_KEY from .env
 SpeechRecognition
 pyaudio          # needed by SpeechRecognition for microphone input
+audioop-lts; python_version >= "3.13"   # audioop left the stdlib in 3.13 (mic level, [VoiceDiag])
 
 # TTS
 edge-tts

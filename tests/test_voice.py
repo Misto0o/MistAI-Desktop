@@ -68,6 +68,7 @@
 #   61. VOICE TURNS TESTS (2)
 #   62. VOICE TURNS HELPERS (3)
 #   63. VOICE TURNS TESTS (3)
+#   64. VOICE FALLBACK
 #   64. VOICE TURNS HELPERS (4)
 #   65. API ERROR RESULT
 #   66. VOICE TURNS TESTS (4)
@@ -77,6 +78,9 @@
 #   70. VOICE TURNS FAKE TIMER
 #   71. VOICE TURNS HELPERS (7)
 #   72. VOICE TURNS TESTS (6)
+#   73. AUDIO LEVELS
+#   74. AUDIO LEVELS HELPERS
+#   75. AUDIO LEVELS TESTS
 # ============================================================
 
 """Wake word, push-to-talk, voice turns, voice timing and diagnostics."""
@@ -2566,3 +2570,404 @@ def test_the_real_timer_thread_never_outlives_the_task(monkeypatch):
     count = spoken.count("Still working.")
     threading.Event().wait(0.2)
     assert spoken.count("Still working.") == count <= api_mod.HEARTBEAT_MAX
+
+
+# ============================================================
+# AUDIO LEVELS
+# ============================================================
+
+# The orb's audio-reactive core reads two numbers: the open listen's mic level
+# (core/api.py mic_level + _StoppableStream's on_level, reset when the listen
+# ends) and the playing voice's level (core/tts.py rms_envelope +
+# NeuralTTS.level, None for the pyttsx3 fallback); Api.audio_level() returns
+# both. Numbers only: no audio is kept, nothing is logged.
+
+
+# ============================================================
+# AUDIO LEVELS HELPERS
+# ============================================================
+
+def _level_tts():
+    from core import tts as tts_mod
+
+    t = tts_mod.NeuralTTS.__new__(tts_mod.NeuralTTS)
+    t._play, t._fallback_speaking = None, False
+    return t
+
+
+class _FakeSd:
+    """sounddevice stand-in: records play() and lets wait() look at the level."""
+
+    def __init__(self, engine, at):
+        self.engine, self.at, self.played, self.seen = engine, at, [], []
+
+    def play(self, data, rate):
+        self.played.append((data, rate))
+
+    def wait(self):
+        started = self.engine._play[1]
+        self.seen = [self.engine.level(now=started + t) for t in self.at]
+
+    def stop(self, ignore_errors=True):
+        pass
+
+
+# ============================================================
+# AUDIO LEVELS TESTS
+# ============================================================
+
+@pytest.mark.parametrize("rms, width, want", [
+    (0, 2, 0.0), (-5, 2, 0.0), (10, 2, 0.0),                # silence and room noise
+    (32767, 2, 1.0), (6000, 2, 1.0),                          # loud speech is clamped
+    (None, 2, 0.0), (100, "x", 0.0),
+])
+def test_mic_level_maps_rms_to_zero_to_one(rms, width, want):
+    from core.api import mic_level
+
+    assert mic_level(rms, width) == pytest.approx(want)
+
+
+def test_mic_level_is_linear_in_dbfs_between_floor_and_top():
+    import math
+    from core import api as api_mod
+
+    mid_db = (api_mod.MIC_LEVEL_FLOOR_DB + api_mod.MIC_LEVEL_TOP_DB) / 2
+    rms = 32768 * 10 ** (mid_db / 20)
+    assert api_mod.mic_level(rms, 2) == pytest.approx(0.5, abs=1e-3)
+    assert 0 < api_mod.mic_level(rms / 4, 2) < 0.5 < api_mod.mic_level(rms * 2, 2) < 1
+    assert api_mod.mic_level(rms * 256, 3) == pytest.approx(0.5, abs=1e-3)   # 24-bit
+    assert not math.isnan(api_mod.mic_level(1e-300, 2))
+
+
+def test_the_proxy_reports_each_chunk_level_and_zero_on_close():
+    levels = []
+    real = _Stream("qLq")
+    rec = sr.Recognizer()
+    rec.energy_threshold = 300
+    p = _StoppableStream(real, threading.Event(), rec, 2, on_level=levels.append)
+    for _ in range(3):
+        p.read(1024)
+    assert levels == [0.0, 1.0, 0.0] and p.speech is True     # speech detection unchanged
+    p.close()
+    assert levels[-1] == 0.0 and real.closed
+
+
+def test_a_failing_level_callback_never_breaks_the_listen():
+    def boom(_v):
+        raise RuntimeError("x")
+
+    rec = sr.Recognizer()
+    rec.energy_threshold = 300
+    p = _StoppableStream(_Stream("L"), threading.Event(), rec, 2, on_level=boom)
+    assert p.read(1024) == LOUD and p.speech is True
+    p.close()
+
+
+def test_a_push_to_talk_listen_sets_the_level_and_resets_it_after(monkeypatch):
+    seen = []
+    api = _second_press_api(monkeypatch, [], heard=["open notepad"])
+    stream = _Stream("qqLLLLLLLL", press_at=5, press=lambda: seen.append(api.mic_level_now()))
+    api.microphone.streams = [stream]
+    assert api.mic_level_now() == 0.0
+    api.push_to_talk()
+    assert seen == [1.0]                          # read 5 sees chunk 4 (speech)
+    assert api.mic_level_now() == 0.0             # the listen is over
+    assert api.audio_level()["mic"] == 0.0
+
+
+def test_a_failed_listen_resets_the_level(monkeypatch):
+    api = _second_press_api(monkeypatch, [])
+    api._set_mic_level(0.8)
+
+    def broken(*_a, **_k):
+        raise OSError("device gone")
+
+    api.ptt_recognizer.listen = broken
+    api.microphone.streams = [_Stream("LLL")]
+    api.push_to_talk()
+    assert api.mic_level_now() == 0.0
+
+
+def test_the_wake_loop_never_reports_a_level():
+    import inspect
+
+    src = inspect.getsource(Api._google_wake_loop)
+    assert "_StoppableStream" not in src and "_set_mic_level" not in src
+
+
+def test_rms_envelope_is_fifty_windows_a_second_normalized_by_the_loudest():
+    import numpy as np
+    from core.tts import ENVELOPE_HZ, rms_envelope
+
+    rate = 24000
+    step = rate // ENVELOPE_HZ
+    data = np.concatenate([np.zeros(step), 0.5 * np.ones(step), 0.25 * np.ones(step // 2)])
+    assert rms_envelope(data.astype("float32"), rate) == pytest.approx((0.0, 1.0, 0.5))
+    stereo = np.stack([data, data], axis=1).astype("float32")
+    assert rms_envelope(stereo, rate) == pytest.approx((0.0, 1.0, 0.5))
+    assert rms_envelope(np.zeros(step * 2, dtype="float32"), rate) == (0.0, 0.0)
+    assert rms_envelope([], rate) == () and rms_envelope(data, 0) == ()
+
+
+def test_tts_level_follows_the_envelope_while_playing():
+    t = _level_tts()
+    assert t.level() == 0.0                                    # nothing plays
+    t._play = ((0.2, 1.0, 0.4), 100.0)
+    assert t.level(now=100.0) == 0.2
+    assert t.level(now=100.0 + 1.5 / 50) == 1.0
+    assert t.level(now=100.0 + 2.5 / 50) == 0.4
+    assert t.level(now=100.0 + 1.0) == 0.0                     # past the end
+    assert t.level(now=99.0) == 0.0                            # before the start
+    t._fallback_speaking = True
+    assert t.level() is None                                   # pyttsx3: no samples
+
+
+def test_neural_playback_is_unchanged_and_exposes_its_level(monkeypatch):
+    import numpy as np
+    from core import tts as tts_mod
+
+    t = _level_tts()
+    t._cv, t._generation, t._gender = threading.Condition(), 0, "none"
+    t._sounddevice_playing = threading.Event()
+    rate = 1000
+    data = np.concatenate([np.zeros(20), np.ones(20)]).astype("float32")
+    sd = _FakeSd(t, at=(0.0, 0.03))
+
+    class _Comm:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"mp3"}
+
+    monkeypatch.setattr(tts_mod, "edge_tts", SimpleNamespace(Communicate=_Comm), raising=False)
+    monkeypatch.setattr(tts_mod, "sf", SimpleNamespace(read=lambda *_a, **_k: (data, rate)),
+                        raising=False)
+    monkeypatch.setattr(tts_mod, "sd", sd)
+    t._neural("hello", 0)
+    assert len(sd.played) == 1 and sd.played[0][0] is data and sd.played[0][1] == rate
+    assert sd.seen == [0.0, 1.0]                               # quiet, then the loud half
+    assert t._play is None and t.level() == 0.0                # over: nothing plays
+    assert not t._sounddevice_playing.is_set()
+
+
+def test_the_fallback_voice_has_no_level_while_it_speaks():
+    t = _level_tts()
+    seen = []
+    t._cv, t._generation = threading.Condition(), 0
+    t._engine = SimpleNamespace(say=lambda _x: None,
+                                runAndWait=lambda: seen.append(t.level()))
+    t._engine_failed = False
+    t._fallback("hello", 0)
+    assert seen == [None] and t.level() == 0.0
+
+
+@pytest.mark.parametrize("tts, want", [
+    (None, {"mic": 0.25, "tts": 0.0}),
+    (SimpleNamespace(level=lambda: 0.75), {"mic": 0.25, "tts": 0.75}),
+    (SimpleNamespace(level=lambda: None), {"mic": 0.25, "tts": None}),
+    (SimpleNamespace(speaking=True), {"mic": 0.25, "tts": 0.0}),          # no level()
+])
+def test_audio_level_reports_the_mic_and_the_voice(tts, want):
+    api = Api.__new__(Api)
+    if tts is not None:
+        api.tts = tts
+    api._set_mic_level(0.25)
+    assert api.audio_level() == want
+    api._set_mic_level(7)
+    assert api.audio_level()["mic"] == 1.0                     # clamped
+    api._set_mic_level("bad")
+    assert api.audio_level()["mic"] == 0.0
+
+
+def test_audio_level_never_raises_or_prints(capsys):
+    def boom():
+        raise RuntimeError("x")
+
+    api = Api.__new__(Api)
+    api.tts = SimpleNamespace(level=boom)
+    assert api.audio_level() == {"mic": 0.0, "tts": 0.0}
+    assert capsys.readouterr().out == ""
+
+
+# ============================================================
+# VOICE FALLBACK
+# ============================================================
+
+# comtypes' generated-module cache (the pyttsx3 Windows voice), the one
+# edge-tts retry, the once-only "no voice" message and the dropped count.
+
+def _fake_comtypes(path):
+    return SimpleNamespace(gen_dir="site"), SimpleNamespace(__path__=list(path))
+
+
+def test_comtypes_cache_goes_first_and_becomes_the_write_target(tmp_path):
+    from core import config
+    client, gen = _fake_comtypes(["C:/site/comtypes/gen"])
+    folder = str(tmp_path / "cache")
+    assert config.configure_comtypes_cache(folder, comtypes_client=client, gen_package=gen) == "dir"
+    assert gen.__path__ == [folder, "C:/site/comtypes/gen"] and client.gen_dir == folder
+    assert config.configure_comtypes_cache(folder, comtypes_client=client, gen_package=gen) == "dir"
+    assert gen.__path__ == [folder, "C:/site/comtypes/gen"]               # no duplicate
+
+
+def test_comtypes_cache_falls_back_to_memory_when_nothing_is_writable(tmp_path, monkeypatch):
+    from core import config
+    monkeypatch.setattr(config, "dir_is_writable", lambda _f: False)
+    client, gen = _fake_comtypes(["C:/site/comtypes/gen"])
+    folder = str(tmp_path / "cache")
+    assert config.configure_comtypes_cache(folder, comtypes_client=client, gen_package=gen) == "memory"
+    assert client.gen_dir is None and folder not in gen.__path__
+    client, gen = _fake_comtypes([folder, "C:/site/comtypes/gen"])
+    assert config.configure_comtypes_cache(folder, memory_only=True, comtypes_client=client,
+                                           gen_package=gen) == "memory"
+    assert gen.__path__ == ["C:/site/comtypes/gen"] and client.gen_dir is None
+
+
+def test_writability_is_probed_with_a_real_file_not_os_access(tmp_path, monkeypatch):
+    import tempfile
+    from core import config
+    assert config.dir_is_writable(str(tmp_path)) and os.listdir(tmp_path) == []   # probe removed
+
+    def denied(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(tempfile, "mkstemp", denied)
+    monkeypatch.setattr(os, "access", lambda *_a: True)      # what fooled comtypes
+    assert not config.dir_is_writable(str(tmp_path))
+
+
+def _fallback_tts(monkeypatch, inits, repaired):
+    import sys
+    from core import tts as tts_mod
+    t = tts_mod.NeuralTTS.__new__(tts_mod.NeuralTTS)
+    t._engine, t._engine_failed, t._fallback_warned = None, False, False
+    errors = []
+    t._on_error = errors.append
+    monkeypatch.setattr(tts_mod, "configure_comtypes_cache", lambda **_k: "dir")
+    monkeypatch.setattr(tts_mod, "_repair_speech_cache", lambda: repaired.append(1) or "dir")
+
+    def init():
+        result = inits.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setitem(sys.modules, "pyttsx3", SimpleNamespace(init=init))
+    return t, errors
+
+
+def test_a_broken_speech_cache_is_repaired_and_the_init_retried_once(monkeypatch, capsys):
+    engine = SimpleNamespace(setProperty=lambda *_a: None)
+    repaired = []
+    t, errors = _fallback_tts(monkeypatch, [SyntaxError("bad cache"), engine], repaired)
+    assert t._ensure_engine() is True and t._engine is engine
+    assert repaired == [1] and errors == []
+    out = capsys.readouterr().out
+    assert "init failed (SyntaxError)" in out and "after a cache repair" in out
+    assert "bad cache" not in out                                  # type names only
+
+
+def test_no_working_voice_is_reported_once_with_one_clear_message(monkeypatch):
+    from core import tts as tts_mod
+    repaired = []
+    t, errors = _fallback_tts(monkeypatch, [PermissionError(13, "x"), PermissionError(13, "x")],
+                              repaired)
+    assert t._ensure_engine() is False and t._engine_failed
+    assert t._ensure_engine() is False                             # no second init, no 2nd message
+    assert errors == [tts_mod.NeuralTTS.NO_ENGINE_MESSAGE] and repaired == [1]
+    assert "on screen" in errors[0]
+
+
+def test_the_cache_repair_rebuilds_on_disk_then_in_memory(monkeypatch):
+    from core import tts as tts_mod
+    modes, calls = [], []
+    monkeypatch.setattr(tts_mod, "configure_comtypes_cache",
+                        lambda **k: modes.append(k) or "memory")
+
+    def create(progid):
+        calls.append(progid)
+        if len(calls) == 1:
+            raise PermissionError(13, "denied")
+
+    assert tts_mod._repair_speech_cache(create=create, load=lambda _n: None) == "memory"
+    assert calls == ["SAPI.SpVoice", "SAPI.SpVoice"] and modes == [{"memory_only": True}]
+    assert tts_mod._repair_speech_cache(create=lambda _p: 1 / 0, load=lambda _n: None) == ""
+
+
+def _neural_engine(monkeypatch, results):
+    from core import tts as tts_mod
+    monkeypatch.setattr(tts_mod, "EDGE_TTS_AVAILABLE", True)
+    t = tts_mod.NeuralTTS.__new__(tts_mod.NeuralTTS)
+    t._cv, t._generation, t._neural_down_until = threading.Condition(), 0, 0.0
+    neural, fallback = [], []
+
+    def fake_neural(text, gen, retry=False):
+        neural.append(retry)
+        r = results.pop(0)
+        if r:
+            raise r
+
+    t._neural = fake_neural
+    t._fallback = lambda text, gen: fallback.append(text)
+    return t, neural, fallback
+
+
+def test_edge_tts_is_retried_once_before_the_fallback(monkeypatch):
+    t, neural, fallback = _neural_engine(monkeypatch, [TimeoutError(), None])
+    t._speak_one(0, "hello")
+    assert neural == [False, True] and fallback == [] and t._neural_down_until == 0.0
+    t, neural, fallback = _neural_engine(monkeypatch, [TimeoutError(), OSError()])
+    t._speak_one(0, "hello")
+    assert neural == [False, True] and fallback == ["hello"] and t._neural_down_until > 0
+
+
+def test_the_retry_uses_the_short_timeouts(monkeypatch):
+    from core import tts as tts_mod
+    seen = []
+
+    class _Comm:
+        def __init__(self, text, voice, connect_timeout=None):
+            seen.append(connect_timeout)
+
+        async def stream(self):
+            if False:
+                yield {}
+
+    monkeypatch.setattr(tts_mod, "edge_tts", SimpleNamespace(Communicate=_Comm), raising=False)
+    t = tts_mod.NeuralTTS.__new__(tts_mod.NeuralTTS)
+    t._gender = "none"
+    for retry in (False, True):
+        with pytest.raises(RuntimeError, match="no audio"):
+            t._neural("hi", 0, retry=retry)
+    assert seen == [tts_mod.NeuralTTS.NEURAL_CONNECT_S, tts_mod.NeuralTTS.RETRY_CONNECT_S]
+    assert tts_mod.NeuralTTS.RETRY_TIMEOUT_S < tts_mod.NeuralTTS.NEURAL_TIMEOUT_S
+
+
+def test_dropped_utterances_are_counted():
+    from core import tts as tts_mod
+    t = tts_mod.NeuralTTS.__new__(tts_mod.NeuralTTS)
+    t._cv, t._outstanding, t.dropped, t._q = threading.Condition(), 1, 0, tts_mod.Queue()
+    t._q.put((0, "hello"))
+
+    def no_engine(_gen, _text):
+        raise RuntimeError("no fallback engine")
+
+    t._speak_one = no_engine
+    threading.Thread(target=t._worker, daemon=True).start()
+    assert t.wait_until_done(timeout=5)
+    assert t.dropped == 1 and tts_mod.dropped_count(t) == 1
+    assert tts_mod.dropped_count(SimpleNamespace()) == 0
+    assert tts_mod.dropped_count(SimpleNamespace(dropped=object())) == 0
+
+
+def test_no_engine_is_true_only_when_both_voices_are_down(monkeypatch):
+    from core import tts as tts_mod
+    monkeypatch.setattr(tts_mod, "EDGE_TTS_AVAILABLE", True)
+    t = tts_mod.NeuralTTS.__new__(tts_mod.NeuralTTS)
+    t._engine_failed, t._neural_down_until = False, 0.0
+    assert not t.no_engine
+    t._engine_failed = True
+    assert not t.no_engine                                     # the online voice may still work
+    t._neural_down_until = tts_mod.time.monotonic() + 60
+    assert t.no_engine

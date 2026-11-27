@@ -1715,8 +1715,11 @@ def test_read_tools_have_large_result_limits_and_others_keep_default():
         "list_apps",
     ):
         assert SPECS[name].result_chars == 4000, name
-    assert SPECS["browser_navigate"].result_chars == 1200
-    assert SPECS["browser_search"].result_chars == 1200
+    # browser_* results ending with the element list are READ-sized, so old
+    # lists shrink out of the resent history like other reads.
+    for name in ("browser_navigate", "browser_search", "browser_open", "browser_click",
+                 "browser_elements", "browser_scroll"):
+        assert SPECS[name].result_chars == 8000, name
     assert SPECS["press_key"].result_chars == 300
     assert SPECS["open_app"].result_chars == SPECS["switch_app"].result_chars == 800  # APP_NOTES room
 
@@ -1826,9 +1829,9 @@ def test_only_the_two_newest_read_results_stay_full(monkeypatch):
         [
             ("run_command", "a", "A" * 5000),
             ("inspect_file", "b", "B" * 5000),
-            # 1200-char navigate excerpts are not READ-type and must not
-            # evict a real read from the full window.
-            ("browser_navigate", "c", "C" * 5000),
+            # A non-READ result (800 chars) must not evict a real read from
+            # the full window.
+            ("open_app", "c", "C" * 5000),
             ("run_command", "d", "D" * 5000),
         ],
     )
@@ -1836,7 +1839,7 @@ def test_only_the_two_newest_read_results_stay_full(monkeypatch):
     assert "A" * 300 + " [truncated, 4700 more chars]" in obs[0]
     assert "A" * 301 not in obs[0]
     assert "B" * 4000 + " [truncated, 1000 more chars]" in obs[1]
-    assert "C" * 1200 + " [truncated, 3800 more chars]" in obs[2]
+    assert "C" * 800 + " [truncated, 4200 more chars]" in obs[2]
     assert "D" * 4000 + " [truncated, 1000 more chars]" in obs[3]
     # Before the third read arrived, the first was still full.
     assert "A" * 4000 in _observations(sent[3])[0]

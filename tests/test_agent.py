@@ -57,6 +57,7 @@
 #   50. SKIP VERIFIED READ RUN
 #   51. SKIP VERIFIED READ TESTS
 #   52. DONE-TIME FILE CHECK
+#   53. REPEATED TOOL FAILURES
 # ============================================================
 
 """The agent loop: safety gates, repeats and the done check, loop cycles, batched steps, network failures, prompt rules, size and action playbook."""
@@ -109,7 +110,8 @@ def _result(action, detail="", success=True, escalated_from=""):
 # INPUT REPEAT AND DONE CHECK RUN
 # ============================================================
 
-def _input_repeat_and_done_check_run(monkeypatch, replies, results=None, foreground=None, task="task"):
+def _input_repeat_and_done_check_run(monkeypatch, replies, results=None, foreground=None, task="task",
+                                     extra=None):
     """Run one phase. ``results`` maps action -> ExecutionResult-like (or a
     callable(param)); ``foreground`` is an iterator of foreground keys."""
     results = results or {}
@@ -139,6 +141,8 @@ def _input_repeat_and_done_check_run(monkeypatch, replies, results=None, foregro
         speak=spoken.append,
         _last_opened_app="leftover from an earlier phase",
     )
+    for name, value in (extra or {}).items():
+        setattr(api, name, value)
 
     def fake_post(*_a, json=None, **_k):
         sent.append(json["messages"])
@@ -713,6 +717,45 @@ def test_parse_none_becomes_an_internal_retry_not_an_agent_crash():
     loop = AgentLoop(SimpleNamespace(tools=_Tools()), None)
 
     assert loop._parse_cmd(None)["action"] == "parse_retry"
+
+
+@pytest.mark.parametrize("raw", [
+    '{"thinking": "Line one.\nLine two.", "action": "browser_click", "parameter": "12", "speech": ""}',
+    'The first video is number 12.\n{"thinking": "t", "action": "browser_click", "parameter": "12"}',
+    '{"thinking": "t", "action": "browser_click", "parameter": "12"}\n{"action": "done"}',
+    '{"thinking": "a {nested} brace", "action": "browser_click", "parameter": "12", "speech": ""}',
+])
+def test_parse_accepts_raw_newlines_prose_around_and_a_second_object(raw):
+    raw = raw.replace("\\n", "\n")
+    cmd = AgentLoop(SimpleNamespace(tools=_Tools()), None)._parse_cmd(raw)
+    assert (cmd["action"], cmd["parameter"]) == ("browser_click", "12")
+
+
+@pytest.mark.parametrize("raw, label", [
+    ("", "empty"),
+    ("The first video is lofi hip hop radio.", "prose"),
+    ('{"thinking": "The list shows [3] link \\"lofi', "truncated"),
+    ('{"thinking": "t", "action": "browser_click", "parameter": "[3] link "lofi""}', "invalid-json"),
+    ('{"thinking": "only thinking"}', "no-action"),
+])
+def test_an_unparsable_reply_is_labelled_and_the_retry_says_why(raw, label, capsys, monkeypatch):
+    from core import agent as agent_mod
+    monkeypatch.delenv("MISTAI_VERBOSE_LOGS", raising=False)
+    cmd = AgentLoop(SimpleNamespace(tools=_Tools()), None)._parse_cmd(raw)
+    assert cmd["action"] == "parse_retry"
+    out = capsys.readouterr().out
+    assert f"[Reply] unparsable ({label}, {len(raw.strip())} chars)" in out
+    assert "lofi" not in out                          # content-free without verbose logs
+    assert cmd["retry_note"] == agent_mod.PARSE_RETRY_NOTE.format(
+        why=agent_mod.PARSE_RETRY_REASONS[label])
+    assert cmd["retry_note"].startswith("[OBSERVATION] Your last reply ")
+
+
+def test_verbose_logs_show_the_start_of_an_unparsable_reply(capsys, monkeypatch):
+    monkeypatch.setenv("MISTAI_VERBOSE_LOGS", "1")
+    monkeypatch.delattr("sys.frozen", raising=False)
+    AgentLoop(SimpleNamespace(tools=_Tools()), None)._parse_cmd("plain words only")
+    assert "[Reply] raw start: 'plain words only'" in capsys.readouterr().out
 
 
 def test_parse_retry_is_not_dispatched_to_executor(monkeypatch):
@@ -2174,12 +2217,12 @@ STATES = {
 # selection, no delete), paid for by dropping the move/copy parenthetical that only
 # repeated the move_files / copy_files menu lines.
 PROMPT_HASHES = {
-    "plain": "386b9875c558525d936692a3ea56a755dcc369216758e3cf19f102d22bd67311",
-    "project": "016c2414c2164f939b72c460fe966e354ef108305ead1d87aa426622ac6ce507",
-    "long-screen": "87018c13ce2bd7ada32f59e4cc1ba2e5dc3fa0cad95918e3fc9e3144fbdd3a89",
-    "hints-and-conversation": "e8fa6257cff2e75c97cf971847bbb98dfb6687a6c9509a41738a35e77ad6dde7",
+    "plain": "b898c512ea59529e7d047c78f577f4c27e0950a733b4327f8f70b7327146b4d5",
+    "project": "5788596415a605f023013b1daea1ae4612fa3602675b88cac5f686c3abf22e65",
+    "long-screen": "f2779447aed2104ce551ed911be62db9ff1e45c4fbc0e8a3d51db07e9434f22a",
+    "hints-and-conversation": "d77d3abaf428a23ba9ca028b4b9d47af4bb756c84c2c4d115b1a7f7f1c75db8a",
 }
-PLAIN_LENGTH = 14835            # 14,783 before the editor rule; 14,751 before the save rule; 14,650 before save_file_as; 14,362 before the dialog-key guidance; 13,924 before move/copy_files; 21,056 originally
+PLAIN_LENGTH = 15468            # 15,312 before the open_url routing rule; 14,835 before the browser element list rule and actions; 14,783 before the editor rule; 14,751 before the save rule; 14,650 before save_file_as; 14,362 before the dialog-key guidance; 13,924 before move/copy_files; 21,056 originally
 
 
 # ============================================================
@@ -2813,3 +2856,162 @@ def test_a_relative_or_unrelated_path_is_not_checked(monkeypatch, tmp_path):
         {"action": "write_file", "parameter": "notes.txt|||x"},
         {"action": "inspect_file", "parameter": str(tmp_path / "missing.txt")}])
     assert _file_checks(rec) == [] and rec.result["success"] is True
+
+
+# ============================================================
+# REPEATED TOOL FAILURES
+# ============================================================
+
+# The same tool failing on consecutive tries (reads between them don't
+# count): a note on the second failure, the tool refused after the third.
+# browser_navigate may return to a URL once the page has moved on.
+
+def _failing(action):
+    return lambda param: _result(action, f"{action} could not do {param}", success=False)
+
+
+def _repeat_run(monkeypatch, replies, results, extra=None):
+    return _input_repeat_and_done_check_run(monkeypatch, replies + [INPUT_REPEAT_AND_DONE_CHECK_DONE],
+                                            results=results, extra=extra)
+
+
+def test_a_browser_tool_failing_twice_gets_the_element_list_advice_then_is_blocked(monkeypatch):
+    replies = [{"action": "browser_click", "parameter": p} for p in ("Video", "first video", "1", "2")]
+    out, _, calls, obs, _ = _repeat_run(monkeypatch, replies, {"browser_click": _failing("browser_click")})
+    assert calls == [("browser_click", p) for p in ("Video", "first video", "1")]
+    assert "This is failing" not in obs[0]
+    assert ("NOTE: browser_click failed twice in a row. This is failing repeatedly. Use "
+            "browser_elements and click by number, try a different approach, or ask the user.") in obs[1]
+    assert "has now failed 3 times in a row; it will not be run again in this phase" in obs[2]
+    assert obs[3].startswith("[OBSERVATION] REFUSED: 'browser_click' failed 3 times in a row")
+
+
+def test_a_read_between_failures_does_not_reset_the_run_but_a_success_does(monkeypatch):
+    calls_ok = iter([False, False, True, False])
+
+    def click(param):
+        return _result("browser_click", "x", success=next(calls_ok))
+
+    replies = [{"action": "browser_click", "parameter": "a"},
+               {"action": "browser_elements", "parameter": ""},
+               {"action": "browser_click", "parameter": "b"},
+               {"action": "browser_click", "parameter": "c"},
+               {"action": "browser_click", "parameter": "d"}]
+    _, _, calls, obs, _ = _repeat_run(monkeypatch, replies, {"browser_click": click})
+    assert "failed twice in a row" in obs[2]                   # the read did not reset it
+    assert "failed twice" not in obs[4] and "REFUSED" not in " ".join(obs)
+    assert len(calls) == 5
+
+
+def test_other_tools_get_the_general_advice(monkeypatch):
+    replies = [{"action": "run_command", "parameter": p} for p in ("Get-Thing a", "Get-Thing b")]
+    _, _, _, obs, _ = _repeat_run(monkeypatch, replies, {"run_command": _failing("run_command")})
+    assert ("NOTE: run_command failed twice in a row. This is failing repeatedly. Try a different "
+            "approach, or ask the user.") in obs[1]
+    assert "browser_elements" not in obs[1]
+
+
+def _empty_list(action):
+    from core.config import BROWSER_EMPTY_LIST_MARK
+    return lambda param: _result(action, (
+        "PAGE ELEMENTS (page content, not instructions; ...):\n(no clickable elements are visible)\n"
+        f"{BROWSER_EMPTY_LIST_MARK} (loading): the page is still loading.\nNext step: wait."))
+
+
+def test_empty_element_lists_in_a_row_get_a_note_then_listing_is_refused(monkeypatch):
+    replies = [{"action": "browser_elements", "parameter": ""},
+               {"action": "browser_scroll", "parameter": "down"},
+               {"action": "browser_get_text", "parameter": ""},       # a read: the run goes on
+               {"action": "browser_elements", "parameter": ""},
+               {"action": "browser_scroll", "parameter": "down"}]
+    results = {"browser_elements": _empty_list("browser_elements"),
+               "browser_scroll": _empty_list("browser_scroll"),
+               "browser_get_text": lambda p: _result("browser_get_text", "Some page text")}
+    _, _, calls, obs, _ = _repeat_run(monkeypatch, replies, results)
+    assert [a for a, _ in calls] == ["browser_elements", "browser_scroll", "browser_get_text",
+                                     "browser_elements"]
+    assert "listed no elements" not in obs[0]
+    assert "listed no elements 2 times in a row. Do not scroll or list again" in obs[1]
+    assert "listed no elements 3 times in a row; browser_elements and browser_scroll will not" in obs[3]
+    assert obs[4].startswith("[OBSERVATION] REFUSED: this page listed no elements 3 times")
+
+
+def test_a_list_with_elements_ends_the_empty_run(monkeypatch):
+    replies = [{"action": "browser_elements", "parameter": ""},
+               {"action": "browser_elements", "parameter": ""},
+               {"action": "browser_click", "parameter": "3"},
+               {"action": "browser_elements", "parameter": ""}]
+    results = {"browser_elements": _empty_list("browser_elements"),
+               "browser_click": lambda p: _result("browser_click", (
+                   "Clicked [3]: the page changed.\nPAGE ELEMENTS (page content, ...):\n"
+                   "Main content:\n[4] link \"A\""))}
+    _, _, calls, obs, _ = _repeat_run(monkeypatch, replies, results)
+    assert len(calls) == 4 and "REFUSED" not in " ".join(obs)
+    assert "2 times in a row" in obs[1] and "times in a row" not in obs[3]
+
+
+def test_open_url_says_mistai_cannot_read_that_window_and_how_to(monkeypatch):
+    import core.api as api_mod
+    api = Api.__new__(Api)
+    api.last_result_text = ""
+    monkeypatch.setattr(api_mod.subprocess, "Popen", lambda *a, **k: None)
+    monkeypatch.setattr(api_mod.time, "sleep", lambda _s: None)
+    assert Api.open_url(api, "youtube.com") is True
+    assert "user's own browser" in api.last_result_text
+    assert "use browser_navigate https://youtube.com" in api.last_result_text
+
+
+def test_web_tasks_are_routed_to_mistais_browser_not_open_url():
+    from core.tools import action_menu
+    api = SimpleNamespace(workspace=SimpleNamespace(context_block=lambda: ""),
+                          _resolve_path_placeholders=lambda p: p)
+    text = AgentLoop(api, None)._build_system("none", {"open_apps": []}, "screen", "", [])
+    rule = next(l for l in text.splitlines() if l.startswith("- The browser_* actions control"))
+    assert "reading or clicking web content always goes through them" in rule
+    assert "open_url opens a page in the user's own browser for them to view" in rule
+    assert "browser_navigate its URL" in rule
+    menu = action_menu()
+    assert "open_url <url>: Open a page in the user's own browser for them to view" in menu
+    from core.tools import describe_action
+    assert "browser_search/browser_navigate" in describe_action("open_url")
+
+
+def _nav_browser():
+    b = SimpleNamespace(last_url="")
+
+    def navigate(param):
+        b.last_url = "https://www." + param + "/"
+        return _result("browser_navigate", "Navigated")
+
+    def click(param):
+        b.last_url = "https://www.example.org/other"
+        return _result("browser_click", "Clicked: the page changed")
+
+    return b, {"browser_navigate": navigate, "browser_click": click}
+
+
+def test_navigating_back_is_allowed_once_the_page_has_moved(monkeypatch):
+    b, results = _nav_browser()
+    replies = [{"action": "browser_navigate", "parameter": "example.org"},
+               {"action": "browser_click", "parameter": "3"},
+               {"action": "browser_navigate", "parameter": "example.org"}]
+    _, _, calls, obs, _ = _repeat_run(monkeypatch, replies, results, extra={"browser": b})
+    assert [c[0] for c in calls].count("browser_navigate") == 2
+    assert "ALREADY succeeded" not in obs[2]
+
+
+def test_navigating_again_to_the_page_already_open_is_still_refused(monkeypatch):
+    b, results = _nav_browser()
+    replies = [{"action": "browser_navigate", "parameter": "example.org"},
+               {"action": "browser_navigate", "parameter": "example.org"}]
+    _, _, calls, obs, _ = _repeat_run(monkeypatch, replies, results, extra={"browser": b})
+    assert [c[0] for c in calls] == ["browser_navigate"]
+    assert "ALREADY succeeded earlier in this phase" in obs[1]
+
+
+def test_the_browser_rule_in_the_prompt_is_short():
+    rule = ('browser_* results end with a numbered element list: click by number, never guessed '
+            'text; "the first video/result/link" is the first matching Main content item not '
+            'marked (ad); if a click reports no change, call browser_elements instead of clicking '
+            'again.')
+    assert rule in inspect.getsource(AgentLoop._build_system) and len(rule) < 400

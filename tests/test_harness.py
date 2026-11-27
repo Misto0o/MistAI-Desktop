@@ -1717,11 +1717,14 @@ def test_needs_skip_with_a_reason_in_stub_and_run_for_real(tmp_path, monkeypatch
 def test_bundled_realistic_tier_order_gates_and_stub_skips(tmp_path, monkeypatch):
     real = rs.load_scenarios(SCENARIOS)[11:]
     assert all("realistic" in s["tags"] and s.get("stub") for s in real)
-    kinds = ["notepad" if "ui_input" in s["tags"] else "browser" if s.get("needs") else "file"
+    kinds = ["browser-ui" if "ui_input" in s["tags"] and s.get("needs") else
+             "notepad" if "ui_input" in s["tags"] else "browser" if s.get("needs") else "file"
              for s in real]
-    assert kinds == ["file"] * 8 + ["browser"] * 3 + ["notepad"] * 2     # files, browser, Notepad
+    # files, browser, Notepad, then the YouTube click-through (real browser, --allow-ui-input)
+    assert kinds == ["file"] * 8 + ["browser"] * 3 + ["notepad"] * 2 + ["browser-ui"]
     by = {s["name"]: s for s in real}
     assert by["rt-search-fact"]["needs"] == ["network", "browser"]
+    assert by["rt-youtube-first-video"]["expect"]["browser_url_contains"] == "/watch"
     assert all({"serve_tmp": True} in by[n]["setup"] and "{tmp_url}" in by[n]["prompt"]
                for n in ("rt-browser-read-price", "rt-browser-follow-link"))
     assert by["rt-delete-matching"]["answers"] == ["yes"] * 3
@@ -1730,7 +1733,7 @@ def test_bundled_realistic_tier_order_gates_and_stub_skips(tmp_path, monkeypatch
     _, recs, _ = _main(tmp_path, SCENARIOS, "--stub", "--tag", "realistic", api=_FakeApi())
     assert set(recs) == set(by)
     for name, kind in zip(by, kinds):
-        if kind == "notepad":
+        if kind in ("notepad", "browser-ui"):
             assert recs[name]["failures"] == ["tagged ui_input; pass --allow-ui-input to run"]
         elif kind == "browser":
             assert recs[name]["status"] == "SKIP" and "run without --stub" in recs[name]["failures"][0]
@@ -1887,3 +1890,13 @@ def test_rt_tip_math_accepts_equivalent_formats_and_still_fails_a_wrong_amount()
     for bad in ("An 18 percent tip on $64.50 is $11.70.", "The tip is $1,161.",
                 "The tip is $11.", "I could not work it out.", "Your total is $76.11."):
         assert rs.check_desktop(expect, _outcome(ran, bad)), bad
+
+
+def test_browser_url_contains_checks_where_mistais_browser_ended():
+    outcome = {"success": True, "speech": "", "log": "", "questions": [],
+               "parsed": {"actions": [], "steps": [], "executed": []},
+               "end_state": {"browser_url": "https://www.youtube.com/watch?v=abc"}}
+    assert rs.check_desktop({"browser_url_contains": "/watch"}, outcome) == []
+    outcome["end_state"]["browser_url"] = "https://www.youtube.com/results?search_query=x"
+    assert rs.check_desktop({"browser_url_contains": "/watch"}, outcome) == [
+        "MistAI's browser did not end on a page containing '/watch'"]

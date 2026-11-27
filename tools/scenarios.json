@@ -1364,6 +1364,50 @@
           }
         ]
       }
+    },
+    {
+      "name": "rt-youtube-first-video",
+      "type": "desktop",
+      "tags": [
+        "realistic",
+        "ui_input"
+      ],
+      "comment": "Real browser and network. YouTube's results change, and some regions show a consent page first, so a failure may be a flake. The stub proves the plumbing only.",
+      "prompt": "search YouTube for lofi hip hop and open the first video",
+      "timeout": 180,
+      "needs": [
+        "network",
+        "browser"
+      ],
+      "stub": [
+        [
+          {
+            "action": "browser_navigate",
+            "parameter": "youtube.com/results?search_query=lofi+hip+hop",
+            "speech": ""
+          },
+          {
+            "action": "browser_click",
+            "parameter": "12",
+            "speech": ""
+          },
+          {
+            "action": "done",
+            "speech": "I opened the first video."
+          }
+        ]
+      ],
+      "expect": {
+        "browser_url_contains": "/watch",
+        "actions_include": [
+          "browser_click"
+        ],
+        "actions_exclude": [
+          "click_on_text",
+          "open_url",
+          "open_app"
+        ]
+      }
     }
   ]
 }

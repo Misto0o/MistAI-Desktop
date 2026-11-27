@@ -74,6 +74,9 @@
 #   67. ORB NINE STATES
 #   68. ORB NINE STATES HELPERS
 #   69. ORB NINE STATES TESTS
+#   70. ORB AUDIO LEVEL AND SHARED LOOK
+#   71. ORB AUDIO LEVEL HELPERS
+#   72. ORB AUDIO LEVEL TESTS
 # ============================================================
 
 """The floating orb: window, states, layout geometry, motion and panels."""
@@ -750,6 +753,8 @@ globalThis.document = {getElementById: () => wrap, addEventListener: () => {}};
 const listeners = {};
 globalThis.window = {addEventListener: (t, fn) => { listeners[t] = fn; }};
 globalThis.setInterval = () => 1;
+const queued = [];                       // the page's next poll, never run by itself
+globalThis.setTimeout = (fn, ms) => { queued.push(ms); return queued.length; };
 globalThis.pywebview = {api: {orb_state: () => Promise.resolve({state: states.shift()})}};
 """ + script + r"""
 (async () => {
@@ -3006,11 +3011,14 @@ def _function(name):
 # ORB STATES TESTS
 # ============================================================
 
-def test_markup_starts_idle_with_the_effect_layers():
-    assert '<div class="orb-wrap" id="orb-wrap" data-state="idle">' in HTML
-    assert '<div class="orb-swirl"></div>' in HTML
-    assert HTML.count('class="orb-ripple') == 2
-    assert 'id="orb"' in HTML and 'id="wave"' in HTML          # what the page already used
+def test_markup_starts_idle_with_the_shared_layers():
+    from ui.html import orb_layers
+
+    assert '<div class="orb-wrap" id="orb-wrap" data-state="idle" data-level="live">' in HTML
+    assert orb_layers("orb") in HTML                               # the floating orb's layers
+    assert '<div class="disc" id="orb"></div>' in HTML            # what the page already used
+    assert HTML.count('class="ripple') == 2 and HTML.count('class="ring') == 2
+    assert 'id="wave"' not in HTML and "flashWave" not in HTML    # replaced by the state looks
 
 
 @pytest.mark.parametrize("state", ["listening", "thinking", "speaking"])
@@ -3019,20 +3027,35 @@ def test_each_active_state_has_its_own_effect(state):
 
 
 def test_reduced_motion_stops_every_orb_animation_but_keeps_the_state_visible():
+    from ui.html import _orb_still_rules
+
     css = _css()
-    block = css.split("@media (prefers-reduced-motion: reduce){", 1)[1].split("\n}", 1)[0]
+    block = css.split("@media (prefers-reduced-motion: reduce){", 1)[1]
+    assert block.startswith(_orb_still_rules(".orb-wrap") + "}")
     assert "animation:none !important" in block
-    for sel in (".orb,", ".orb-swirl", ".orb-ripple", ".orb-wrap::before", ".orb-wrap::after"):
-        assert sel in block
-    assert '[data-state="thinking"] .orb-swirl{opacity:.6}' in block
-    assert '[data-state="speaking"] .orb-ripple{opacity:.5' in block
+    assert '[data-state="thinking"] .arc{opacity:1}' in block
+    assert '[data-state="speaking"] .ripple{opacity:.5' in block
+
+
+def test_the_main_orb_has_no_outer_rings_and_draws_nothing_outside_its_circle():
+    from ui.html import orb_css
+
+    css = _css()
+    assert ".orb-wrap::before" not in css and ".orb-wrap::after" not in css
+    assert "ring-spin" not in css and "pulse-hot" not in css
+    shared = orb_css()
+    assert shared in css
+    assert "box-shadow" not in shared and "outline" not in shared
+    # every layer is inset inside the disc (no negative insets)
+    assert not re.search(r"inset:-", shared)
 
 
 def test_the_orb_uses_no_external_resource_or_library():
-    css = _css()
-    orb_css = css[css.index(".orb-swirl{"):css.index("@media (prefers-reduced-motion")]
-    assert not re.search(r"url\(|@import|https?:", orb_css)
-    for name in ("orbState", "setOrb"):
+    from ui.html import ORB_LEVEL_JS, orb_css
+
+    assert not re.search(r"url\(|@import|https?:", orb_css())
+    assert not re.search(r"https?:|import\(|require\(", ORB_LEVEL_JS)
+    for name in ("orbState", "setOrb", "followAudio"):
         assert not re.search(r"https?:|import\(|require\(", _function(name))
 
 
@@ -3421,7 +3444,7 @@ def test_ask_confirmation_sets_and_clears_waiting():
 def test_the_loop_and_api_publish_at_their_choke_points():
     src = inspect.getsource(AgentLoop._loop_steps)
     i = src.index('waiting_scope(self.api, "ask", input_mode, question)')
-    block = src[i:i + 900]
+    block = src[i:i + 1400]
     assert "_get_text_answer(question" in block and "_listen_once(" in block
     j = src.index('with signal_scope(self.api, "reading"):   # vision or UIA')
     assert "self._get_screen_context()" in src[j:j + 200]
@@ -3594,7 +3617,8 @@ globalThis.document = {getElementById: () => wrap, addEventListener: () => {}};
 const listeners = {};
 let poll = null;
 globalThis.window = {addEventListener: (t, fn) => { listeners[t] = fn; }};
-globalThis.setInterval = (fn) => { poll = fn; return 1; };
+globalThis.setInterval = () => 1;
+globalThis.setTimeout = (fn) => { poll = fn; return 1; };    // the next poll
 globalThis.pywebview = {api: {orb_state: () => Promise.resolve(replies.shift())}};
 """ + script + r"""
 (async () => {
@@ -3637,3 +3661,236 @@ def test_the_panel_page_renders_the_status_kinds_display_only(tmp_path, state, t
     if texts is not None:
         assert res["texts"] == texts                       # text exactly as given, as text
         assert res["cls"] == "panel status " + state["kind"]
+
+
+# ============================================================
+# ORB AUDIO LEVEL AND SHARED LOOK
+# ============================================================
+
+# One orb look for both pages (ui/html.py orb_css / orb_layers, built from
+# config.ORB_TINT) with a look for each of the ten states, and an inner core
+# (.heart) that follows the audio level while listening or speaking: the
+# bridge's orb_state() carries "level" then (state_level: the mic, or the
+# voice, None for the fallback voice); the floating orb page polls every
+# ORB_POLL_MS, every ORB_FAST_POLL_MS while listening or speaking; the main
+# page polls Api.audio_level only in those two states. orbLevel smooths the
+# level into --lvl (no requestAnimationFrame in Node: it is written at once).
+
+
+# ============================================================
+# ORB AUDIO LEVEL HELPERS
+# ============================================================
+
+ALL_TEN_STATES = ("idle",) + NINE_STATES
+
+
+def _level_api(ptt=False, speaking=False, busy=False, mic=0.0, tts=0.0):
+    api = _state_api(ptt=ptt, speaking=speaking, busy=busy)
+    api.audio_level = lambda: {"mic": mic, "tts": tts}
+    return api
+
+
+_ORB_POLL_DRIVE = r"""
+const realSetTimeout = setTimeout;
+const replies = %REPLIES%;
+const lv = [];
+const wrap = {dataset: {}, style: {setProperty: (k, v) => lv.push([k, v])}};
+globalThis.document = {getElementById: () => wrap, addEventListener: () => {}};
+const listeners = {};
+globalThis.window = {addEventListener: (t, fn) => { listeners[t] = fn; }};
+globalThis.setInterval = () => { throw new Error('no intervals'); };
+let next = null;
+globalThis.setTimeout = (fn, ms) => { next = [fn, ms]; return 1; };
+const orbState = () => {
+  const r = replies.shift();
+  return r === 'reject' ? Promise.reject(new Error('bridge gone')) : Promise.resolve(r);
+};
+globalThis.pywebview = {api: {orb_state: orbState, talk: () => Promise.resolve({})}};
+%SCRIPT%
+(async () => {
+  const seen = [];
+  const n = replies.length;
+  listeners['pywebviewready']();
+  for (let i = 0; i < n; i++) {
+    await new Promise(r => realSetTimeout(r, 5));
+    const last = lv.length ? lv[lv.length - 1][1] : null;
+    seen.push([wrap.dataset.state, next[1], wrap.dataset.level || '', last]);
+    if (i < n - 1) next[0]();
+  }
+  console.log(JSON.stringify(seen));
+})();
+"""
+
+
+_MAIN_AUDIO_DRIVE = r"""
+const settle = () => new Promise(r => realSetTimeout(r, 5));
+(async () => {
+  for (const fn of listeners['pywebviewready'] || []) fn();
+  await settle();
+  const wrap = document.getElementById('orb-wrap');
+  const lv = [];
+  wrap.style.setProperty = (k, v) => lv.push([k, v]);
+  let n = 0;
+  let reply = {mic: 0.6, tts: 0.3};
+  pywebview.api.audio_level = () => { n++; return Promise.resolve(reply); };
+  const step = async (ms) => { advance(ms); await settle(); };
+  const out = {};
+  setBusy(true); await step(500); await step(500);
+  out.thinking = n;                                       // nothing polled
+  handleListenState('listening', ''); await step(0); await step(80); await step(80);
+  out.listening = n; out.lvlListen = lv[lv.length - 1]; out.levelListen = wrap.dataset.level;
+  handleListenState('idle', ''); await step(80); await step(500);
+  out.afterIdle = n; out.lvlIdle = lv[lv.length - 1];
+  reply = {mic: 0, tts: null};                            // the fallback voice: no level
+  pywebview.api.is_agent_busy = () => Promise.resolve({busy: true, speaking: true});
+  await syncBusy(); await step(0); await step(80);
+  out.speaking = n - out.afterIdle; out.levelSpeak = wrap.dataset.level;
+  pywebview.api.is_agent_busy = () => Promise.resolve({busy: false, speaking: false});
+  await syncBusy(); await step(80); await step(500);
+  out.afterSpeech = n - out.afterIdle; out.state = wrap.dataset.state;
+  console.log(JSON.stringify({out, errors: consoleErrors}));
+})();
+"""
+
+
+# ============================================================
+# ORB AUDIO LEVEL TESTS
+# ============================================================
+
+@pytest.mark.parametrize("kw, want", [
+    ({"ptt": True, "mic": 0.6}, {"state": "listening", "level": 0.6}),
+    ({"speaking": True, "tts": 0.4}, {"state": "speaking", "level": 0.4}),
+    ({"speaking": True, "tts": None}, {"state": "speaking", "level": None}),
+    ({"busy": True, "mic": 0.9, "tts": 0.9}, {"state": "thinking"}),
+    ({}, {"state": "idle"}),
+])
+def test_the_bridge_adds_the_level_while_listening_or_speaking(kw, want):
+    assert fo.OrbBridge(_level_api(**kw)).orb_state() == want
+
+
+def test_the_level_comes_with_the_orbs_own_state_too():
+    api = _sig_api(ptt=True)
+    api.audio_level = lambda: {"mic": 0.3, "tts": 0.0}
+    orb = fo.FloatingOrb(api)
+    orb._win = SimpleNamespace(animations_enabled=lambda: True)
+    assert fo.OrbBridge(api, orb).orb_state() == {"state": "listening", "level": 0.3}
+
+
+def test_state_level_never_raises():
+    def boom():
+        raise RuntimeError("x")
+
+    api = SimpleNamespace(audio_level=boom)
+    assert fo.state_level(api, "listening") == 0.0
+    assert fo.state_level(api, "speaking") is None
+    assert fo.state_level(SimpleNamespace(audio_level=lambda: {}), "listening") == 0.0
+    assert fo.state_level(_level_api(mic=0.5), "thinking") == 0.0
+    assert fo.LEVEL_STATES == ("listening", "speaking")
+
+
+@floating_orb_window_needs_node
+def test_the_orb_page_polls_fast_only_while_listening_or_speaking(tmp_path):
+    from ui.html import ORB_FAST_POLL_MS, ORB_POLL_MS
+
+    script = ORB_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    replies = [{"state": "idle"}, {"state": "listening", "level": 0.5},
+               {"state": "speaking", "level": None}, {"state": "speaking", "level": 0.25},
+               {"state": "thinking"}, {"state": "listening"}, "reject"]
+    f = tmp_path / "orb_poll.js"
+    f.write_text(_ORB_POLL_DRIVE.replace("%REPLIES%", json.dumps(replies))
+                 .replace("%SCRIPT%", script), encoding="utf-8")
+    out = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    slow, fast = ORB_POLL_MS, ORB_FAST_POLL_MS
+    assert (slow, fast) == (500, 80)
+    assert json.loads(out.stdout) == [
+        ["idle", slow, "live", "0.000"],
+        ["listening", fast, "live", "0.500"],
+        ["speaking", fast, "none", "0.000"],          # no level: the core breathes
+        ["speaking", fast, "live", "0.250"],
+        ["thinking", slow, "live", "0.000"],
+        ["listening", fast, "live", "0.000"],         # no level field: rests at 0
+        ["listening", fast, "live", "0.000"],         # a failed poll keeps the state
+    ]
+
+
+@floating_orb_window_needs_node
+def test_the_main_page_polls_audio_only_while_listening_or_speaking(tmp_path):
+    from test_api import _HARNESS
+
+    cfg = {"gender": "female", "set_gender": _real_outputs(), "flags": {"is_dev": False},
+           "fakeTimers": True}
+    prefix = _HARNESS.split("%PAGE%", 1)[0]
+    f = tmp_path / "main_audio.js"
+    f.write_text(prefix.replace("%CONFIG%", json.dumps(cfg)) + _script() + _MAIN_AUDIO_DRIVE,
+                 encoding="utf-8")
+    out = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["errors"] == []
+    o = res["out"]
+    assert o["thinking"] == 0                                   # thinking: no audio polls
+    assert o["listening"] == 3                                  # at once, then every 80 ms
+    assert o["lvlListen"] == ["--lvl", "0.600"] and o["levelListen"] == "live"
+    assert o["afterIdle"] == 3 and o["lvlIdle"] == ["--lvl", "0.000"]   # stopped, core rests
+    assert o["speaking"] == 2 and o["levelSpeak"] == "none"
+    assert o["afterSpeech"] == 2 and o["state"] == "idle"
+
+
+def test_the_level_smoother_is_shared_and_respects_reduced_motion():
+    from ui.html import ORB_LEVEL_JS
+
+    assert ORB_LEVEL_JS in ORB_HTML and ORB_LEVEL_JS in HTML
+    assert "prefers-reduced-motion: reduce" in ORB_LEVEL_JS
+    assert "wrap.dataset.motion==='still'" in ORB_LEVEL_JS
+    assert "requestAnimationFrame" in ORB_LEVEL_JS
+    assert "ATTACK_S=0.05,DECAY_S=0.25" in ORB_LEVEL_JS          # fast attack, slower decay
+    # the orb page never pushes or adds calls: only orb_state and talk
+    assert set(re.findall(r"pywebview\.api\.(\w+)", ORB_HTML)) == {"orb_state", "talk"}
+    assert "evaluate_js" not in ORB_HTML
+
+
+def test_one_shared_look_covers_all_ten_states_on_both_pages():
+    from ui.html import ORB_STATES, orb_css, orb_layers
+
+    assert ORB_STATES == fo.STATES
+    css = orb_css()
+    for state in NINE_STATES:
+        assert f'.orb-wrap[data-state="{state}"]' in css, state
+    assert ".disc{" in css and "breathe" in css                # idle: the disc breathes
+    for page in (HTML, ORB_HTML):
+        assert css in page
+        assert '.orb-wrap[data-state="listening"] .heart' in page
+        assert '[data-level="none"] .heart{animation:heart' in page
+    assert orb_layers() in ORB_HTML and orb_layers("orb") in HTML
+    for state in ALL_TEN_STATES:
+        assert f"'{state}'" in ORB_HTML.split("<script>", 1)[1]
+
+
+def test_the_level_drives_only_the_inner_core_and_stays_inside_the_circle():
+    from ui.html import orb_css
+
+    css = orb_css()
+    rules = {}
+    for sel in (".heart{", ".heart::before{"):
+        i = css.index(sel)
+        rules[sel] = (i, css.index("}", i))
+    uses = [m.start() for m in re.finditer(r"var\(--lvl", css)]
+    assert len(uses) == 2
+    assert all(any(a < u < b for a, b in rules.values()) for u in uses)
+    heart = css[slice(*rules[".heart{"])]
+    glow = css[slice(*rules[".heart::before{"])]
+    assert "inset:24%" in heart and "* .38" in heart            # 52% of the disc, at most 62%
+    assert "transform:scale(calc(" in heart and "opacity:calc(" in glow
+    # compositor-only: the level never feeds a filter (a repaint every frame)
+    assert "filter" not in heart and "filter" not in glow
+    assert "box-shadow" not in css and not re.search(r"inset:-", css)
+
+
+def test_the_shared_still_rules_freeze_the_core_too():
+    from ui.html import _orb_still_rules
+
+    rules = _orb_still_rules(".orb-wrap")
+    assert ".orb-wrap .heart," in rules and ".orb-wrap .heart{transform:scale(.9)" in rules
+    assert ('.orb-wrap[data-motion="still"] .heart{transform:scale(.9)' in
+            _orb_still_rules('.orb-wrap[data-motion="still"]'))

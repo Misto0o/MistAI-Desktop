@@ -616,7 +616,7 @@ class TestUiaFirst:
         loop, understood, _ = self._browser_loop(monkeypatch, page=("T", "word " * 1000))
         ctx = loop._get_screen_context()
         assert understood == []
-        assert "more chars: browser_get_text reads the whole page]" in ctx
+        assert "more characters; use browser_get_text to read more]" in ctx
         assert len(ctx) < AgentLoop.PAGE_TEXT_CHARS + 600
 
     @pytest.mark.parametrize("page, why", [

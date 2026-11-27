@@ -12,14 +12,15 @@
 #   2. ASYNC WINDOW SHOW
 #   3. VOICE ACKNOWLEDGEMENT AND HEARTBEAT SETTINGS
 #   4. STOPPABLE MICROPHONE STREAM
-#   5. BROWSER ACTIONS
-#   6. BROWSER ACTION HANDLERS
-#   7. SYSTEM UTILITIES
-#   8. SYSTEM ACTION HANDLERS
-#   9. WINDOW ACTIONS
-#   10. WINDOW ACTION HANDLERS
-#   11. SAVE AS DIALOG HANDLER
-#   12. API CLASS
+#   5. MICROPHONE LEVEL
+#   6. BROWSER ACTIONS
+#   7. BROWSER ACTION HANDLERS
+#   8. SYSTEM UTILITIES
+#   9. SYSTEM ACTION HANDLERS
+#   10. WINDOW ACTIONS
+#   11. WINDOW ACTION HANDLERS
+#   12. SAVE AS DIALOG HANDLER
+#   13. API CLASS
 # ============================================================
 
 """
@@ -31,6 +32,7 @@ wired together.
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -51,6 +53,8 @@ import speech_recognition as sr
 from .agent import NOT_VISIBLE_ON_SCREEN, AgentLoop
 from .config import (
     app_note,
+    BROWSER_NOTE,
+    browser_seed_profile_enabled,
     SAVE_BOX_POLL_S,
     SAVE_NAME_BOX_WAIT_S,
     spelled_key_name,
@@ -106,6 +110,7 @@ from .config import (
     verbose_logs,
     voice_diag_enabled,
 )
+from .browser_session import NAV_TIMEOUT_MS
 from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler, EnhancedUIANavigator
 from . import planner as conversation, workspace as file_search, live_state as clip
@@ -115,7 +120,7 @@ from .floating_orb import signal_scope, waiting_scope
 from .memory import Memory, recall_builtin, TaskStore
 from .screen import WindowWatch, CohereVision
 from .tools import ToolRegistry
-from .tts import NeuralTTS, VoiceTimer, WakeCalibration
+from .tts import NeuralTTS, VoiceTimer, WakeCalibration, dropped_count as _tts_dropped
 from .workspace import Workspace
 
 # ============================================================
@@ -198,28 +203,70 @@ class _StoppableStream:
     set, so a second press ends the listen within one chunk. It notes whether
     any chunk was loud enough to count as speech -- listen()'s own test,
     against the recognizer's current energy_threshold. close() passes
-    through, so Microphone.__exit__ closes the real stream."""
+    through, so Microphone.__exit__ closes the real stream. on_level
+    (optional) gets each chunk's normalized level (mic_level) and 0.0 when
+    the stream closes; it is never asked to do anything else."""
 
-    def __init__(self, stream, stop, rec, sample_width):
+    def __init__(self, stream, stop, rec, sample_width, on_level=None):
         import audioop
 
         self._stream, self._stop, self._rec = stream, stop, rec
         self._width, self._rms = sample_width, audioop.rms
+        self._on_level = on_level
         self.speech = False
 
     def read(self, size):
         if self._stop.is_set():
             return b""
         buf = self._stream.read(size)
-        if buf and not self.speech:
+        if buf and (not self.speech or self._on_level is not None):
             try:
-                self.speech = self._rms(buf, self._width) > self._rec.energy_threshold
+                rms = self._rms(buf, self._width)
             except Exception:
-                pass
+                rms = None
+            if rms is not None:
+                if not self.speech:
+                    try:
+                        self.speech = rms > self._rec.energy_threshold
+                    except Exception:
+                        pass
+                self._report(mic_level(rms, self._width))
         return buf
 
+    def _report(self, level):
+        if self._on_level is not None:
+            try:
+                self._on_level(level)
+            except Exception:
+                pass
+
     def close(self):
+        self._report(0.0)
         return self._stream.close()
+
+
+# ============================================================
+# MICROPHONE LEVEL
+# ============================================================
+
+MIC_LEVEL_FLOOR_DB = -50.0    # dBFS that reads as 0 (room noise)
+MIC_LEVEL_TOP_DB = -15.0      # dBFS that reads as 1 (loud speech)
+
+
+def mic_level(rms, sample_width):
+    """A chunk's RMS as a 0..1 level: its dBFS mapped linearly from
+    MIC_LEVEL_FLOOR_DB (0) to MIC_LEVEL_TOP_DB (1), clamped. A number only;
+    no audio is kept."""
+    try:
+        rms = float(rms)
+        full = float(2 ** (8 * int(sample_width) - 1))
+    except (TypeError, ValueError):
+        return 0.0
+    if rms <= 0 or full <= 0:
+        return 0.0
+    db = 20.0 * math.log10(rms / full)
+    level = (db - MIC_LEVEL_FLOOR_DB) / (MIC_LEVEL_TOP_DB - MIC_LEVEL_FLOOR_DB)
+    return max(0.0, min(1.0, level))
 
 
 # ============================================================
@@ -234,7 +281,111 @@ class _StoppableStream:
 # BROWSER ACTION HANDLERS
 # ============================================================
 
+NAV_LIMIT_S = NAV_TIMEOUT_MS // 1000   # browser_navigate's load limit, in seconds
+
+
 class BrowserActionsMixin:
+    # ============================================================
+    # BROWSER RESULT HELPERS
+    # ============================================================
+
+    # A browser_click parameter that is a list number: 12, [12], #12.
+    # "12", "[12]", "#12", or a list line pasted whole: '[12] link "Name"'.
+    _BROWSER_REF_RX = re.compile(r'^\s*(?:\[?\s*#?\s*(\d{1,5})\s*\]?|\[(\d{1,5})\]\s+[a-z]+\s+".*)\s*$',
+                                 re.S)
+
+    @staticmethod
+    def _browser_error(e):
+        """One line for a failed browser call, never Playwright's call log."""
+        text = str(e or "") or type(e).__name__
+        if "Download is starting" in text:
+            return "the URL is a file download, not a page"
+        first = text.splitlines()[0].strip()
+        return first[:200] + ("..." if len(first) > 200 else "")
+
+    def _browser_note(self, text):
+        """The session's one-shot note (the browser was reopened) before text."""
+        take = getattr(self.browser, "take_note", None)
+        note = take() if callable(take) else ""
+        return f"NOTE: {note}. {text}" if note else text
+
+    def _browser_tip(self, text):
+        """config.BROWSER_NOTE once per phase, after the first element list
+        (the same once-per-phase set as the APP_NOTES tips)."""
+        given = self.__dict__.setdefault("_app_notes_given", set())
+        if "browser" in given:
+            return text
+        given.add("browser")
+        print("[AppNotes] browser note added")
+        return f"{text}\n{BROWSER_NOTE}"
+
+    def _elements_block(self, still_loading=None):
+        """"\n" + the page's numbered element list, or "" (blank page, a stand-in
+        browser without lists, or a failed read: logged as a type only)."""
+        get = getattr(self.browser, "elements_text", None)
+        if not callable(get):
+            return ""
+        try:
+            text = get(still_loading) if still_loading is not None else get()
+        except Exception as e:
+            print(f"[Browser] element list failed ({type(e).__name__})")
+            return "\n(The element list could not be read; call browser_elements.)"
+        return self._browser_tip("\n" + text) if text else ""
+
+    def _downloads_dir(self):
+        """The user's Downloads folder (registry shell folder, OneDrive-aware)."""
+        return self._resolve_path_placeholders("{downloads}")
+
+    def _save_download_text(self):
+        """Save the download the last browser_click/browser_navigate started
+        into Downloads (numbered, never overwriting) and say where. Only
+        these two actions call it: no other download is saved."""
+        try:
+            path = self.browser.save_download(self._downloads_dir())
+        except Exception as e:
+            if "timed out" in str(e):
+                print("[Browser] download still running at the save wait")
+                return (" It is still downloading; it will be saved to the Downloads folder "
+                        "when it finishes.")
+            print(f"[Browser] download not saved ({type(e).__name__})")
+            return f" It could not be saved to the Downloads folder: {self._browser_error(e)}."
+        print("[Browser] download saved to Downloads")
+        return f" Saved it to the Downloads folder as {os.path.basename(path)}."
+
+    def _page_text(self):
+        try:
+            return " ".join((self.browser.get_text("") or "").split())
+        except Exception:
+            return ""
+
+    def _page_excerpt(self, limit=900, text=None):
+        """First chunk of the current page's real DOM text, handed back in the
+        same observation as a navigate/search (so the model need not call
+        browser_get_text as a second step). The page's main content (<main>,
+        the one <article>: BrowserSession.main_text) when it has one, so
+        menus do not fill the excerpt; a cut one says how much is left."""
+        text = self._page_text() if text is None else text
+        total = len(text)
+        main = getattr(self.browser, "main_text", None)
+        if callable(main) and len(text) > limit:
+            try:
+                got = main(timeout=2.0)
+            except Exception:
+                got = None
+            if isinstance(got, dict) and got.get("src") in ("main", "article"):
+                body = " ".join(str(got.get("text") or "").split())
+                if len(body) >= 40:
+                    text, total = body, len(body) + max(
+                        0, int(got.get("total") or 0) - len(str(got.get("text") or "")))
+        if total <= limit:
+            return text
+        return (text[:limit] + f"... [{total - limit} more characters; use browser_get_text "
+                "to read more]")
+
+    # ============================================================
+    # BROWSER ACTION HANDLERS
+    # ============================================================
+
     def _act_browser_import_cookies(self, param):
         if not param:
             self.last_result_text = "browser_import_cookies needs domain(s), e.g. 'youtube.com' or 'youtube.com|google.com'"
@@ -244,47 +395,37 @@ class BrowserActionsMixin:
             self.last_result_text = f"Imported cookies: {counts}. Navigate/reload the page to see the logged-in state."
             return True
         except Exception as e:
-            self.last_result_text = f"browser_import_cookies failed: {e}"
+            self.last_result_text = f"browser_import_cookies failed: {self._browser_error(e)}"
             return False
 
     def _act_browser_use_daily_profile(self, param):
         try:
             source, copied = self.browser.use_daily_profile_copy()
-            self.last_result_text = f"Cloned logins from {source} ({', '.join(copied)}). Next browser action will use them."
+            self.last_result_text = (f"Copied {len(copied)} login item(s) from the user's Firefox "
+                                     "profile. The next browser action will use them.")
             return True
         except Exception as e:
-            self.last_result_text = f"browser_use_daily_profile failed: {e}"
-            return False   
+            self.last_result_text = f"browser_use_daily_profile failed: {self._browser_error(e)}"
+            return False
 
     def _act_browser_open(self, param):
-            try:
-                self.browser.ensure_started()
-                if self.browser._start_error:
-                    self.last_result_text = self.browser._start_error
-                    return False
-                if param:
-                    url, title = self.browser.navigate(param)
-                    self.last_result_text = f"Opened {url} ({title})"
-                else:
-                    self.last_result_text = "Browser ready"
-                return True
-            except Exception as e:
-                self.last_result_text = f"browser_open failed: {e}"
-                return False
-
-    def _page_text(self):
         try:
-            return " ".join((self.browser.get_text("") or "").split())
-        except Exception:
-            return ""
-
-    def _page_excerpt(self, limit=900, text=None):
-        """First chunk of the current page's real DOM text, for handing back
-        to the model in the same observation as a navigate/search. Without
-        this the model had to *know* to call browser_get_text as a second
-        step -- and a small model instead re-ran the search five times."""
-        text = self._page_text() if text is None else text
-        return text[:limit] + ("..." if len(text) > limit else "")
+            self.browser.ensure_started()
+            if self.browser._start_error:
+                self.last_result_text = self.browser._start_error
+                return False
+            if param:
+                url, title = self.browser.navigate(param)
+                self.last_result_text = self._browser_note(
+                    f"Opened {url} ({title})") + self._elements_block()
+            else:
+                self.last_result_text = self._browser_note("Browser ready")
+                if (getattr(self.browser, "last_url", "") or "about:blank") != "about:blank":
+                    self.last_result_text += self._elements_block()
+            return True
+        except Exception as e:
+            self.last_result_text = f"browser_open failed: {self._browser_error(e)}"
+            return False
 
     def _act_browser_navigate(self, param):
         if not param:
@@ -292,6 +433,14 @@ class BrowserActionsMixin:
             return False
         try:
             url, title = self.browser.navigate(param)
+            download = getattr(self.browser, "last_nav_download", None)
+            if download:
+                self.last_result_text = self._browser_note(
+                    f"browser_navigate: that address is a file download ({str(download)[:80]}), "
+                    "not a page.") + self._save_download_text()
+                return True
+            still = bool(getattr(self.browser, "last_nav_still_loading", False))
+            stopped = bool(getattr(self.browser, "last_nav_stopped", False))
             text = self._page_text()
             reason = blocked_page_reason(url, title, text)
             if reason:
@@ -300,18 +449,31 @@ class BrowserActionsMixin:
                     f"BLOCKED: {reason}. This is a block/CAPTCHA page, not the content; "
                     f"do not try to solve it. Use browser_search for the information instead.")
                 return False
+            if stopped and not text.strip():
+                self.last_result_text = self._browser_note(
+                    f"browser_navigate: the page did not load within {NAV_LIMIT_S}s (the load "
+                    "was stopped; nothing is shown yet). Try again later or use browser_search.")
+                return False
             excerpt = self._page_excerpt(text=text)
             self.last_result_text = f"Navigated to {url} ({title})."
+            if stopped:
+                self.last_result_text += (
+                    f" The page was still loading after {NAV_LIMIT_S}s; the load was stopped. "
+                    "Here is what is on it.")
+            elif still:
+                self.last_result_text += (
+                    " The page is still loading; here is what is on it so far.")
             if excerpt:
                 self.last_result_text += (
                     f" PAGE TEXT (already read -- do NOT navigate again; use "
                     f"browser_get_text with a selector only if you need more): "
                     f"{excerpt}"
                 )
+            self.last_result_text = self._browser_note(self.last_result_text) + self._elements_block()
             self.speak(f"Navigating to {url}")
             return True
         except Exception as e:
-            self.last_result_text = f"browser_navigate failed: {e}"
+            self.last_result_text = f"browser_navigate failed: {self._browser_error(e)}"
             return False
 
     def _act_browser_search(self, param):
@@ -338,10 +500,12 @@ class BrowserActionsMixin:
                         f" RESULTS PAGE TEXT (already read -- do NOT search again; "
                         f"answer from this, or browser_click a result): {excerpt}"
                     )
+                self.last_result_text = (self._browser_note(self.last_result_text)
+                                         + self._elements_block())
                 self.speak(f"Searching for {param}")
                 return True
         except Exception as e:
-            self.last_result_text = f"browser_search failed: {e}"
+            self.last_result_text = f"browser_search failed: {self._browser_error(e)}"
             return False
         self.last_result_text = (
             "BLOCKED: the search was blocked ("
@@ -357,47 +521,94 @@ class BrowserActionsMixin:
             self.speak("Browser closed")
             return True
         except Exception as e:
-            self.last_result_text = f"browser_close failed: {e}"
+            self.last_result_text = f"browser_close failed: {self._browser_error(e)}"
             return False
 
+    def _act_browser_elements(self, param=""):
+        """browser_elements: a fresh numbered list (never starts the browser)."""
+        if not getattr(self.browser, "running", False):
+            self.last_result_text = ("browser_elements: MistAI's browser is not open; use "
+                                     "browser_navigate or browser_search first.")
+            return False
+        block = self._elements_block()
+        if not block:
+            self.last_result_text = self._browser_note(
+                "browser_elements: no page is open (blank tab); use browser_navigate first.")
+            return False
+        self.last_result_text = self._browser_note(
+            f"Elements of {getattr(self.browser, 'last_url', '') or 'the current page'}:") + block
+        return True
+
     def _act_browser_click(self, param):
-        if not param:
-            self.last_result_text = "browser_click needs the visible text to click"
+        """browser_click <number> (preferred), <text> or <text|role>. The
+        result says what the click did; the fresh list follows unless nothing
+        changed or a download started."""
+        if not str(param or "").strip():
+            self.last_result_text = ("browser_click needs an element number from the list "
+                                     "(or the visible text to click)")
             return False
-        if "|" in param:
-            text, role = param.split("|", 1)
-        else:
-            text, role = param, None
+        m = self._BROWSER_REF_RX.match(str(param))
         try:
-            self.browser.click(text.strip(), role=(role.strip() if role else None))
-            self.last_result_text = f"Clicked '{text.strip()}' in the browser (real DOM match)"
-            return True
+            if m:
+                res = self.browser.click(ref=int(m.group(1) or m.group(2)))
+            else:
+                text, _, role = str(param).partition("|")
+                res = self.browser.click(text.strip(), role=(role.strip() or None))
         except Exception as e:
-            self.last_result_text = f"browser_click could not find/click '{text.strip()}': {e}"
+            self.last_result_text = self._browser_note(
+                f"browser_click failed: {self._browser_error(e)}")
             return False
+        if not isinstance(res, dict):       # a stand-in browser
+            self.last_result_text = f"Clicked '{str(param).strip()}' in the browser"
+            return True
+        text = self._browser_note(str(res.get("message") or ""))
+        if res.get("ok") and getattr(self.browser, "last_download", None) is not None:
+            text += self._save_download_text()
+        if not res.get("ok") or res.get("changed"):
+            text += self._elements_block()
+        self.last_result_text = text
+        return bool(res.get("ok"))
+
+    def _act_browser_scroll(self, param):
+        """browser_scroll down|up|top|bottom (default down), then the list."""
+        d = str(param or "down").strip().lower() or "down"
+        if d not in ("down", "up", "top", "bottom"):
+            self.last_result_text = "browser_scroll needs down, up, top or bottom"
+            return False
+        try:
+            moved, pct = self.browser.scroll(d)
+        except Exception as e:
+            self.last_result_text = f"browser_scroll failed: {self._browser_error(e)}"
+            return False
+        text = (f"Scrolled {d}; the bottom of the screen is now at about {pct}% of the page."
+                if moved else f"The page did not scroll {d} (already there, or it does not scroll).")
+        self.last_result_text = self._browser_note(text) + self._elements_block()
+        return True
 
     def _act_browser_fill(self, param):
         if "|" not in (param or ""):
-            self.last_result_text = "browser_fill needs format: field label|text to type"
+            self.last_result_text = "browser_fill needs format: field label or number|text to type"
             return False
         field, text = param.split("|", 1)
         try:
-            self.browser.fill(field.strip(), text)
-            self.last_result_text = f"Filled '{field.strip()}'"
-            return True
+            done = self.browser.fill(field.strip(), text)
         except Exception as e:
-            self.last_result_text = f"browser_fill could not find field '{field.strip()}': {e}"
+            self.last_result_text = self._browser_note(f"browser_fill failed: {self._browser_error(e)}")
             return False
+        what = done if isinstance(done, str) else f"'{field.strip()}'"
+        self.last_result_text = self._browser_note(
+            f"Filled {what} (not submitted: press Enter or click the button).")
+        return True
 
     def _act_browser_press_key(self, param):
         if not param:
             return False
         try:
             self.browser.press_key(param.strip())
-            self.last_result_text = f"Pressed '{param.strip()}' in the browser"
+            self.last_result_text = self._browser_note(f"Pressed '{param.strip()}' in the browser")
             return True
         except Exception as e:
-            self.last_result_text = f"browser_press_key failed: {e}"
+            self.last_result_text = f"browser_press_key failed: {self._browser_error(e)}"
             return False
 
 
@@ -1040,7 +1251,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         self._agent_started_at = 0.0
         self._agent_generation = 0       # bumped per run; stale callbacks are ignored
         from .browser_session import BrowserSession
-        self.browser = BrowserSession()
+        # "Use my Firefox sign-ins" is read at each browser start.
+        self.browser = BrowserSession(firefox_signins=self.get_firefox_signins)
         self._pending_answer = None
         self._pending_source = None     # "button" or "typed", with _pending_answer
         self._answer_event = threading.Event()
@@ -1620,6 +1832,34 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         ptt = getattr(self, "_ptt_waiting", None)
         return ptt is not None and ptt.is_set()
 
+    # -- Audio levels (the orb's audio-reactive core) -------------------------
+    # One float for the mic, written by the open listen's _StoppableStream
+    # (each chunk) and reset to 0 when the listen ends; read by the orb pages.
+    # A plain float attribute: its write and read are atomic, so no lock is
+    # needed. Numbers only, never logged.
+
+    def _set_mic_level(self, level):
+        try:
+            self._mic_level = max(0.0, min(1.0, float(level)))
+        except (TypeError, ValueError):
+            self._mic_level = 0.0
+
+    def mic_level_now(self):
+        """The open listen's last chunk level 0..1; 0.0 with no listen."""
+        return float(getattr(self, "_mic_level", 0.0) or 0.0)
+
+    def audio_level(self):
+        """{"mic": 0..1, "tts": 0..1, or None when the voice playing has no
+        level (the pyttsx3 fallback)}; both 0.0 when idle. For the pages."""
+        tts = getattr(self, "tts", None)
+        level = getattr(tts, "level", None)
+        try:
+            spoken = level() if callable(level) else 0.0
+        except Exception:
+            spoken = 0.0
+        return {"mic": self.mic_level_now(),
+                "tts": None if spoken is None else float(spoken)}
+
     def _mic_compete_state(self):
         """Why a clip the wake loop is handling may have been meant for a
         _listen_once (a command, follow-up or answer), or None."""
@@ -1862,7 +2102,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                             if getattr(src, "stream", None) is not None:
                                 stream = src.stream = _StoppableStream(
                                     src.stream, self._ptt_stop_event(), rec,
-                                    getattr(src, "SAMPLE_WIDTH", 2))
+                                    getattr(src, "SAMPLE_WIDTH", 2),
+                                    on_level=self._set_mic_level)
                         else:
                             if profile:
                                 phrase_limit = self._confirm_listen_setup(rec, src, profile)
@@ -1877,7 +2118,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                                     and getattr(src, "stream", None) is not None):
                                 src.stream = _StoppableStream(
                                     src.stream, stop_event, rec,
-                                    getattr(src, "SAMPLE_WIDTH", 2))
+                                    getattr(src, "SAMPLE_WIDTH", 2),
+                                    on_level=self._set_mic_level)
                         if diag is not None:
                             diag["thr1"] = rec.energy_threshold
                         self._voice_mark("listen_start")
@@ -1918,6 +2160,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     self._voice_mark(f"listen_failed ({type(e).__name__})", end=True)
                     return None
         finally:
+            self._set_mic_level(0.0)          # the listen is over (or failed)
             if waiting is not None:
                 waiting.clear()
             if diag is not None:
@@ -2263,6 +2506,26 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         self.__dict__.setdefault("_orb_option_cache", {})[name] = value
         return {"success": True, "enabled": self.orb_option(name)}
 
+    # "Use my Firefox sign-ins" (default off; MISTAI_BROWSER_SEED_PROFILE
+    # overrides the saved value). Read when MistAI's browser starts, so a
+    # change applies to the next browser session.
+    def get_firefox_signins(self):
+        try:
+            saved = self.memory.get_profile("browser_seed_profile", "off")
+        except Exception:
+            saved = "off"
+        return browser_seed_profile_enabled(saved)
+
+    def set_firefox_signins(self, enabled):
+        value = "on" if enabled else "off"
+        try:
+            self.memory.set_profile("browser_seed_profile", value)
+        except Exception:
+            return {"success": False, "enabled": self.get_firefox_signins(),
+                    "error": "Could not save the setting"}
+        print(f"[Browser] Use my Firefox sign-ins: {value} (applies to the next browser start)")
+        return {"success": True, "enabled": self.get_firefox_signins()}
+
     def start_floating_orb_if_enabled(self):
         if self.get_floating_orb():
             self._floating_orb().show()
@@ -2432,9 +2695,12 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                             f'{",true" if offer_remember else ""})')
             heard = None
             if input_mode == "voice":
+                dropped = _tts_dropped(self.tts)
                 self.speak(question)
                 while self.tts.speaking and not self._answer_event.is_set():
                     time.sleep(0.05)
+                unheard = _tts_dropped(self.tts) != dropped
+                started = time.monotonic()
                 if not self._answer_event.is_set():
                     # Its own [VoiceTiming] turn: mic and STT time of the answer.
                     self._voice_start("confirm")
@@ -2444,6 +2710,12 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                                               **({} if profile == "shared"
                                                  else {"profile": profile}))
                     self._voice_mark("answered", end=True)
+                if unheard and not heard and not self._answer_event.is_set():
+                    # No voice could speak the question: it is only on screen,
+                    # so give the reader the typed answer's full time.
+                    print("[Confirm] question not spoken (no voice) -- waiting for a button")
+                    self._answer_event.wait(timeout=max(
+                        0.0, self.CONFIRM_TEXT_TIMEOUT - (time.monotonic() - started)))
             else:
                 self._answer_event.wait(timeout=self.CONFIRM_TEXT_TIMEOUT)
             with self._answer_lock:
@@ -2460,6 +2732,41 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             self._notify_js("closeConfirmPrompt()")
             if shown and confirm_reminimize_enabled():
                 self.minimize_window()
+
+    # ------------------------------------------------------------
+    # UNHEARD QUESTION
+    # ------------------------------------------------------------
+    # A voice-mode ask_user question that no engine could speak (the TTS
+    # dropped it) was never heard. It goes on screen with the typed prompt
+    # (window restored); a spoken answer still counts during the usual listen,
+    # and then the typed prompt keeps waiting for the rest of its full time,
+    # so nothing is cut short because nothing was said.
+
+    def _answer_unheard_question(self, question, timeout=60, listen_timeout=10,
+                                 **listen_kwargs):
+        with self._answer_lock:
+            self._pending_answer = None
+            self._answer_event.clear()
+            self._awaiting_text_answer.set()
+        print("[AskUser] question not spoken (no voice) -- shown on screen")
+        started = time.monotonic()
+        try:
+            if getattr(self, "_window", None):
+                try:
+                    self._window.restore()
+                except Exception as e:
+                    print(f"[AskUser] window not shown ({type(e).__name__})")
+            self._notify_js(f'showAskUserPrompt("{esc(question)}")')
+            heard = self._listen_once(timeout=listen_timeout,
+                                      stop_event=self._answer_event, **listen_kwargs)
+            if heard and not self._answer_event.is_set():
+                return heard
+            got = self._answer_event.wait(
+                timeout=max(0.0, timeout - (time.monotonic() - started)))
+            with self._answer_lock:
+                return self._pending_answer if got else None
+        finally:
+            self._awaiting_text_answer.clear()
 
     def _get_text_answer(self, question, timeout=60):
         with self._answer_lock:
@@ -3046,6 +3353,10 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 return self._act_browser_close()
             elif action == "browser_click":
                 return self._act_browser_click(param)
+            elif action == "browser_elements":
+                return self._act_browser_elements(param)
+            elif action == "browser_scroll":
+                return self._act_browser_scroll(param)
             elif action == "browser_fill":
                 return self._act_browser_fill(param)
             elif action == "browser_get_text":
@@ -4965,6 +5276,12 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                 url = "https://" + url
             subprocess.Popen(["explorer.exe", url])
             time.sleep(2.5)
+            # The user's own browser: no browser_* action reaches it. Say so,
+            # so a task that needs the page's content switches to MistAI's.
+            self.last_result_text = (
+                f"Opened {url} in the user's own browser for them to look at. MistAI cannot "
+                f"read or click inside that window: if the task needs this page's content, "
+                f"use browser_navigate {url} (MistAI's browser), not screen reads or ask_user.")
             return True
         except Exception as e:
             print(f"[URL] Error: {e if verbose_logs() else type(e).__name__}")
@@ -5139,6 +5456,41 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         except Exception as e:
             return f"Error reading screen: {e}", False
 
+    BROWSER_READ_CHARS = 3000    # page text a browser-page read returns
+
+    def _browser_page_answer(self, query=""):
+        """read_screen_text with MistAI's own browser in front and a question
+        that is not about looks (MISTAI_UIA_FIRST): the page's DOM text, no
+        5-8 s vision read. "" otherwise (never starts the browser)."""
+        from .screen import is_visual_question
+
+        browser = getattr(self, "browser", None)
+        if not uia_first_enabled() or not getattr(browser, "running", False):
+            return ""
+        if query and is_visual_question(query):
+            return ""
+        try:
+            in_front = clip.foreground_for_reading()[0]
+            if not in_front or in_front != clip.playwright_window():
+                return ""
+            got = browser.page_text(timeout=2.0)
+        except Exception:
+            return ""
+        if not got:
+            return ""
+        title, raw = got
+        text = " ".join(str(raw or "").split())
+        if len(text) < 40:
+            return ""
+        cut = text[:self.BROWSER_READ_CHARS]
+        print(f"  [Read] MistAI's browser page: page text ({len(text)} chars, {len(cut)} sent), "
+              "no vision call")
+        more = (f" [cut, {len(text) - len(cut)} more characters; use browser_get_text to "
+                "read more]" if len(text) > len(cut) else "")
+        return (f"PAGE TEXT of MistAI's browser page '{str(title)[:60]}' (DOM, exact; no "
+                f"screenshot was read): {cut}{more}\n(For what is clickable use browser_elements; "
+                "for how the page looks, ask read_screen_text about its appearance.)")
+
     def read_screen_text(self, query=""):
         """In a native window whose accessibility text is sufficient and a
         question that is not about looks (MISTAI_UIA_FIRST, default on): that
@@ -5148,6 +5500,10 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         from .screen import is_visual_question, text_is_sufficient
 
         trace = trace_reads_enabled()
+        page = self._browser_page_answer(query)
+        if page:
+            self.last_result_text = page[:_RESULT_MEMORY_CHARS]
+            return self.last_result_text
         # UIA first: it is closer in time to the screenshot than the slow vision call.
         exact, title, native, kind, asked = self._exact_ui_text(query, include_browser=trace)
         if (native and kind in ("exact", "background") and uia_first_enabled()

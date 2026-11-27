@@ -691,6 +691,110 @@ def test_ask_user_passes_a_profile_only_when_one_is_chosen(monkeypatch, value, e
     assert listens == [{"timeout": 10, **extra}]
 
 
+# -- A question no voice could speak (the TTS dropped it) --------------------
+# It stays on screen and its wait is the typed answer's full time, never cut
+# short because nothing was said.
+
+class _ClickLater:
+    """An answer event whose wait() is a button click arriving at once."""
+
+    def __init__(self, api, answer):
+        self.api, self.answer, self.waits, self.flag = api, answer, [], False
+
+    def is_set(self):
+        return self.flag
+
+    def set(self):
+        self.flag = True
+
+    def clear(self):
+        self.flag = False
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        self.api._pending_answer, self.api._pending_source = self.answer, "button"
+        self.flag = True
+        return True
+
+
+def _unheard_confirm_api(listens, spoken_ok):
+    a = _confirm_api(listens)
+    a.tts = SimpleNamespace(speaking=False, dropped=0)
+    a.speak = (lambda t: None) if spoken_ok else (lambda t: setattr(a.tts, "dropped", 1))
+    a._listen_once = lambda **kw: listens.append(kw) or None
+    a._answer_event = _ClickLater(a, "yes")
+    return a
+
+
+def test_an_unspoken_confirmation_waits_the_full_time_for_a_button():
+    listens = []
+    a = _unheard_confirm_api(listens, spoken_ok=False)
+    assert Api.ask_confirmation(a, "Delete it?", "voice") == ("yes", "button")
+    assert len(listens) == 1                                  # a spoken answer still counts
+    assert a._answer_event.waits and a._answer_event.waits[0] > Api.CONFIRM_TEXT_TIMEOUT - 5
+
+
+def test_a_spoken_confirmation_keeps_its_short_listen():
+    listens = []
+    a = _unheard_confirm_api(listens, spoken_ok=True)
+    assert Api.ask_confirmation(a, "Delete it?", "voice") == (None, "voice")
+    assert a._answer_event.waits == [] and len(listens) == 1
+
+
+def _unheard_ask_api(heard):
+    a = _confirm_api([])
+    shown = []
+    a._notify_js = shown.append
+    a._listen_once = lambda **kw: heard
+    a._answer_event = _ClickLater(a, "Documents")
+    return a, shown
+
+
+def test_an_unspoken_ask_user_question_is_shown_and_waits_for_a_typed_answer(capsys):
+    a, shown = _unheard_ask_api(heard=None)
+    assert Api._answer_unheard_question(a, "Which folder?", timeout=60) == "Documents"
+    assert any(js.startswith('showAskUserPrompt("Which folder?"') for js in shown)
+    assert a._answer_event.waits[0] > 55 and not a._awaiting_text_answer.is_set()
+    assert "Which folder" not in capsys.readouterr().out      # never logged
+    a, _ = _unheard_ask_api(heard="the downloads one")
+    assert Api._answer_unheard_question(a, "Which folder?") == "the downloads one"
+    assert a._answer_event.waits == []
+
+
+def test_the_agent_hands_an_unspoken_question_to_the_screen_prompt(monkeypatch):
+    from core.agent import AgentLoop
+    from core.tools import SPECS
+    monkeypatch.delenv("MISTAI_CONFIRM_LISTEN", raising=False)
+    listens, unheard = [], []
+    replies = iter(json.dumps(r) for r in [{"action": "ask_user", "parameter": "Which one?"},
+                                           {"action": "done", "speech": "ok"}])
+    tts = SimpleNamespace(speaking=False, dropped=0)
+    api = SimpleNamespace(
+        task_memory=SimpleNamespace(get_hints_for_task=lambda _t: []),
+        caption_window=None, captions_enabled=False, _stop_requested=threading.Event(),
+        live=SimpleNamespace(snapshot={"open_apps": []}),
+        api_manager=SimpleNamespace(get_headers=lambda: {}, get_api_url=lambda: "u",
+                                    get_fallback_url=lambda: "f"),
+        tools=SimpleNamespace(specs=SPECS, get=lambda n: SPECS[n],
+                              requires_confirmation=lambda *a, **k: False),
+        executor=SimpleNamespace(run=lambda a, p: None),
+        memory=SimpleNamespace(add_action=lambda *a: None),
+        _resolve_path_placeholders=lambda p: p,
+        speak=lambda _t: setattr(tts, "dropped", tts.dropped + 1),   # no voice works
+        tts=tts,
+        _listen_once=lambda **kw: listens.append(kw) or "x",
+        _answer_unheard_question=lambda q, **kw: unheard.append((q, kw)) or "the first one",
+        _normalize_utterance=lambda t: str(t).lower(), _VOICE_STOP_WORDS={"stop"},
+    )
+    monkeypatch.setattr("core.agent.requests.post", lambda *a, **k: SimpleNamespace(
+        ok=True, status_code=200, json=lambda: {"response": next(replies)}))
+    monkeypatch.setattr("core.agent.time.sleep", lambda _s: None)
+    loop = AgentLoop(api, None)
+    monkeypatch.setattr(loop, "_get_screen_context", lambda *a, **k: "screen")
+    loop._loop("t", "m", "none", "voice", None)
+    assert listens == [] and unheard == [("Which one?", {"timeout": 60, "listen_timeout": 10})]
+
+
 # ==========================================================================
 # moved from tests/test_enter_confirmation.py
 # press_key('enter') confirmation: skipped only for a safe, known, in-front target.

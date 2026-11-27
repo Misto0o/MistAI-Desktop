@@ -77,6 +77,7 @@ from .config import (
     router_via_agent,
     verbose_logs,
     DEFAULT_MODEL,
+    CHAT_RETRY_TIMEOUT,
     chat_timeout,
 )
 
@@ -1075,36 +1076,95 @@ def _model_for(api, model):
 # CHAT OR TASK DECISION
 # ============================================================
 
+# When the routing call times out twice, a cheap local look at the message
+# decides: something that reads like a request to act goes to the agent,
+# anything else gets CHAT_SLOW_REPLY (no model to answer it with).
+CHAT_SLOW_REPLY = "Sorry, I'm slow to answer right now. Please say that again in a moment."
+
+_LEAD_IN_RX = re.compile(
+    r"^(?:(?:hey|ok|okay|hi)\s+)?(?:mist(?:\s*ai)?\b[\s,:]*)?(?:please\s+)?"
+    r"(?:(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?|i\s+(?:want|need)\s+you\s+to\s+"
+    r"|go\s+ahead\s+and\s+|just\s+)?", re.I)
+_ACTION_VERBS = frozenset("""
+    open close launch start run quit exit play pause resume stop skip search find look go navigate
+    browse visit show list type write send message email text call reply create make new delete
+    remove move copy paste rename save download upload install uninstall update turn switch set
+    change mute unmute increase decrease raise lower click press scroll read check remind schedule
+    add organize clean take minimize maximize restore restart reboot shut lock sign log select
+    print zip unzip extract convert record screenshot fill submit subscribe like bookmark empty
+    """.split())
+_TASK_MARK_RX = re.compile(
+    r"https?://|www\.|\b[a-z]:\\|\.(?:txt|docx?|pdf|xlsx?|pptx?|png|jpe?g|csv|py|exe|zip)\b"
+    r"|\b(?:my|this|the)\s+(?:screen|computer|pc|laptop|desktop|files?|folders?|downloads|"
+    r"documents|browser|apps?|windows?)\b", re.I)
+
+
+def looks_like_action(message):
+    """Cheap local guess, only after the router timed out twice: does the
+    message ask MistAI to do something (an imperative verb first, after a
+    "Mist," / "please" / "can you" lead-in, or a URL, path, file name or
+    "my screen/files/..." mention)?"""
+    text = " ".join(str(message or "").split())
+    if _TASK_MARK_RX.search(text):
+        return True
+    rest = _LEAD_IN_RX.sub("", text, count=1)
+    first = re.match(r"[a-z]+", rest.lower())
+    return bool(first) and first.group(0) in _ACTION_VERBS
+
+
+def _route_call(api, message, gender, model, timeout, single):
+    """One routing call: the raw reply ("" on any failure or timeout)."""
+    try:
+        history = api.agent._recent_conversation_block(message)
+    except Exception:
+        history = ""
+    title = "sir" if gender == "male" else "ma'am" if gender == "female" else ""
+    now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+    t_call = time.perf_counter()
+    raw = planner._llm(
+        api,
+        build_prompt(message, now, history, title, single=single),
+        _model_for(api, model),
+        timeout=timeout,
+        label="Conversation",
+        fallback=False,
+        # The router's voice line; only in agent mode (flag off = the same call as before).
+        **({"system": ROUTER_SYSTEM} if call_mode() == "agent" else {}),
+    )
+    print(f"[Timing] Router LLM: {time.perf_counter() - t_call:.2f}s mode={call_mode()}")
+    return raw
+
+
 def try_chat(api, message, gender="none", model=None):
     """Answer ``message`` as conversation, or return None to hand it to the
-    agent. Never raises. ``model`` is the request's model (ask_mistai)."""
+    agent. Never raises. ``model`` is the request's model (ask_mistai). A
+    timed-out routing call is retried once with CHAT_RETRY_TIMEOUT; if that
+    fails too, ``looks_like_action`` decides (agent, or CHAT_SLOW_REPLY)."""
     t0 = time.monotonic()
     timeout = chat_timeout()
     reason = ""
+    path = ""
     single = single_shot_enabled()
     try:
         api._single_shot_goal = None    # a hint is only ever for this message
     except Exception:
         pass
     try:
-        try:
-            history = api.agent._recent_conversation_block(message)
-        except Exception:
-            history = ""
-        title = "sir" if gender == "male" else "ma'am" if gender == "female" else ""
-        now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-        t_call = time.perf_counter()
-        raw = planner._llm(
-            api,
-            build_prompt(message, now, history, title, single=single),
-            _model_for(api, model),
-            timeout=timeout,
-            label="Conversation",
-            fallback=False,
-            # The router's voice line; only in agent mode (flag off = the same call as before).
-            **({"system": ROUTER_SYSTEM} if call_mode() == "agent" else {}),
-        )
-        print(f"[Timing] Router LLM: {time.perf_counter() - t_call:.2f}s mode={call_mode()}")
+        t_try = time.monotonic()
+        raw = _route_call(api, message, gender, model, timeout, single)
+        if not (raw or "").strip() and time.monotonic() - t_try >= timeout * 0.95:
+            retry = max(float(CHAT_RETRY_TIMEOUT), timeout)
+            print(f"[Conversation] router timed out after {timeout:.1f}s -- retrying with "
+                  f"{retry:.1f}s")
+            t_try = time.monotonic()
+            raw = _route_call(api, message, gender, model, retry, single)
+            path = "retry"
+            if not (raw or "").strip():
+                path = ("local: action-like" if looks_like_action(message)
+                        else "local: conversation")
+                print(f"[Conversation] router failed again "
+                      f"({'timeout' if time.monotonic() - t_try >= retry * 0.95 else 'no reply'})"
+                      f" -- deciding locally: {path.split(': ')[1]}")
         reply = parse_route(raw)
         reason = route_reason(raw)
         if single and reply is None:
@@ -1112,6 +1172,10 @@ def try_chat(api, message, gender="none", model=None):
             print(f"[Conversation] single deliverable: {'yes' if one else 'no'}")
             if one:
                 api._single_shot_goal = str(message)
+        if path == "local: conversation":
+            reply, reason = CHAT_SLOW_REPLY, ""
+        elif path == "local: action-like":
+            reason = ""
     except Exception as e:
         print(f"[Conversation] Router failed ({e if verbose_logs() else type(e).__name__}) "
               "-- routing to agent")
@@ -1120,9 +1184,15 @@ def try_chat(api, message, gender="none", model=None):
     if reason == "no reply" and elapsed >= timeout * 0.95:
         reason = "timeout"
     # A fixed label says why a message went to the agent without a model
-    # decision (timeouts cost the whole wait before the agent starts).
+    # decision (timeouts cost the whole wait before the agent starts), or that
+    # the decision came from the retry or the local check.
+    label = path if path.startswith("local") else (reason if reason and not reply else "")
+    if path == "retry" and not label:
+        label = "retry"
+    elif path == "retry":
+        label = f"retry, {label}"
     print(
         f"[Conversation] route={'chat' if reply else 'task'} "
-        f"in {elapsed:.2f}s" + (f" ({reason})" if reason and not reply else "")
+        f"in {elapsed:.2f}s" + (f" ({label})" if label else "")
     )
     return reply

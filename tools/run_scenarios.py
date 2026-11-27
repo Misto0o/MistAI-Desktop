@@ -38,7 +38,8 @@ Scenario keys beyond the obvious: "needs": ["network", "browser"] SKIPs in --stu
 (a script would pass without the real page); setup {"serve_tmp": true} serves the
 scenario's tmp folder on 127.0.0.1 at "{tmp_url}" (stopped after the scenario);
 expect "file_contains" / "file_not_contains": [{"path", "text", "ignore_case"}] read
-the file as UTF-8 (BOM and CRLF tolerated); both fail when the file is missing.
+the file as UTF-8 (BOM and CRLF tolerated); both fail when the file is missing;
+expect "browser_url_contains": "text" checks the page MistAI's own browser ended on.
 
 Isolation: memory/tasks/tool stats go to a fresh throwaway SQLite file per
 scenario (MISTAI_DB_PATH), and the workspace and live state are reset before
@@ -353,6 +354,9 @@ def check_desktop(expect, outcome):
             )
         elif not any(wt["text"].lower() in t.lower() for t in texts):
             fails.append(f"{wt['process']} window does not contain {wt['text']!r}")
+    want_url = expect.get("browser_url_contains")
+    if want_url and want_url not in str(end.get("browser_url") or ""):
+        fails.append(f"MistAI's browser did not end on a page containing {want_url!r}")
     alternatives = expect.get("any_of")
     if alternatives:
         alt_fails = [check_desktop(alt, outcome) for alt in alternatives]
@@ -1003,6 +1007,9 @@ class Runner:
             end_state = {
                 "process_started": {n: bool(pids_named([n]) - before) for n in started_names},
             }
+            if any(e.get("browser_url_contains") for e in parts):
+                browser = getattr(self.api(), "browser", None)
+                end_state["browser_url"] = str(getattr(browser, "last_url", "") or "")
             if text_procs:
                 # ponytail: one window_text list shared by all alternatives;
                 # per-process lists if alternatives ever read different apps.

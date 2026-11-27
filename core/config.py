@@ -32,7 +32,7 @@
 #   24. ORB BACKGROUND
 #   25. ORB DEBUG AND MOTION FLAGS
 #   26. ORB MOTION STYLE
-#   27. ORB FLIGHT, PANELS AND ANCHOR FLAGS
+#   27. ORB FLIGHT, PANELS, BROWSER PROFILE AND ANCHOR FLAGS
 #   28. VISION CLICK NUDGE
 #   29. CONFIRMATION LISTEN SETTINGS
 #   30. CONFIRMATION LISTEN PROFILE
@@ -76,6 +76,7 @@
 #   68. API ERROR WORDING
 #   69. BACKEND URL AND KEY
 #   70. CRASH LOG
+#   71. COMTYPES CACHE
 # ============================================================
 
 """
@@ -117,9 +118,12 @@ MODEL_LABELS = {"gemini": "Nova", "mistral": "Flux"}
 DEFAULT_MODEL = "gemini"
 AGENT_MODEL = DEFAULT_MODEL  # alias used by tools/run_scenarios.py
 # Conversation layer (core/conversation.py): timeout of the chat-or-task
-# routing call (primary URL only, no fallback). Any failure routes to the
-# agent.
+# routing call (primary URL only, no fallback). A timeout gets one retry with
+# CHAT_RETRY_TIMEOUT; a second failure is decided locally (action-like ->
+# the agent, else a short "slow right now" reply). Other failures route to
+# the agent.
 CHAT_TIMEOUT = 5
+CHAT_RETRY_TIMEOUT = 8
 
 
 # -- model chain (every backend LLM call) ---------------------------------------
@@ -722,7 +726,7 @@ def orb_motion():
 
 
 # ============================================================
-# ORB FLIGHT, PANELS AND ANCHOR FLAGS
+# ORB FLIGHT, PANELS, BROWSER PROFILE AND ANCHOR FLAGS
 # ============================================================
 
 def _env_or_saved(name, saved):
@@ -739,6 +743,12 @@ def orb_flight_enabled(saved=None):
 def orb_panels_enabled(saved=None):
     """MISTAI_ORB_PANELS, else Settings "Task panels" (default off)."""
     return _env_or_saved("MISTAI_ORB_PANELS", saved)
+
+
+def browser_seed_profile_enabled(saved=None):
+    """MISTAI_BROWSER_SEED_PROFILE, else Settings "Use my Firefox sign-ins"
+    (default off): copy the user's Firefox logins into MistAI's browser."""
+    return _env_or_saved("MISTAI_BROWSER_SEED_PROFILE", saved)
 
 
 PANEL_ANCHORS = ("top-right", "top-left", "top-center")   # also the fallback order
@@ -1112,6 +1122,20 @@ APP_NOTES = {
         "'Plus', 'Minus', 'Divide by', 'Equals', 'Clear entry').",
     ),
 }
+
+
+# The browser's tip, appended once per phase after the first element list
+# (Api._browser_tip, same once-per-phase set as the app notes).
+# The first words of an element list's empty-page message (browser_session
+# empty_list_message); the agent counts results that carry it.
+BROWSER_EMPTY_LIST_MARK = "NO ELEMENTS LISTED"
+
+BROWSER_NOTE = (
+    "Browser tip: every browser_* result ends with a numbered element list. Click by number "
+    "(browser_click 12), never by guessed text. For \"the first video/result/link\" take the "
+    "first matching Main content item not marked (ad). If a click says the page did not "
+    "change, call browser_elements instead of clicking again. open_url pages can't be "
+    "listed: browser_navigate them.")
 
 
 def app_note(normalized_name):
@@ -1496,6 +1520,13 @@ _BLOCK_PAGE_RX = (
     (re.compile(r"\bverify (?:that )?you(?: are|'re) (?:a )?human\b", re.I),
      "the page asks to verify you are human"),
     (re.compile(r"\baccess denied\b", re.I), "the page says access denied"),
+    (re.compile(r"\bchecking (?:if the site connection is secure|your browser)\b", re.I),
+     "the page is a browser check (an interstitial)"),
+    (re.compile(r"\bperforming security verification\b", re.I),
+     "the page is a browser check (an interstitial)"),
+    (re.compile(r"\benable javascript and cookies to continue\b", re.I),
+     "the page is a browser check (an interstitial)"),
+    (re.compile(r"\bpress (?:and|&) hold\b", re.I), "the page asks to press and hold (a bot check)"),
     (re.compile(r"\bbots use DuckDuckGo too\b", re.I),
      "the page reports an anomaly (DuckDuckGo's bot check)"),
 )
@@ -1771,3 +1802,88 @@ def enable_crash_log(folder=None):
     except Exception as e:
         print(f"[CrashLog] not enabled ({type(e).__name__})")
         return ""
+
+
+# ============================================================
+# COMTYPES CACHE
+# ============================================================
+
+# comtypes writes Python wrappers for COM type libraries (SAPI for pyttsx3's
+# Windows voice, UIAutomationClient for pywinauto) into comtypes/gen on first
+# use. It picks that folder with os.access(W_OK), which on Windows only looks
+# at the read-only attribute, not the folder's permissions: under a Python
+# installed for all users (C:\Python313, Program Files) it "passes", the write
+# then fails with "[Errno 13] Permission denied" and pyttsx3 cannot start. A
+# frozen build would write into its temporary unpack folder instead, lost on
+# every run. configure_comtypes_cache puts ~/MistAI/comtypes_cache (probed by
+# really creating a file there) first on comtypes.gen.__path__ and makes it
+# comtypes' write target; modules already generated elsewhere are still found
+# after it. When no folder is writable, comtypes generates in memory only.
+
+_COMTYPES_STATE = {"mode": None}
+
+
+def comtypes_cache_dir():
+    return os.path.join(os.path.expanduser("~"), "MistAI", "comtypes_cache")
+
+
+def dir_is_writable(folder):
+    """Whether a file can really be created in folder (a probe file, removed
+    again); os.access is not enough on Windows. Never raises."""
+    import tempfile
+
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".probe-", dir=folder)
+    except Exception:
+        return False
+    try:
+        os.close(fd)
+        os.remove(probe)
+    except Exception:
+        pass
+    return True
+
+
+def configure_comtypes_cache(folder=None, memory_only=False, comtypes_client=None,
+                             gen_package=None):
+    """Point comtypes at a user-writable cache; "dir", "memory" or "" (no
+    comtypes). Safe to call more than once and after comtypes.client was
+    imported (it reads comtypes.client.gen_dir at write time). Never raises.
+    comtypes_client / gen_package: stand-ins (tests)."""
+    try:
+        if comtypes_client is None:
+            import comtypes.client as comtypes_client
+        if gen_package is None:
+            import comtypes.gen as gen_package
+    except Exception as e:
+        print(f"[COMCache] comtypes not available ({type(e).__name__})")
+        return ""
+    mode = "memory"
+    folder = folder or comtypes_cache_dir()
+    try:
+        if not memory_only:
+            os.makedirs(folder, exist_ok=True)
+            if dir_is_writable(folder):
+                mode = "dir"
+        path = [p for p in list(gen_package.__path__)
+                if os.path.normcase(os.path.abspath(p)) != os.path.normcase(os.path.abspath(folder))]
+        if mode == "dir":
+            gen_package.__path__ = [folder] + path
+            comtypes_client.gen_dir = folder
+        else:
+            gen_package.__path__ = path
+            comtypes_client.gen_dir = None             # comtypes: generate in memory
+        import importlib
+
+        importlib.invalidate_caches()
+    except Exception as e:
+        mode = "memory"
+        try:
+            comtypes_client.gen_dir = None
+        except Exception:
+            pass
+        print(f"[COMCache] setup failed ({type(e).__name__})")
+    if _COMTYPES_STATE["mode"] != mode:
+        _COMTYPES_STATE["mode"] = mode
+        print(f"[COMCache] generated COM modules: {'user cache' if mode == 'dir' else 'memory only'}")
+    return mode

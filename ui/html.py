@@ -70,65 +70,11 @@ header{
 
 .center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px;position:relative;min-width:0}
 
-/* orb:start (ORB_HTML reuses this block) */
-.orb-wrap{width:150px;height:150px;position:relative}
-.orb{
-  width:100%;height:100%;border-radius:50%;position:relative;
-  background:radial-gradient(circle at 35% 30%, #7ff5ff, #00d9ff 45%, #0369a1 100%);
-  box-shadow:0 0 30px rgba(0,217,255,0.6), 0 0 70px rgba(0,217,255,0.25), inset 0 0 20px rgba(255,255,255,0.4);
-  animation:breathe 3s ease-in-out infinite;
-  transition:background .4s, box-shadow .4s;
-  display:flex;align-items:center;justify-content:center;
-}
-.orb-wrap::before{
-  content:'';position:absolute;inset:-16px;border-radius:50%;
-  border:1px solid rgba(0,217,255,0.35);
-  animation:ring-spin 8s linear infinite;
-}
-.orb-wrap::after{
-  content:'';position:absolute;inset:-32px;border-radius:50%;
-  border:1px dashed rgba(0,217,255,0.18);
-  animation:ring-spin 18s linear infinite reverse;
-}
-@keyframes breathe{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.04);filter:brightness(1.2)}}
-@keyframes ring-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-.orb.active{
-  background:radial-gradient(circle at 35% 30%, #baffc9, #34d399 45%, #047857 100%);
-  box-shadow:0 0 30px rgba(52,211,153,0.6), 0 0 70px rgba(52,211,153,0.25), inset 0 0 20px rgba(255,255,255,0.4);
-}
-.orb.busy{animation:breathe 1.1s ease-in-out infinite, pulse-hot 1.1s ease-in-out infinite}
-@keyframes pulse-hot{0%,100%{box-shadow:0 0 30px rgba(0,217,255,0.6),0 0 70px rgba(0,217,255,0.25)}50%{box-shadow:0 0 45px rgba(0,217,255,1),0 0 100px rgba(0,217,255,0.5)}}
-/* Orb states (data-state on .orb-wrap, set by setOrb): idle breathes (above),
-   listening pulses, thinking swirls, speaking ripples. */
-.orb-swirl{position:absolute;inset:0;border-radius:50%;opacity:0;transition:opacity .4s;pointer-events:none;
-  background:conic-gradient(from 0deg,rgba(255,255,255,0) 0deg,rgba(186,140,255,0.75) 90deg,rgba(255,255,255,0) 180deg,rgba(127,245,255,0.7) 270deg,rgba(255,255,255,0) 360deg);
-  mix-blend-mode:screen}
-.orb-ripple{position:absolute;inset:0;border-radius:50%;border:2px solid rgba(127,245,255,0.7);opacity:0;pointer-events:none}
-.orb-wrap[data-state="listening"] .orb{animation:orb-listen .9s ease-in-out infinite;
-  box-shadow:0 0 40px rgba(127,245,255,0.9),0 0 90px rgba(0,217,255,0.45),inset 0 0 20px rgba(255,255,255,0.5)}
-.orb-wrap[data-state="thinking"] .orb{animation:breathe 1.6s ease-in-out infinite}
-.orb-wrap[data-state="thinking"] .orb-swirl{opacity:1;animation:ring-spin 1.4s linear infinite}
-.orb-wrap[data-state="speaking"] .orb{animation:breathe 1.2s ease-in-out infinite}
-.orb-wrap[data-state="speaking"] .orb-ripple{animation:orb-ripple 1.8s ease-out infinite}
-.orb-wrap[data-state="speaking"] .orb-ripple.r2{animation-delay:.9s}
-@keyframes orb-listen{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
-@keyframes orb-ripple{0%{transform:scale(1);opacity:.7}100%{transform:scale(1.6);opacity:0}}
-@media (prefers-reduced-motion: reduce){
-  .orb,.orb-swirl,.orb-ripple,.orb-wrap::before,.orb-wrap::after,.wave span{animation:none !important}
-  .orb-wrap[data-state="thinking"] .orb-swirl{opacity:.6}
-  .orb-wrap[data-state="speaking"] .orb-ripple{opacity:.5;transform:scale(1.15)}
-  .orb-wrap[data-state="speaking"] .orb-ripple.r2{opacity:0}
-}
-/* orb:end */
-
-.wave{display:flex;align-items:center;gap:3px;height:20px;opacity:0;transition:opacity .3s}
-.wave span{width:3px;background:rgba(255,255,255,0.85);border-radius:2px;animation:wave-bar 0.9s ease-in-out infinite}
-.wave span:nth-child(1){animation-delay:0s}
-.wave span:nth-child(2){animation-delay:.1s}
-.wave span:nth-child(3){animation-delay:.2s}
-.wave span:nth-child(4){animation-delay:.3s}
-.wave span:nth-child(5){animation-delay:.15s}
-@keyframes wave-bar{0%,100%{height:4px}50%{height:18px}}
+/* The orb: the shared look (ui/html.py orb_css, the same as the floating
+   orb's page) sized for this page; the disc's green rim says the wake word is on. */
+.orb-wrap{width:150px;height:150px;position:relative;--s:150px}
+.orb-wrap .disc.active{border-color:rgba(140,236,180,.9)}
+/*%ORB_CSS%*/
 
 .mist-title{font-family:'Orbitron',sans-serif;font-size:1.6em;font-weight:700;letter-spacing:.15em;color:var(--text);text-shadow:0 0 14px rgba(0,217,255,0.4)}
 .mist-status{font-size:.78em;color:var(--muted2);font-family:'DM Mono',monospace;display:flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);padding:5px 14px;border-radius:20px}
@@ -264,6 +210,7 @@ button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{trans
       <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works"></div></div>
       <div class="toggle-row" id="row-orb_flight"><span>Orb follows the task</span><div class="sw" id="sw-orb_flight" title="Needs the floating orb. The orb flies beside the window Mist is working in"></div></div>
       <div class="toggle-row" id="row-orb_panels"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Needs the floating orb. Two panels at the top of the screen: the steps Mist takes and its answer"></div></div>
+      <div class="toggle-row" id="row-firefox_signins"><span>Use my Firefox sign-ins</span><div class="sw" id="sw-firefox_signins" title="Copies your Firefox profile (cookies and saved logins) into MistAI's own browser so it can use sites you are signed in to. Off by default. Takes effect the next time MistAI's browser starts."></div></div>
     </div>
 
     <div class="card">
@@ -280,12 +227,8 @@ button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{trans
   </div>
 
   <div class="center">
-    <div class="orb-wrap" id="orb-wrap" data-state="idle">
-      <span class="orb-ripple"></span><span class="orb-ripple r2"></span>
-      <div class="orb" id="orb">
-        <div class="orb-swirl"></div>
-        <div class="wave" id="wave"><span></span><span></span><span></span><span></span><span></span></div>
-      </div>
+    <div class="orb-wrap" id="orb-wrap" data-state="idle" data-level="live">
+<!--%ORB_LAYERS%-->
     </div>
     <div class="mist-title">M.I.S.T.</div>
     <div class="mist-status ready" id="mist-status" role="status" aria-live="polite"><div class="dot" aria-hidden="true"></div><span id="mist-status-text">Ready</span></div>
@@ -365,7 +308,7 @@ const chat=document.getElementById('chat'),inp=document.getElementById('inp');
 const btnSend=document.getElementById('btn-send'),orb=document.getElementById('orb');
 const orbWrap=document.getElementById('orb-wrap');
 const swWake=document.getElementById('sw-wake');
-const swCap=document.getElementById('sw-cap'),wave=document.getElementById('wave');
+const swCap=document.getElementById('sw-cap');
 const selGender=document.getElementById('sel-gender');
 const apiModal=document.getElementById('apiModal');
 const mistStatus=document.getElementById('mist-status'),mistStatusText=document.getElementById('mist-status-text');
@@ -387,7 +330,8 @@ function makeSwitch(sw,label){
   sw.onkeydown=e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();if(sw.onclick)sw.onclick();}};
 }
 for(const [id,label] of [['sw-wake','Wake word'],['sw-cap','Captions'],['sw-orb','Floating orb'],
-  ['sw-orb_flight','Orb follows the task'],['sw-orb_panels','Task panels']]){
+  ['sw-orb_flight','Orb follows the task'],['sw-orb_panels','Task panels'],
+  ['sw-firefox_signins','Use my Firefox sign-ins']]){
   const sw=document.getElementById(id);if(sw)makeSwitch(sw,label);
 }
 // Hint chips and resource links are divs too: Enter or Space clicks them.
@@ -426,6 +370,7 @@ window.addEventListener('pywebviewready',()=>{
   runStep('stats',updateStats);
   runStep('status',checkStatus);
   runStep('orb',loadOrbSetting);
+  runStep('signins',loadFirefoxSignins);
 });
 
 // Developer-only controls stay hidden (and unused) unless Python says this is
@@ -494,7 +439,38 @@ function orbState(s){
 function setOrb(){
   const state=orbState({ptt:pttState,speaking:speaking,busy:busy});
   orbWrap.dataset.state=state;
+  followAudio(state);
   return state;
+}
+
+/*%ORB_LEVEL_JS%*/
+// While the orb is listening or speaking its core follows the mic or Mist's
+// voice: Api.audio_level every AUDIO_POLL_MS, smoothed by orbLevel. In every
+// other state nothing is polled and the core rests (level 0).
+const AUDIO_POLL_MS=80;
+const orbLvl=orbLevel(orbWrap);
+let audioPoll=null;
+const audioLive=(st)=>st==='listening'||st==='speaking';
+function followAudio(state){
+  if(!audioLive(state)){
+    if(audioPoll!==null){clearTimeout(audioPoll);audioPoll=null;}
+    orbLvl.set(0);
+    return;
+  }
+  if(audioPoll!==null||typeof pywebview==='undefined'||!pywebview.api
+     ||typeof pywebview.api.audio_level!=='function')return;
+  const tick=async()=>{
+    try{
+      const r=(await pywebview.api.audio_level())||{};
+      const st=orbWrap.dataset.state;
+      if(st==='listening')orbLvl.set(Number(r.mic)||0);
+      else if(st==='speaking')orbLvl.set(r.tts===null?null:(Number(r.tts)||0));
+    }catch(e){}
+    if(audioPoll===null)return;                  // stopped meanwhile
+    audioPoll=audioLive(orbWrap.dataset.state)?setTimeout(tick,AUDIO_POLL_MS):null;
+    if(audioPoll===null)orbLvl.set(0);
+  };
+  audioPoll=setTimeout(tick,0);
 }
 function showPttNote(text){
   clearTimeout(pttNoteTimer);
@@ -504,7 +480,6 @@ function showPttNote(text){
 function handleListenState(state,message){
   pttState=(state==='waiting'||state==='listening')?state:'idle';
   btnPtt.classList.toggle('active',pttState!=='idle');
-  wave.style.opacity=pttState==='listening'?'1':'0';
   // While listening, a second press ends the listen (Api.push_to_talk).
   pttLabel.textContent=pttState==='listening'?'Done':'Talk';
   clearTimeout(pttSafetyTimer);pttSafetyTimer=null;
@@ -578,6 +553,23 @@ swOrb.onclick=async()=>{
     if(r&&r.error)addMsg('Floating orb: '+r.error,'error');
   }catch(e){console.error('Floating orb toggle error:',e);}
 };
+
+// "Use my Firefox sign-ins" (off by default): Python saves it; MistAI's
+// browser reads it the next time it starts (Api.get_firefox_signins).
+async function loadFirefoxSignins(){
+  if(typeof pywebview.api.get_firefox_signins!=='function')return;
+  const sw=document.getElementById('sw-firefox_signins');
+  setSw(sw,!!(await pywebview.api.get_firefox_signins()));
+  sw.onclick=async()=>{
+    try{
+      const r=await pywebview.api.set_firefox_signins(!sw.classList.contains('on'));
+      setSw(sw,!!(r&&r.enabled));
+      if(r&&r.error)addMsg('Firefox sign-ins: '+r.error,'error');
+      else addMsg((r&&r.enabled?'Firefox sign-ins on':'Firefox sign-ins off')
+        +': applies the next time the Mist browser starts','system');
+    }catch(e){console.error('Firefox sign-ins toggle error:',e);}
+  };
+}
 
 function showAskUserPrompt(question){
   addMsg(question, 'assistant');
@@ -851,7 +843,6 @@ function showResult(res) {
   if (res.success) {
     if (res.command && res.command.speech) {
       addMsg(res.command.speech, 'assistant');
-      flashWave();
     }
     if (res.steps) addMsg(`Completed in ${res.steps} step${res.steps !== 1 ? 's' : ''}`, 'memory');
     updateStats();
@@ -871,7 +862,6 @@ function showResult(res) {
 function setBusy(b){
   busy=b;
   btnSend.disabled=inp.disabled=b;
-  orb.classList.toggle('busy',b);
   restoreStatus();
   setOrb();
 }
@@ -893,11 +883,6 @@ async function syncBusy(){
       if(inp.dataset.answering==="true"){inp.dataset.answering="false";inp.placeholder="Tell MistAI what to do...";}
     }
   }catch(e){}
-}
-
-function flashWave(){
-  wave.style.opacity='1';
-  setTimeout(()=>wave.style.opacity='0', 2200);
 }
 
 function addMsg(text,type){
@@ -1008,17 +993,21 @@ btnStop.onclick = async () => {
 </html>"""
 
 
-# The floating orb window (core/floating_orb.py): only the orb, no fonts, no
-# external resources; its js_api is OrbBridge. A flat frosted-glass disc
-# (config.ORB_TINT) sized in vmin, so it follows the window through the three
-# sizes. Ten looks, one per data-state (core/floating_orb.py orb_state), all
-# CSS inside the page (the window never resizes per frame): idle breathes;
-# listening, two outward rings; thinking, a rotating half arc; planning,
-# three nodes lighting in turn; executing, a slow quarter arc (small, docked);
-# reading, a scan line inside the disc; waiting, amber, a slow pause ring and
-# a pause glyph; speaking, two ripples and three moving bars; completed,
-# green, a check and one ring burst; error, soft red, an exclamation mark and
-# one short shake. Shape tells them apart, not colour alone. Motion stops
+# The orb's look, shared by the main window (HTML) and the floating orb window
+# (ORB_HTML, core/floating_orb.py): a flat frosted-glass disc (config.ORB_TINT)
+# whose layers are sized from --s, the orb's side (each page sets it), so one
+# block serves the 150 px main orb and the 100vmin floating one. Ten looks, one
+# per data-state (core/floating_orb.py orb_state): idle breathes; listening,
+# two outward rings; thinking, a rotating half arc; planning, three nodes
+# lighting in turn; executing, a slow quarter arc (small, docked); reading, a
+# scan line inside the disc; waiting, amber, a slow pause ring and a pause
+# glyph; speaking, two ripples and three moving bars; completed, green, a check
+# and one ring burst; error, soft red, an exclamation mark and one short shake.
+# Shape tells them apart, not colour alone. Every layer stays inside the disc:
+# nothing is drawn outside the orb's circle (no outer rings, glows or shadows).
+# While listening or speaking the inner core (.heart) follows the audio level:
+# --lvl (0..1, smoothed by orbLevel) scales and brightens it; with no level
+# (data-level="none": the fallback voice) it breathes instead. Motion stops
 # under prefers-reduced-motion and when Windows animation effects are off
 # (the bridge's "still": data-motion="still"); glyphs and tints stay.
 
@@ -1032,6 +1021,9 @@ ORB_STATE_TINTS = {
     "error": ("rgba(255,150,140,.58)", "rgba(196,72,72,.28)", "rgba(255,200,196,.95)"),
 }   # (tint centre, tint edge, glyph/ring colour)
 
+ORB_STATES = ("idle", "listening", "thinking", "planning", "executing", "reading", "waiting",
+              "speaking", "completed", "error")   # = core/floating_orb.py STATES
+
 
 # ============================================================
 # ORB PAGE STILL RULES
@@ -1042,7 +1034,7 @@ def _orb_still_rules(w):
     keeps its shape, glyph and tint (reduced motion, Windows animations off)."""
     return (
         f"{w},{w} .disc,{w} .ring,{w} .arc,{w} .ripple,{w} .halo,{w} .burst,{w} .scan,"
-        f"{w} .nodes i,{w} .bars i{{animation:none !important}}"
+        f"{w} .heart,{w} .nodes i,{w} .bars i{{animation:none !important}}"
         f'{w}[data-state="listening"] .ring{{opacity:.8;transform:scale(.95)}}'
         f'{w}[data-state="listening"] .ring.r2{{opacity:.45;transform:scale(.8)}}'
         f'{w}[data-state="thinking"] .arc{{opacity:1}}'
@@ -1056,36 +1048,48 @@ def _orb_still_rules(w):
         f'{w}[data-state="speaking"] .bars i{{transform:scaleY(.55)}}'
         f'{w}[data-state="speaking"] .bars i:nth-child(2){{transform:none}}'
         f'{w}[data-state="completed"] .burst{{opacity:0}}'
+        f"{w} .heart{{transform:scale(.9)}}{w} .heart::before{{opacity:.75}}"
     )
 
 
 # ============================================================
-# ORB PAGE
+# SHARED ORB CSS
 # ============================================================
 
-def _orb_page():
-    from core.config import ORB_TINT as t, orb_background
+def orb_css():
+    """The orb's whole look as one CSS string (built from config.ORB_TINT):
+    the layers, the ten state looks, the level-driven core, and the still
+    rules (one prefers-reduced-motion block plus data-motion="still"). The
+    page sets the wrapper's size and --s."""
+    from core.config import ORB_TINT as t
 
-    # The disc fills the window (the round region is the disc's edge) and the
-    # page and window background is the rim colour (config.orb_background),
-    # so a frame the page has not painted yet never shows black.
-    bg = orb_background()
     tint = ""
     for state, (centre, edge, _ink) in ORB_STATE_TINTS.items():
         tint += (f'.orb-wrap[data-state="{state}"] .tint{{opacity:1;'
                  f"background:radial-gradient(circle,{centre} 0%,{edge} 100%)}}")
     w_ink, c_ink, e_ink = (ORB_STATE_TINTS[k][2] for k in ("waiting", "completed", "error"))
-    css = (
-        f"html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:{bg}}}"
-        "body{display:flex;align-items:center;justify-content:center;user-select:none;"
-        "-webkit-user-select:none;cursor:default}"
-        ".orb-wrap{position:relative;width:100vmin;height:100vmin}"
-        ".disc,.tint,.inner,.ring,.arc,.ripple,.halo,.burst{position:absolute;inset:0;"
+
+    def u(k):                                   # a length: k x the orb's side
+        return f"calc(var(--s) * {k})"
+
+    return (
+        ".disc,.tint,.heart,.inner,.ring,.arc,.ripple,.halo,.burst{position:absolute;inset:0;"
         "border-radius:50%;pointer-events:none}"
         f".disc{{background:radial-gradient(circle,{t['center']} 0%,{t['mid']} 58%,{t['edge']} 100%);"
         f"border:1px solid {t['border']};box-sizing:border-box;"
         "animation:breathe 3.2s ease-in-out infinite}"
         ".tint{opacity:0;transition:opacity .35s ease}"
+        # The audio-driven core: 52% of the disc at rest, at most 62% (scale 1.2).
+        # --lvl moves only transform and opacity (compositor-only, no repaint):
+        # the size on .heart, the brightness as its glow layer's opacity.
+        ".heart{inset:24%;opacity:0;transition:opacity .25s ease;will-change:transform;"
+        "transform:scale(calc(.82 + var(--lvl, 0) * .38))}"
+        ".heart::before{content:'';position:absolute;inset:0;border-radius:50%;"
+        f"background:radial-gradient(circle,{t['center']} 0%,{t['mid']} 60%,rgba(255,255,255,0) 100%);"
+        "will-change:opacity;opacity:calc(.5 + var(--lvl, 0) * .5)}"
+        '.orb-wrap[data-state="listening"] .heart,.orb-wrap[data-state="speaking"] .heart{opacity:1}'
+        '.orb-wrap[data-state="speaking"][data-level="none"] .heart{'
+        "animation:heart 1.2s ease-in-out infinite}"
         ".inner{inset:6%;overflow:hidden}"
         f".scan{{position:absolute;left:0;right:0;top:0;height:14%;opacity:0;"
         f"background:linear-gradient(to bottom,transparent,{t['border']},transparent)}}"
@@ -1097,23 +1101,24 @@ def _orb_page():
         ".core{position:absolute;inset:0;display:flex;align-items:center;"
         "justify-content:center;pointer-events:none}"
         ".core>span{position:absolute;display:none;align-items:center;justify-content:center}"
-        f".nodes{{gap:7vmin}}.nodes i{{display:block;width:10vmin;height:10vmin;"
+        f".nodes{{gap:{u('.07')}}}.nodes i{{display:block;width:{u('.10')};height:{u('.10')};"
         f"border-radius:50%;background:{t['center']};opacity:.25;"
         "animation:node 1.2s ease-in-out infinite}"
         ".nodes i:nth-child(2){animation-delay:.4s}.nodes i:nth-child(3){animation-delay:.8s}"
-        f".bars{{gap:5vmin}}.bars i{{display:block;width:7vmin;height:30vmin;"
-        f"border-radius:4vmin;background:{t['center']};transform:scaleY(.4);"
+        f".bars{{gap:{u('.05')}}}.bars i{{display:block;width:{u('.07')};height:{u('.30')};"
+        f"border-radius:{u('.04')};background:{t['center']};transform:scaleY(.4);"
         "animation:bar .9s ease-in-out infinite}"
         ".bars i:nth-child(2){animation-delay:-.3s}.bars i:nth-child(3){animation-delay:-.6s}"
-        f".g-pause{{gap:7vmin}}.g-pause i{{display:block;width:8vmin;height:28vmin;"
-        f"border-radius:2vmin;background:{w_ink}}}"
-        f".g-check{{width:15vmin;height:30vmin;box-sizing:border-box;"
-        f"border-right:6vmin solid {c_ink};border-bottom:6vmin solid {c_ink};"
-        "border-radius:1vmin;transform:translateY(-4vmin) rotate(45deg)}"
-        ".g-excl{flex-direction:column;gap:4vmin}"
-        f".g-excl i{{display:block;width:8vmin;border-radius:4vmin;background:{e_ink}}}"
-        ".g-excl i:first-child{height:26vmin}.g-excl i:last-child{height:8vmin}"
+        f".g-pause{{gap:{u('.07')}}}.g-pause i{{display:block;width:{u('.08')};height:{u('.28')};"
+        f"border-radius:{u('.02')};background:{w_ink}}}"
+        f".g-check{{width:{u('.15')};height:{u('.30')};box-sizing:border-box;"
+        f"border-right:{u('.06')} solid {c_ink};border-bottom:{u('.06')} solid {c_ink};"
+        f"border-radius:{u('.01')};transform:translateY({u('-.04')}) rotate(45deg)}}"
+        f".g-excl{{flex-direction:column;gap:{u('.04')}}}"
+        f".g-excl i{{display:block;width:{u('.08')};border-radius:{u('.04')};background:{e_ink}}}"
+        f".g-excl i:first-child{{height:{u('.26')}}}.g-excl i:last-child{{height:{u('.08')}}}"
         "@keyframes breathe{0%,100%{filter:brightness(1)}50%{filter:brightness(1.08)}}"
+        "@keyframes heart{0%,100%{transform:scale(.84)}50%{transform:scale(1.02)}}"
         "@keyframes pulse{0%{transform:scale(.7);opacity:.9}100%{transform:scale(1.05);opacity:0}}"
         "@keyframes spin{to{transform:rotate(360deg)}}"
         "@keyframes ripple{0%{transform:scale(.5);opacity:.7}100%{transform:scale(1.05);opacity:0}}"
@@ -1145,6 +1150,101 @@ def _orb_page():
         + "@media (prefers-reduced-motion: reduce){" + _orb_still_rules(".orb-wrap") + "}"
         + _orb_still_rules('.orb-wrap[data-motion="still"]')
     )
+
+
+# ============================================================
+# SHARED ORB LAYERS
+# ============================================================
+
+def orb_layers(disc_id=""):
+    """The orb's layers (inside an .orb-wrap): back to front, the ripples,
+    the disc (``disc_id`` names it for the main page's wake-word rim), the
+    state tint, the audio core, the scan line, the rings and arcs, and the
+    glyphs."""
+    disc = f'<div class="disc" id="{disc_id}"></div>' if disc_id else '<div class="disc"></div>'
+    return (
+        '  <span class="ripple"></span><span class="ripple r2"></span>\n'
+        f'  {disc}<div class="tint"></div><span class="heart"></span>\n'
+        '  <div class="inner"><span class="scan"></span></div>\n'
+        '  <span class="ring"></span><span class="ring r2"></span><span class="arc"></span>\n'
+        '  <span class="halo"></span><span class="burst"></span>\n'
+        '  <div class="core">\n'
+        '    <span class="nodes"><i></i><i></i><i></i></span>\n'
+        '    <span class="bars"><i></i><i></i><i></i></span>\n'
+        '    <span class="glyph g-pause"><i></i><i></i></span>\n'
+        '    <span class="glyph g-check"></span>\n'
+        '    <span class="glyph g-excl"><i></i><i></i></span>\n'
+        '  </div>'
+    )
+
+
+# ============================================================
+# SHARED ORB LEVEL SMOOTHING
+# ============================================================
+
+# orbLevel(wrap): the polled audio level (0..1, or null when the voice has no
+# level) becomes --lvl on the wrapper, smoothed on animation frames: fast
+# attack (ATTACK_S), slower decay (DECAY_S); frames stop once it has settled.
+# null sets data-level="none" (the core breathes instead). Under reduced
+# motion or data-motion="still" the core rests at 0. Both pages use it.
+ORB_LEVEL_JS = r"""function orbLevel(wrap){
+  const ATTACK_S=0.05,DECAY_S=0.25;
+  let target=0,cur=0,last=0,raf=0;
+  const reduced=()=>typeof matchMedia==='function'
+    &&matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const still=()=>wrap.dataset.motion==='still'||reduced();
+  const write=(v)=>{
+    if(wrap.style&&typeof wrap.style.setProperty==='function')
+      wrap.style.setProperty('--lvl',v.toFixed(3));
+  };
+  function frame(t){
+    const dt=last?Math.min(0.1,(t-last)/1000):1/60;
+    last=t;
+    const tau=target>cur?ATTACK_S:DECAY_S;
+    cur+=(target-cur)*(1-Math.exp(-dt/tau));
+    if(Math.abs(target-cur)<0.002)cur=target;
+    write(cur);
+    if(cur===target){raf=0;last=0;}
+    else raf=requestAnimationFrame(frame);
+  }
+  return {set(level){
+    wrap.dataset.level=level===null?'none':'live';
+    target=(typeof level==='number'&&isFinite(level))?Math.max(0,Math.min(1,level)):0;
+    if(still()||typeof requestAnimationFrame!=='function'){
+      cur=still()?0:target;
+      write(cur);
+      return;
+    }
+    if(!raf)raf=requestAnimationFrame(frame);
+  },
+  get value(){return cur;}};
+}
+"""
+
+
+# ============================================================
+# ORB PAGE
+# ============================================================
+
+ORB_POLL_MS = 500        # the floating orb page's state poll
+ORB_FAST_POLL_MS = 80    # ...while listening or speaking (the audio-driven core)
+
+
+def _orb_page():
+    from core.config import orb_background
+
+    # The disc fills the window (the round region is the disc's edge) and the
+    # page and window background is the rim colour (config.orb_background),
+    # so a frame the page has not painted yet never shows black.
+    bg = orb_background()
+    css = (
+        f"html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:{bg}}}"
+        "body{display:flex;align-items:center;justify-content:center;user-select:none;"
+        "-webkit-user-select:none;cursor:default}"
+        ".orb-wrap{position:relative;width:100vmin;height:100vmin;--s:100vmin}"
+        + orb_css()
+    )
+    states = ",".join(f"'{s}'" for s in ORB_STATES)
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1155,35 +1255,32 @@ def _orb_page():
 </style>
 </head>
 <body>
-<div class="orb-wrap" id="orb-wrap" data-state="idle" data-motion="on">
-  <span class="ripple"></span><span class="ripple r2"></span>
-  <div class="disc"></div><div class="tint"></div>
-  <div class="inner"><span class="scan"></span></div>
-  <span class="ring"></span><span class="ring r2"></span><span class="arc"></span>
-  <span class="halo"></span><span class="burst"></span>
-  <div class="core">
-    <span class="nodes"><i></i><i></i><i></i></span>
-    <span class="bars"><i></i><i></i><i></i></span>
-    <span class="glyph g-pause"><i></i><i></i></span>
-    <span class="glyph g-check"></span>
-    <span class="glyph g-excl"><i></i><i></i></span>
-  </div>
+<div class="orb-wrap" id="orb-wrap" data-state="idle" data-motion="on" data-level="live">
+""" + orb_layers() + """
 </div>
 <script>
+""" + ORB_LEVEL_JS + """
 window.addEventListener('pywebviewready',()=>{
   const wrap=document.getElementById('orb-wrap');
-  const STATES=['idle','listening','thinking','planning','executing','reading','waiting',
-                'speaking','completed','error'];
+  const STATES=[""" + states + """];
+  // The state from the bridge every POLL_MS; every FAST_POLL_MS while the
+  // core follows the mic or the voice (listening, speaking), when the reply
+  // also carries "level". Each poll schedules the next one, so a slow reply
+  // never stacks calls.
+  const POLL_MS=""" + str(ORB_POLL_MS) + """,FAST_POLL_MS=""" + str(ORB_FAST_POLL_MS) + """;
+  const LIVE=['listening','speaking'];
+  const lvl=orbLevel(wrap);
   async function poll(){
     try{
       const s=await pywebview.api.orb_state();
       const st=String(s&&s.state||'idle');
       wrap.dataset.state=STATES.includes(st)?st:'idle';
       wrap.dataset.motion=(s&&s.still)?'still':'on';
+      lvl.set(LIVE.includes(wrap.dataset.state)&&s&&'level' in s?s.level:0);
     }catch(e){}
+    setTimeout(poll,LIVE.includes(wrap.dataset.state)?FAST_POLL_MS:POLL_MS);
   }
   poll();
-  setInterval(poll,500);
   // Hold to talk: a press held HOLD_MS without moving starts push-to-talk and
   // the release sends it; a quick tap toggles (start, then a second tap
   // sends). Moving more than DRAG_PX is a drag (pywebview easy_drag), never talk.
@@ -1217,7 +1314,18 @@ window.addEventListener('pywebviewready',()=>{
 ORB_HTML = _orb_page()
 
 
-# A task panel window (core/orb_panels.py): dark translucent glass, rounded,
+# ============================================================
+# MAIN PAGE ORB
+# ============================================================
+
+# The main window's orb is the same look (orb_css, orb_layers, orbLevel),
+# placed where HTML has its markers; its disc keeps id="orb" (the wake-word rim).
+HTML = (HTML.replace("/*%ORB_CSS%*/", orb_css())
+        .replace("<!--%ORB_LAYERS%-->", orb_layers("orb"))
+        .replace("/*%ORB_LEVEL_JS%*/", ORB_LEVEL_JS))
+
+
+# A task panel window (core/floating_orb.py TASK PANELS): dark translucent glass, rounded,
 # a close button, a short drop in from above. Its js_api is
 # PanelBridge (panel_state, dismiss). Text goes in through textContent only.
 # The status kinds (waiting: the open question and a hint, amber, a pause

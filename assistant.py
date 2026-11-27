@@ -47,13 +47,18 @@ import webview  # noqa: E402  (must come after stderr filtering / env setup)
 from core.api import Api  # noqa: E402
 from core.caption import show_splash, start_tk_root  # noqa: E402
 from ui.html import HTML  # noqa: E402
-from core.config import VERSION, enable_crash_log, get_resource_path, setup_tesseract  # noqa: E402
+from core.config import (  # noqa: E402
+    VERSION, configure_comtypes_cache, enable_crash_log, get_resource_path, setup_tesseract,
+)
 
 
 def main():
     # A native crash leaves every thread's stack in ~/MistAI/logs/crash.log
     # (frames only, no content); works frozen, where there is no stderr.
     enable_crash_log()
+    # comtypes' generated COM modules (the Windows voice, UI Automation) go to
+    # a user-writable cache, never site-packages or the frozen unpack folder.
+    configure_comtypes_cache()
     print(f"[MistAI v{VERSION}] Starting...")
     start_tk_root()
     show_splash(get_resource_path)

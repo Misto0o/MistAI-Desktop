@@ -57,8 +57,11 @@ a = Analysis(
         'requests',
         'speech_recognition',
         'pyttsx3',
+        'pyttsx3.drivers',
+        'pyttsx3.drivers.sapi5',   # loaded by name at runtime (the Windows voice)
         'pyaudio',
         '_portaudio',
+        'audioop',          # stdlib before 3.13, the audioop-lts package from 3.13
         'psutil',
         'pytesseract',
         'PIL',
@@ -81,6 +84,7 @@ a = Analysis(
         'difflib',
         'pycaw.pycaw',
         'comtypes',
+        'comtypes.client',
         'browser_cookie3',
     ] + playwright_hiddenimports,
     hookspath=[],

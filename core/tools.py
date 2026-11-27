@@ -255,6 +255,12 @@ def _T(name, **kw):
 # open_app / switch_app: their own text plus an APP_NOTES tip (<= 350 chars).
 APP_RESULT_CHARS = 800
 
+# browser_* results that end with the numbered element list (about 6000
+# chars, browser_session.ELEMENT_LIST_CHARS) after their own text and the
+# page excerpt (900). At or above READ_RESULT_CHARS, so only the two newest
+# stay in full in the resent history.
+BROWSER_LIST_RESULT_CHARS = 8000
+
 SPECS = dict(
     [
         # -- Apps & windows ------------------------------------------------------
@@ -494,6 +500,7 @@ SPECS = dict(
             settle=1.0,
             base_confidence=0.9,
             categories=("browser",),
+            result_chars=BROWSER_LIST_RESULT_CHARS,
         ),
         _T(
             "browser_navigate",
@@ -501,7 +508,7 @@ SPECS = dict(
             settle=1.0,
             base_confidence=0.92,
             categories=("browser",),
-            result_chars=1200,
+            result_chars=BROWSER_LIST_RESULT_CHARS,
         ),
         _T(
             "browser_search",
@@ -509,15 +516,31 @@ SPECS = dict(
             settle=1.0,
             base_confidence=0.92,
             categories=("browser",),
-            result_chars=1200,
+            result_chars=BROWSER_LIST_RESULT_CHARS,
         ),
         _T("browser_close", categories=("browser",)),
+        # The click handler watches for the effect itself (CLICK_EFFECT_S).
         _T(
             "browser_click",
-            settle=0.3,
+            settle=0.1,
             base_confidence=0.95,
             base_reliability=0.9,
             categories=("browser", "click"),
+            result_chars=BROWSER_LIST_RESULT_CHARS,
+        ),
+        _T(
+            "browser_elements",
+            settle=0.0,
+            base_confidence=0.98,
+            categories=("browser", "perception"),
+            result_chars=BROWSER_LIST_RESULT_CHARS,
+        ),
+        _T(
+            "browser_scroll",
+            settle=0.1,
+            base_confidence=0.95,
+            categories=("browser",),
+            result_chars=BROWSER_LIST_RESULT_CHARS,
         ),
         _T(
             "browser_fill",
@@ -716,21 +739,34 @@ _PLAYBOOK = {
     "volume_unmute": ("Unmute system audio", "",
                       "Windows Core Audio API -- deterministic, no toggle guessing."),
     "browser_open": ("Start MistAI's browser", "optional starting URL"),
-    "browser_navigate": ("Go to a URL in MistAI's browser", "url",
+    "browser_navigate": ("Go to a URL in MistAI's browser (to read or click its content)", "url",
                          "A channel is youtube.com/@handle; a YouTube search is "
                          "youtube.com/results?search_query=YOUR+TERMS (one step instead "
                          "of six)."),
     "browser_search": ("Web search (DuckDuckGo) in one step", "search query"),
     "browser_close": ("Close MistAI's browser", ""),
     "browser_click": (
-        "Click by visible text in MistAI's browser",
-        'text, or text|role (e.g. "Subscribe|button")',
-        "Use text|role for precision when plain text matches more than one element "
-        "(role examples: button, link, checkbox, textbox). Talks to the real page "
-        "structure -- raises a real error if nothing matches, never silently clicks the "
-        "wrong thing."),
+        "Click an element in MistAI's browser by its number from the element list",
+        'number from the list (e.g. "12"); or visible text, or text|role',
+        "Every browser_* result ends with a numbered element list; use its numbers (a number "
+        "stays with its element until the page changes; an old number is refused, not "
+        "guessed). Text matches prefer visible links and buttons; with several matches it "
+        "clicks the best and says which; no match fails at once with the closest names. "
+        "A covered element is not clicked: the result names what covers it. The result says "
+        "what happened: a new page, a new tab, a download (saved to the user's Downloads "
+        "folder, never overwriting; the result names the file), a dialog, or that nothing "
+        "changed.",
+        "12"),
+    "browser_elements": (
+        "List what is clickable on MistAI's browser page, numbered (fresh numbers)", "",
+        "A dialog's elements come first, then the main content on screen, then menus; "
+        "off-screen items are counted (browser_scroll, then browser_elements again)."),
+    "browser_scroll": ("Scroll MistAI's browser page; returns the new element list",
+                       "down, up, top or bottom"),
     "browser_fill": ("Fill a form field in MistAI's browser",
-                     "field label or placeholder|text to type"),
+                     "field number from the list, label or placeholder|text to type",
+                     "Does not submit. No matching field fails at once with the fields the "
+                     "page has.", "4|lofi hip hop"),
     "browser_get_text": (
         "Read the page's exact DOM text (trust it, don't re-verify)",
         "optional CSS selector, empty = whole page",
@@ -745,15 +781,19 @@ _PLAYBOOK = {
     "browser_import_cookies": (
         "Import one domain's cookies from the user's real Firefox (rarely needed)",
         "domain, or domain1|domain2",
-        "MistAI's browser AUTO-SEEDS from the user's real Firefox logins on its own "
-        'first-ever launch -- do NOT call this for a normal "am I logged in" / "use my '
-        "cookies\" request. Only for ONE SPECIFIC domain that wasn't part of the original "
-        "seed."),
+        "Works only when the user turned on Settings > Use my Firefox sign-ins (off by "
+        "default; then nothing is read from their Firefox). With it on, MistAI's browser "
+        "already starts from their Firefox logins: call this only for ONE SPECIFIC domain "
+        "missing from that copy."),
     "browser_use_daily_profile": (
-        "Re-seed MistAI's browser from the user's real Firefox (rarely needed)", "",
-        "Only if the user wants to REFRESH with a login added since the original "
-        "auto-seed. Not needed on a normal first use."),
-    "open_url": ("Open a website in the user's own browser", "url"),
+        "Re-copy the user's Firefox logins into MistAI's browser (rarely needed)", "",
+        "Works only when Settings > Use my Firefox sign-ins is on, and only if the user wants "
+        "a login added since the first copy."),
+    "open_url": ("Open a page in the user's own browser for them to view (no reading/clicking)",
+                 "url",
+                 "Only when the user just wants a page opened, or asks for their own browser. "
+                 "To read, search or click web content use browser_search/browser_navigate "
+                 "instead; after an open_url, browser_navigate the same URL for that."),
     "check_email": ("Check unread emails", ""),
     "analyze_screen": ("General visual description of the screen", ""),
     "read_screen_text": ("Answer a SPECIFIC question about content VISIBLE on screen",
@@ -800,6 +840,7 @@ _ARG_RX = {
     "copy_files": r"[^|]*\S[^|]*\|\|\|\s*\S",
     "quick_message": r"[^|]*\S[^|]*\|[^|]*\S[^|]*\|\s*\S",
     "browser_fill": r"[^|]*\S[^|]*\|",
+    "browser_scroll": r"(?i)\s*((up|down|top|bottom)\s*)?$",
     "click_nth": r"\s*\d+\s*\|\s*\S",
     "click_coords": r"\s*\d+\s*,\s*\d+\s*$",
     "brightness_set": r"\s*(100|\d{1,2})\s*%?\s*$",

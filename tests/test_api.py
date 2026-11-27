@@ -283,7 +283,7 @@ let out_actions = [];
     cls: document.getElementById('mist-status').className,
     ptt: document.getElementById('btn-ptt').classList.list,
     label: document.getElementById('ptt-label').textContent,
-    wave: document.getElementById('wave').style.opacity || '',
+    orb: document.getElementById('orb-wrap').dataset.state || '',
   });
   out_actions = [];
   for (const a of CONFIG.actions || []) {
@@ -707,7 +707,7 @@ def test_push_to_talk_button_and_states():
 # UI PAGE HELPERS (7)
 # ============================================================
 
-READY = {"text": "Ready", "cls": "mist-status ready", "ptt": [], "wave": "0"}
+READY = {"text": "Ready", "cls": "mist-status ready", "ptt": [], "orb": "idle"}
 
 
 def _run(tmp_path, actions, ptt=None):
@@ -717,7 +717,7 @@ def _run(tmp_path, actions, ptt=None):
 
 
 def _status(snap):
-    return {k: snap[k] for k in ("text", "cls", "ptt", "wave")}
+    return {k: snap[k] for k in ("text", "cls", "ptt", "orb")}
 
 
 # ============================================================
@@ -736,9 +736,9 @@ def test_a_press_shows_waiting_then_listening_then_returns(tmp_path):
     # does not parse the HTML, so the untouched status text reads "".)
     assert a[0]["calls"] == 1 and a[0]["text"] == "" and a[0]["ptt"] == []
     assert _status(a[1]) == {"text": "Waiting for mic...", "cls": "mist-status listening",
-                             "ptt": ["active"], "wave": "0"}
+                             "ptt": ["active"], "orb": "listening"}
     assert _status(a[2]) == {"text": "Listening...", "cls": "mist-status listening",
-                             "ptt": ["active"], "wave": "1"}
+                             "ptt": ["active"], "orb": "listening"}
     assert _status(a[3]) == READY
     assert all(s["wake"] == [] for s in a)                  # wake stays off
 
@@ -752,7 +752,7 @@ def test_didnt_catch_that_shows_for_three_seconds(tmp_path):
         {"advance": 200},
     ])
     assert _status(a[1]) == {"text": "Didn't catch that", "cls": "mist-status notice",
-                             "ptt": [], "wave": "0"}
+                             "ptt": [], "orb": "idle"}
     assert a[2]["text"] == "Didn't catch that"
     assert _status(a[3]) == READY
 

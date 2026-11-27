@@ -1359,12 +1359,72 @@ def test_the_route_line_names_the_reason_and_never_the_message(monkeypatch, caps
     assert "diary" not in line and "secret" not in line
 
 
-def test_a_reply_that_never_came_within_the_timeout_is_labelled_timeout(monkeypatch, capsys):
-    clock = iter([0.0, 6.0])
-    monkeypatch.setattr(conversation.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr("core.planner._llm", lambda *a, **k: "")
-    conversation.try_chat(_api(), "hi there", "none")
-    assert "route=task in 6.00s (timeout)" in capsys.readouterr().out
+def _timing_out_router(monkeypatch, replies):
+    """planner._llm stand-in: each call takes its whole timeout (a timeout)
+    when its scripted reply is "", else returns at once. Returns the timeouts."""
+    clock, calls = [0.0], []
+    monkeypatch.setattr(conversation.time, "monotonic", lambda: clock[0])
+    monkeypatch.delenv("MISTAI_CHAT_TIMEOUT", raising=False)
+    script = iter(replies)
+
+    def fake_llm(api, prompt, model, timeout, label, fallback, **_k):
+        calls.append(timeout)
+        raw = next(script)
+        if not raw:
+            clock[0] += timeout
+        return raw
+    monkeypatch.setattr("core.planner._llm", fake_llm)
+    return calls
+
+
+def test_a_timed_out_router_call_is_retried_once_with_the_longer_timeout(monkeypatch, capsys):
+    calls = _timing_out_router(monkeypatch, ["", '{"route": "chat", "reply": "Hello!"}'])
+    assert conversation.try_chat(_api(), "hi there", "none") == "Hello!"
+    assert calls == [config.CHAT_TIMEOUT, config.CHAT_RETRY_TIMEOUT]
+    out = capsys.readouterr().out
+    assert "[Conversation] router timed out after 5.0s -- retrying with 8.0s" in out
+    assert "route=chat in 5.00s (retry)" in out
+
+
+def test_a_retry_that_says_task_goes_to_the_agent_labelled_retry(monkeypatch, capsys):
+    _timing_out_router(monkeypatch, ["", '{"route": "task", "reply": ""}'])
+    assert conversation.try_chat(_api(), "open notepad", "none") is None
+    assert "route=task in 5.00s (retry)" in capsys.readouterr().out
+
+
+def test_two_timeouts_send_an_action_like_message_to_the_agent(monkeypatch, capsys):
+    calls = _timing_out_router(monkeypatch, ["", ""])
+    assert conversation.try_chat(_api(), "Mist, can you open notepad", "none") is None
+    assert len(calls) == 2
+    out = capsys.readouterr().out
+    assert "router failed again (timeout) -- deciding locally: action-like" in out
+    assert "route=task in 13.00s (local: action-like)" in out
+    assert "notepad" not in out
+
+
+def test_two_timeouts_answer_conversation_with_the_slow_reply(monkeypatch, capsys):
+    _timing_out_router(monkeypatch, ["", ""])
+    assert conversation.try_chat(_api(), "hi, how are you", "none") == conversation.CHAT_SLOW_REPLY
+    assert "route=chat in 13.00s (local: conversation)" in capsys.readouterr().out
+
+
+def test_a_fast_failure_is_not_retried_and_still_goes_to_the_agent(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr("core.planner._llm", lambda *a, **k: calls.append(1) or "")
+    assert conversation.try_chat(_api(), "hi there", "none") is None
+    assert calls == [1]
+    assert capsys.readouterr().out.rstrip().endswith("(no reply)")
+
+
+@pytest.mark.parametrize("message, action", [
+    ("open notepad", True), ("Mist, can you search YouTube for lofi", True),
+    ("please close chrome", True), ("could you send Sam a message", True),
+    ("visit www.python.org", True), ("what's on my screen", True), ("where is report.pdf", True),
+    ("hi, how are you", False), ("what is the capital of France", False),
+    ("tell me a joke", False), ("thanks", False), ("misty mountains are nice", False),
+])
+def test_the_local_check_reads_requests_to_act(message, action):
+    assert conversation.looks_like_action(message) is action
 
 
 def test_a_task_decision_has_no_label(monkeypatch, capsys):
