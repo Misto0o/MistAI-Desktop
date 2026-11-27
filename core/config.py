@@ -32,52 +32,56 @@
 #   24. ORB BACKGROUND
 #   25. ORB DEBUG AND MOTION FLAGS
 #   26. ORB MOTION STYLE
-#   27. ORB FLIGHT, PANELS, BROWSER PROFILE AND ANCHOR FLAGS
-#   28. VISION CLICK NUDGE
-#   29. CONFIRMATION LISTEN SETTINGS
-#   30. CONFIRMATION LISTEN PROFILE
-#   31. RE-MINIMIZE AFTER CONFIRMATION
-#   32. RECIPIENT MATCH LIMITS
-#   33. PERSON NAME NORMALIZATION
-#   34. RECIPIENT MATCH
-#   35. ASK BEFORE SENDING
-#   36. GROUNDED SEND CHECK
-#   37. VOICE DIAGNOSTICS FLAG
-#   38. NARRATION MODES
-#   39. NARRATION MODE
-#   40. WAKE CLIPS, HOTKEYS AND FACT CATEGORIES
-#   41. FACTS FILE PATH
-#   42. DATABASE PATH
-#   43. HISTORY RETENTION DEFAULT
-#   44. HISTORY RETENTION
-#   45. OWN PROCESS AND APP ALIASES
-#   46. PROCESS NAME NORMALIZATION
-#   47. APP PROCESS NAMES
-#   48. VENDOR PREFIXES
-#   49. PROCESS NAME CORES
-#   50. PROCESS MATCHING
-#   51. TRACKED PROCESSES AND SECRET FILE PATTERNS
-#   52. SECRET FILE REFERENCES
-#   53. OUTBOUND SCRUB PATTERNS
-#   54. CARD NUMBER CHECKSUM
-#   55. OUTBOUND SCRUB
-#   56. INJECTION FLAGS
-#   57. SECRET OUTPUT GUARD
-#   58. CREDENTIAL FAILURE PATTERNS
-#   59. CREDENTIAL FAILURE HINT
-#   60. SEARCH ENGINES AND ROUTES
-#   61. BLOCKED SEARCH PAGES
-#   62. SECRET TEXT GUARD
-#   63. BUNDLED RESOURCE PATHS
-#   64. JAVASCRIPT STRING ESCAPING
-#   65. TESSERACT SETUP
-#   66. BACKEND SELECTION
-#   67. API ERROR REDACTION
-#   68. API ERROR WORDING
-#   69. BACKEND URL AND KEY
-#   70. CRASH LOG
-#   71. COMTYPES CACHE
-#   72. DESTRUCTIVE GUARD AND AUDIT TRAIL
+#   27. ENV-OR-SAVED SWITCHES
+#   28. FLOATING ORB SWITCH -> FLIGHT, POINTER, IDLE DRIFT
+#   29. PANEL ANCHOR OVERRIDE (DEVELOPER ONLY)
+#   30. VISION CLICK NUDGE
+#   31. CONFIRMATION LISTEN SETTINGS
+#   32. CONFIRMATION LISTEN PROFILE
+#   33. RE-MINIMIZE AFTER CONFIRMATION
+#   34. RECIPIENT MATCH LIMITS
+#   35. PERSON NAME NORMALIZATION
+#   36. RECIPIENT MATCH
+#   37. ASK BEFORE SENDING
+#   38. MESSAGES SWITCH MAPPING
+#   39. GROUNDED SEND CHECK
+#   40. VOICE DIAGNOSTICS FLAG
+#   41. NARRATION MODES
+#   42. NARRATION MODE
+#   43. WAKE CLIPS, HOTKEYS AND FACT CATEGORIES
+#   44. FACTS FILE PATH
+#   45. DATABASE PATH
+#   46. HISTORY RETENTION DEFAULT
+#   47. HISTORY RETENTION
+#   48. OWN PROCESS AND APP ALIASES
+#   49. APP NOTES
+#   50. PROCESS NAME NORMALIZATION
+#   51. APP PROCESS NAMES
+#   52. VENDOR PREFIXES
+#   53. PROCESS NAME CORES
+#   54. PROCESS MATCHING
+#   55. TRACKED PROCESSES AND SECRET FILE PATTERNS
+#   56. SECRET FILE REFERENCES
+#   57. OUTBOUND SCRUB PATTERNS
+#   58. CARD NUMBER CHECKSUM
+#   59. OUTBOUND SCRUB
+#   60. INJECTION FLAGS
+#   61. SECRET OUTPUT GUARD
+#   62. CREDENTIAL FAILURE PATTERNS
+#   63. CREDENTIAL FAILURE HINT
+#   64. SEARCH ENGINES AND ROUTES
+#   65. BLOCKED SEARCH PAGES
+#   66. SECRET TEXT GUARD
+#   67. BUNDLED RESOURCE PATHS
+#   68. JAVASCRIPT STRING ESCAPING
+#   69. TESSERACT SETUP
+#   70. BACKEND SELECTION
+#   71. API ERROR REDACTION
+#   72. API ERROR WORDING
+#   73. BACKEND URL AND KEY
+#   74. CRASH LOG
+#   75. COMTYPES CACHE
+#   76. DESTRUCTIVE GUARD AND AUDIT TRAIL
 # ============================================================
 
 """
@@ -727,7 +731,7 @@ def orb_motion():
 
 
 # ============================================================
-# ORB FLIGHT, PANELS, BROWSER PROFILE AND ANCHOR FLAGS
+# ENV-OR-SAVED SWITCHES
 # ============================================================
 
 def _env_or_saved(name, saved):
@@ -736,9 +740,19 @@ def _env_or_saved(name, saved):
     return flag if flag is not None else str(saved or "").lower() == "on"
 
 
-def orb_flight_enabled(saved=None):
-    """MISTAI_ORB_FLIGHT, else Settings "Orb follows the task" (default off)."""
-    return _env_or_saved("MISTAI_ORB_FLIGHT", saved)
+# ============================================================
+# FLOATING ORB SWITCH -> FLIGHT, POINTER, IDLE DRIFT
+# ============================================================
+# One Settings switch, "Floating orb" (profile "floating_orb"), turns on the
+# orb AND its three behaviors: following the task, pointing before clicks and
+# idle drift. ``orb_on`` is that switch. The old per-behavior switches
+# ("orb_flight", "orb_pointer", "orb_idle_drift" profile rows) are no longer
+# read (left in the database untouched); their env flags stay as
+# developer-only overrides that win over the switch.
+
+def orb_flight_enabled(orb_on=False):
+    """MISTAI_ORB_FLIGHT (developer override), else the Floating orb switch."""
+    return _env_or_saved("MISTAI_ORB_FLIGHT", "on" if orb_on else "off")
 
 
 def orb_panels_enabled(saved=None):
@@ -746,20 +760,21 @@ def orb_panels_enabled(saved=None):
     return _env_or_saved("MISTAI_ORB_PANELS", saved)
 
 
-def orb_pointer_enabled(saved="on"):
-    """MISTAI_ORB_POINTER, else Settings "Orb points before clicking" (default
-    on). Acts only while flight ("Orb follows the task") is on too."""
-    return _env_or_saved("MISTAI_ORB_POINTER", "on" if saved is None else saved)
+def orb_pointer_enabled(orb_on=False):
+    """MISTAI_ORB_POINTER (developer override), else the Floating orb switch.
+    Acts only while flight is on too."""
+    return _env_or_saved("MISTAI_ORB_POINTER", "on" if orb_on else "off")
 
 
-def orb_idle_drift_enabled(saved="on"):
-    """MISTAI_ORB_IDLE_DRIFT, else Settings "Idle drift" (default on)."""
-    return _env_or_saved("MISTAI_ORB_IDLE_DRIFT", "on" if saved is None else saved)
+def orb_idle_drift_enabled(orb_on=False):
+    """MISTAI_ORB_IDLE_DRIFT (developer override), else the Floating orb switch."""
+    return _env_or_saved("MISTAI_ORB_IDLE_DRIFT", "on" if orb_on else "off")
 
 
 def browser_seed_profile_enabled(saved=None):
-    """MISTAI_BROWSER_SEED_PROFILE, else Settings "Use my Firefox sign-ins"
-    (default off): copy the user's Firefox logins into MistAI's browser."""
+    """MISTAI_BROWSER_SEED_PROFILE, else Settings "Let Mist use sign-ins from
+    my browser" (default off). Seeding also needs a supported browser chosen
+    (core/browser_signins.py; today Firefox only)."""
     return _env_or_saved("MISTAI_BROWSER_SEED_PROFILE", saved)
 
 
@@ -767,15 +782,19 @@ PANEL_ANCHORS = ("top-right", "top-left", "top-center",
                  "bottom-right", "bottom-left")   # also the fallback order
 
 
-def panel_anchor(saved=None):
+# ============================================================
+# PANEL ANCHOR OVERRIDE (DEVELOPER ONLY)
+# ============================================================
+# The task panels pick a random clear anchor per task (core/orb_behavior.py
+# choose_panel_anchor). MISTAI_PANEL_ANCHOR pins one instead (developer
+# override, read at call time). The old Settings preset ("panel_anchor") and
+# saved drag positions ("panel_positions") are no longer read.
+
+def panel_anchor_override():
     """MISTAI_PANEL_ANCHOR (top-right | top-left | top-center | bottom-right |
-    bottom-left), read at call time, else the saved Settings preset, else
-    top-right; anything invalid is skipped."""
+    bottom-left), or None when unset or invalid."""
     v = os.environ.get("MISTAI_PANEL_ANCHOR", "").strip().lower()
-    if v in PANEL_ANCHORS:
-        return v
-    s = str(saved or "").strip().lower()
-    return s if s in PANEL_ANCHORS else "top-right"
+    return v if v in PANEL_ANCHORS else None
 
 
 def panel_blur_enabled():
@@ -909,7 +928,7 @@ def recipient_match(seen, expected):
 # set by the Settings page only (Api.set_ask_before_sending), never by the
 # model; read at call time. The page shows these labels and explanations.
 ASK_BEFORE_SENDING_CHOICES = ("always", "when_unsure", "never")
-ASK_BEFORE_SENDING_DEFAULT = "when_unsure"
+ASK_BEFORE_SENDING_DEFAULT = "always"     # the safe option (was "when_unsure")
 ASK_BEFORE_SENDING_LABELS = {
     "always": "Always ask",
     "when_unsure": "Ask when unsure",
@@ -928,6 +947,35 @@ def ask_before_sending_choice(saved):
     of ASK_BEFORE_SENDING_CHOICES."""
     v = str(saved or "").strip().lower()
     return v if v in ASK_BEFORE_SENDING_CHOICES else ASK_BEFORE_SENDING_DEFAULT
+
+
+# ============================================================
+# MESSAGES SWITCH MAPPING
+# ============================================================
+# Settings > MESSAGES shows one switch, "Ask me before sending a message for
+# you", over the three modes above:
+#   on  -> "always"       (every message waits for a yes; the default)
+#   off -> "when_unsure"  (still asks unless recipient and message are the
+#                          user's own words and the chat name matched exactly)
+# The switch never selects "never": a "never" saved earlier is still honored
+# (shown as off with SEND_SWITCH_NEVER_NOTE) until the switch is touched.
+
+SEND_SWITCH_HELP = ("Mist shows you the name and the message and waits for your yes "
+                    "before it sends anything.")
+SEND_SWITCH_OFF_HELP = ("Off: Mist still asks when the name or the message isn't exactly "
+                        "what you said, or the chat name doesn't match exactly.")
+SEND_SWITCH_NEVER_NOTE = ("Right now messages are sent without asking (an earlier setting). "
+                          "Turn this on to be asked every time.")
+
+
+def send_switch_state(mode):
+    """The switch position for a mode: True only for "always"."""
+    return ask_before_sending_choice(mode) == "always"
+
+
+def send_mode_for_switch(on):
+    """The mode a switch position saves: "always" or "when_unsure" (never "never")."""
+    return "always" if on else "when_unsure"
 
 
 # ============================================================

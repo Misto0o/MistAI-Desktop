@@ -923,8 +923,7 @@ globalThis.pywebview = {api: {orb_state: () => Promise.resolve({state: states.sh
         orb.tick()
         assert orb.home == (500, 500, 138) and played == []
 
-    @pytest.mark.parametrize("name, env", [("orb_flight", "MISTAI_ORB_FLIGHT"),
-                                           ("orb_panels", "MISTAI_ORB_PANELS")])
+    @pytest.mark.parametrize("name, env", [("orb_panels", "MISTAI_ORB_PANELS")])
     def test_orb_options_are_off_by_default_saved_and_env_overridable(self, monkeypatch, name, env):
         monkeypatch.delenv(env, raising=False)
         api = _api()
@@ -939,7 +938,7 @@ globalThis.pywebview = {api: {orb_state: () => Promise.resolve({state: states.sh
         assert api.set_orb_option("floating_orb", True)["success"] is False
 
     def test_the_option_switches_start_off(self):
-        for name, label in (("orb_flight", "Orb follows the task"), ("orb_panels", "Task panels")):
+        for name, label in (("orb_panels", "Task panels"),):
             assert f'<span>{label}</span><div class="sw" id="sw-{name}"' in HTML
         assert "if(typeof pywebview.api.get_orb_options!=='function')return;" in _script()
 
@@ -2052,76 +2051,42 @@ class TestOrbLayout:
         ("top-right", [1664, 1624]), ("top-left", [16, 16]), ("top-center", [840, 820]),
     ])
     def test_each_anchor_stacks_down_from_the_top_with_inset_and_gap(self, anchor, xs):
-        spots, used = ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, anchor)
-        assert used == anchor and [x for x, _ in spots] == xs
-        assert [y for _, y in spots] == [16, 16 + 176 + 12]
+        rects = ob.panel_stack(PANELS, ORB_LAYOUT_WORK, anchor, 16, 12)
+        assert [r[0] for r in rects] == xs
+        assert [r[1] for r in rects] == [16, 16 + 176 + 12]
+
+    @pytest.mark.parametrize("anchor, x", [("bottom-right", 1664), ("bottom-left", 16)])
+    def test_bottom_anchors_end_at_the_bottom_inset(self, anchor, x):
+        rects = ob.panel_stack(PANELS, ORB_LAYOUT_WORK, anchor, 16, 12)
+        assert rects[0][0] == x and rects[-1][3] == 1040 - 16
 
     @pytest.mark.parametrize("scale, inset, gap", [(1.0, 16, 12), (1.25, 20, 15), (1.5, 24, 18)])
     def test_inset_and_gap_scale_with_dpi(self, scale, inset, gap):
         sizes = [(round(240 * scale), round(176 * scale)), (round(280 * scale), round(140 * scale))]
-        spots, _ = ol.anchored_panels(sizes, ORB_LAYOUT_WORK, "top-right", scale)
-        assert spots[0] == (1920 - inset - sizes[0][0], inset)
-        assert spots[1][1] == inset + sizes[0][1] + gap
-
-    @pytest.mark.parametrize("orb", [(100, 900, 82), (1700, 900, 82), (900, 500, 28)])
-    def test_the_position_does_not_depend_on_the_orb(self, orb):
-        assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-right", orb=orb)[0] == \
-            ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-right")[0]
-
-    def test_panels_never_cover_the_orb(self):
-        orb = (1700, 20, 82)                                # docked in the top-right corner
-        spots, used = ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-right", orb=orb)
-        assert not any(ol.overlaps(r, (1700, 20, 1782, 102)) for r in _rects(spots))
-        assert used == "top-right" and spots[0][1] == 102 + 12   # moved below the orb
-
-    def test_a_target_covering_the_corner_moves_the_panels_to_the_next_anchor(self):
-        target = (1000, 0, 1920, 800)                       # covers the top-right
-        spots, used = ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-right", target_rect=target)
-        assert used == "top-left"
-        assert not any(ol.overlaps(r, target) for r in _rects(spots))
-        both = (0, 0, 700, 800), (1200, 0, 1920, 800)       # left and right covered: centre
-        for t in both:
-            assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-left", target_rect=t)[1] in (
-                "top-left", "top-right", "top-center")
-        wide = (0, 0, 1920, 600)                            # covers every top anchor: bottom
-        assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-center", target_rect=wide)[1] == "bottom-right"
-        every = (0, 0, 1920, 1040)                          # covers every anchor: keeps it
-        assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-center", target_rect=every)[1] == "top-center"
-
-    def test_a_maximized_target_keeps_the_configured_anchor(self):
-        spots, used = ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-left", target_rect=(-8, -8, 1928, 1048),
-                                         maximized=True)
-        assert used == "top-left" and spots[0] == (16, 16)
+        rects = ob.panel_stack(sizes, ORB_LAYOUT_WORK, "top-right", round(16 * scale), round(12 * scale))
+        assert rects[0][:2] == (1920 - inset - sizes[0][0], inset)
+        assert rects[1][1] == inset + sizes[0][1] + gap
 
     @pytest.mark.parametrize("work", [(-1920, 0, 0, 1040), (1920, -200, 3840, 880),
                                       (0, 0, 2560, 1400)])
     def test_multi_monitor_offsets(self, work):
-        spots, _ = ol.anchored_panels(PANELS, work, "top-right")
-        assert spots[0] == (work[2] - 16 - 240, work[1] + 16)
-        for x, y, r, b in _rects(spots):
+        rects = ob.panel_stack(PANELS, work, "top-right", 16, 12)
+        assert rects[0][:2] == (work[2] - 16 - 240, work[1] + 16)
+        for x, y, r, b in rects:
             assert work[0] <= x and r <= work[2] and work[1] <= y and b <= work[3]
 
-    def test_a_small_work_area_keeps_every_panel_inside(self):
-        work = (0, 0, 300, 250)
-        spots, _ = ol.anchored_panels(PANELS, work, "top-right")
-        for x, y, r, b in _rects(spots):
-            assert 0 <= x and r <= 300 and 0 <= y and b <= 250
+    def test_a_stack_that_does_not_fit_is_reported_outside_the_work_area(self):
+        rects = ob.panel_stack(PANELS, (0, 0, 300, 250), "top-right", 16, 12)
+        assert rects[-1][3] > 250                       # unclamped, so the choice can drop it
 
-    def test_the_anchor_setting_is_read_at_call_time_and_validated(self, monkeypatch):
-        from core.config import panel_anchor
+    def test_the_anchor_override_is_read_at_call_time_and_validated(self, monkeypatch):
+        from core.config import panel_anchor_override
         monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
-        assert panel_anchor() == "top-right"
+        assert panel_anchor_override() is None
         for raw, want in (("top-left", "top-left"), (" TOP-CENTER ", "top-center"),
-                          ("bottom-left", "bottom-left"), ("middle", "top-right"),
-                          ("", "top-right")):
+                          ("bottom-left", "bottom-left"), ("middle", None), ("", None)):
             monkeypatch.setenv("MISTAI_PANEL_ANCHOR", raw)
-            assert panel_anchor() == want
-        # the env wins over the saved preset; a bad saved value is the default
-        monkeypatch.setenv("MISTAI_PANEL_ANCHOR", "top-left")
-        assert panel_anchor("bottom-right") == "top-left"
-        monkeypatch.delenv("MISTAI_PANEL_ANCHOR")
-        assert panel_anchor("bottom-right") == "bottom-right"
-        assert panel_anchor("sideways") == "top-right"
+            assert panel_anchor_override() == want
 
 
 # ============================================================
@@ -2890,10 +2855,12 @@ class _Bus:
 # ORB PANELS HELPERS (2)
 # ============================================================
 
-def _panels(monkeypatch, blur=False):
+def _panels(monkeypatch, blur=False, seed=0):
     monkeypatch.setattr(op, "panel_blur_enabled", lambda: blur)
+    monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
     bus, wv, win, clock = _Bus(), _OrbPanelsWebview(), _OrbPanelsWin(), _OrbPanelsClock()
-    panels = op.OrbPanels(SimpleNamespace(bus=bus), win, webview=wv, html="<p>", clock=clock)
+    panels = op.OrbPanels(SimpleNamespace(bus=bus), win, webview=wv, html="<p>", clock=clock,
+                          rng=_random.Random(seed))
     return panels, bus, wv, win, clock
 
 
@@ -2930,7 +2897,9 @@ def test_panels_open_untitled_unfocused_beside_the_orb_away_from_the_target(monk
     for x, y, w, h in moves:
         assert not overlaps((x, y, x + w, y + h), TARGET)
         assert x >= ORB[0] + ORB[2]                          # right of the orb
-    assert panels.side == "top-right"                        # anchored at the top
+    # a random anchor clear of the orb and the target (top-center covers the
+    # orb, the left ones the target)
+    assert panels.side in ("top-right", "bottom-right")
     bus.publish(events.AGENT_STEP, {"action": "done", "speech": "The total is 42."})
     panels.update(ORB, TARGET, ORB_PANELS_WORK, 1.0, busy=False)
     assert len(wv.created) == 2                              # + answer
@@ -4488,111 +4457,186 @@ def test_our_own_window_or_the_shell_never_counts_as_fullscreen():
 # ORB BEHAVIOR PANEL TESTS
 # ============================================================
 
-def test_panel_fractions_round_trip_and_clamp_on_any_monitor():
-    rect = (1500, 600, 1780, 740)
-    frac = ob.panel_fraction(rect, BEHAVIOR_WORK)
-    assert ob.panel_from_fraction(frac, (280, 140), BEHAVIOR_WORK) == (1500, 600)
-    small = (0, 0, 1280, 680)                               # a smaller monitor: kept on it
-    x, y = ob.panel_from_fraction(frac, (280, 140), small)
-    assert 0 <= x <= 1280 - 280 and 0 <= y <= 680 - 140
-    assert ob.panel_fraction((5000, -300, 5280, -160), BEHAVIOR_WORK) == (1.0, 0.0)   # off screen
-    other = (-1920, 0, 0, 1040)
-    assert ob.panel_from_fraction((0.0, 0.0), (280, 140), other) == (-1920, 0)
-
-
-def test_saved_panel_positions_parse_safely():
-    good = ob.dump_positions({"answer": (0.5, 0.25), "steps": (1.0, 0.0)})
-    assert ob.parse_positions(good) == {"answer": (0.5, 0.25), "steps": (1.0, 0.0)}
-    assert ob.parse_positions("{bad") == {} and ob.parse_positions("") == {}
-    assert ob.parse_positions('{"nope": [0, 0], "answer": [2, -1], "steps": ["x"]}') == {
-        "answer": (1.0, 0.0)}
-    assert ob.parse_positions('["answer"]') == {}
-
-
 def test_moved_by_user_ignores_tiny_differences():
     assert not ob.moved_by_user((10, 10, 50, 50), (11, 12, 51, 52))
     assert ob.moved_by_user((10, 10, 50, 50), (30, 10, 70, 50))
     assert not ob.moved_by_user(None, (1, 1, 2, 2))
 
 
-class _PosApi(SimpleNamespace):
-    def panel_positions(self):
-        return self.positions
+# -- automatic placement (pure) --------------------------------------------------------------
 
-    def save_panel_position(self, kind, frac):
-        self.positions[kind] = tuple(frac)
-        self.saved.append(kind)
-
-    def panel_anchor_setting(self):
-        return self.anchor
+_STACK = [(240, 176), (280, 140)]          # steps + answer, logical = physical at scale 1
 
 
-def _pos_panels(monkeypatch, anchor="top-right", positions=None):
+def _stacks(work=BEHAVIOR_WORK, sizes=_STACK):
+    return {a: ob.panel_stack(sizes, work, a, 16, 12) for a in ob.PANEL_PRESETS}
+
+
+def _covers(anchor, rect, work=BEHAVIOR_WORK):
+    return any(ob._overlaps(r, rect) for r in _stacks(work)[anchor])
+
+
+def test_anchors_overlapping_the_orb_the_element_or_the_window_are_dropped():
+    orb = (1700, 20, 1782, 102)                        # under the top-right stack
+    element = (20, 900, 60, 940)                       # under the bottom-left stack
+    window = (600, 0, 1300, 500)                       # under the top-center stack
+    seen = {ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, [orb, element], window,
+                                   rng=_random.Random(i))[0] for i in range(60)}
+    assert seen == {"top-left", "bottom-right"}
+    for a in seen:
+        assert not any(_covers(a, r) for r in (orb, element, window))
+
+
+def test_the_choice_is_random_among_the_clear_ones_with_an_injected_rng():
+    picks = [ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, rng=_random.Random(i))
+             for i in range(80)]
+    assert {a for a, _r in picks} == set(ob.PANEL_PRESETS)       # every clear one gets picked
+    assert {r for _a, r in picks} == {"random"}
+    a1 = ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, rng=_random.Random(7))
+    a2 = ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, rng=_random.Random(7))
+    assert a1 == a2                                              # seeded: reproducible
+
+
+def test_the_same_spot_is_never_picked_twice_in_a_row_when_another_is_clear():
+    rng, last = _random.Random(3), None
+    for _ in range(50):
+        a, _r = ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, last=last, rng=rng)
+        assert a != last
+        last = a
+    # only one clear anchor (the window and an element cover the rest): it is used again
+    window, element = (0, 0, 1500, 1040), (1700, 900, 1750, 950)
+    assert ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, [element], window, last="top-right",
+                                  rng=_random.Random(0)) == ("top-right", "only")
+
+
+def test_anchors_outside_the_work_area_are_dropped():
+    work = (0, 0, 1920, 400)                           # short: a stack (340 px + insets) barely fits
+    tall = [(240, 300), (280, 140)]                    # 452 px: fits nowhere
+    stacks = {a: ob.panel_stack(tall, work, a, 16, 12) for a in ob.PANEL_PRESETS}
+    a, reason = ob.choose_panel_anchor(stacks, work, rng=_random.Random(0))
+    assert reason == "fallback"
+    wide_work = (0, 0, 2000, 1040)
+    fits = {a: ob.panel_stack(_STACK, wide_work, a, 16, 12) for a in ob.PANEL_PRESETS}
+    assert ob.choose_panel_anchor(fits, wide_work, rng=_random.Random(0))[1] == "random"
+
+
+def test_with_nothing_clear_the_least_overlapping_one_wins():
+    maximized = (-8, -8, 1928, 1048)                  # the task's window covers everything
+    orb = (1700, 20, 1782, 102)                       # and the orb sits top-right
+    a, reason = ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, [orb], maximized,
+                                       rng=_random.Random(0))
+    assert reason == "fallback" and a != "top-right" and not _covers(a, orb)
+    # the hard obstacles (orb, element) weigh first: a small window overlap beats any orb overlap
+    element = (900, 300, 1000, 400)
+    every = [(0, 0, 1920, 1040)]
+    a, reason = ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, every + [element], None,
+                                       rng=_random.Random(0))
+    assert reason == "fallback"
+    scores = {k: sum(ob._area(r, o) for r in v for o in every + [element])
+              for k, v in _stacks().items()}
+    assert scores[a] == min(scores.values())
+    # ties go random but never repeat the last one
+    tie = {ob.choose_panel_anchor(_stacks(), BEHAVIOR_WORK, [], maximized, last="top-left",
+                                  rng=_random.Random(i))[0] for i in range(40)}
+    assert "top-left" not in tie and len(tie) > 1
+
+
+# -- automatic placement in OrbPanels ----------------------------------------------------------
+
+def _auto_panels(monkeypatch, seed=1):
     monkeypatch.setattr(op, "panel_blur_enabled", lambda: False)
-    api = _PosApi(bus=_Bus(), positions=dict(positions or {}), saved=[], anchor=anchor)
+    monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
     wv, win, clock = _OrbPanelsWebview(), _OrbPanelsWin(), _OrbPanelsClock()
     win.rects = {}
-    panels = op.OrbPanels(api, win, webview=wv, html="<p>", clock=clock)
-    panels._was_busy = True                                     # mid-task: no model reset
+    panels = op.OrbPanels(SimpleNamespace(bus=_Bus()), win, webview=wv, html="<p>", clock=clock,
+                          rng=_random.Random(seed))
+    return panels, wv, win, clock
+
+
+def _start_task(panels, orb=None, target=None, point=None):
+    panels.update(orb, target, ORB_PANELS_WORK, 1.0, busy=False)
+    panels.update(orb, target, ORB_PANELS_WORK, 1.0, busy=True)         # a task starts
     panels.model.steps = [{"label": "Clicking", "action": "uia_click", "state": "run"}]
-    return panels, api, wv, win, clock
+    panels.update(orb, target, ORB_PANELS_WORK, 1.0, busy=True, point=point)
 
 
-def test_a_dragged_panel_is_left_alone_saved_once_settled_and_wins_over_the_preset(monkeypatch):
-    panels, api, wv, win, clock = _pos_panels(monkeypatch)
+def test_one_choice_per_task_kept_while_the_orb_and_window_move(monkeypatch, capsys):
+    panels, wv, win, clock = _auto_panels(monkeypatch)
+    _start_task(panels)
+    first, spot = panels.anchor, panels.rects["steps"][:2]
+    for orb, target in (((1700, 20, 82), (0, 0, 900, 900)), ((20, 20, 28), (1000, 0, 1920, 1040))):
+        panels.update(orb, target, ORB_PANELS_WORK, 1.0, busy=True)
+        assert panels.anchor == first and panels.rects["steps"][:2] == spot   # stays put
+    assert capsys.readouterr().out.count("[OrbPanels] anchor ") == 1
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=False)              # the task ends
+    _start_task(panels)                                                    # the next one
+    assert panels.anchor != first                                          # never twice in a row
+
+
+def test_the_choice_avoids_the_orb_click_target_and_window_at_task_start(monkeypatch):
+    for seed in range(12):
+        panels, *_ = _auto_panels(monkeypatch, seed)
+        orb, target, point = (1700, 20, 82), (0, 0, 900, 1040), (900, 950, 960, 990)
+        _start_task(panels, orb, target, point)
+        rect = panels.rects["steps"]
+        for o in ((1700, 20, 1782, 102), target, point):
+            assert not ob._overlaps(rect, o), (seed, panels.anchor)
+        assert panels.anchor == "bottom-right"            # the only clear one
+
+
+def test_only_the_click_target_still_moves_the_stack_for_a_moment(monkeypatch):
+    panels, *_ = _auto_panels(monkeypatch)
+    _start_task(panels)
+    anchor = panels.anchor
+    stack = panels.rects["steps"]
+    click = (stack[0] + 10, stack[1] + 10, stack[0] + 40, stack[1] + 40)    # under the stack now
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True, point=click)
+    assert not ob._overlaps(panels.rects["steps"], click) and panels.anchor == anchor
     panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    assert panels.rects["steps"] == stack                                   # back at its anchor
+
+
+def test_the_env_override_pins_the_anchor(monkeypatch, capsys):
+    panels, *_ = _auto_panels(monkeypatch)
+    monkeypatch.setenv("MISTAI_PANEL_ANCHOR", "bottom-left")
+    _start_task(panels)
+    l, t, r, b = panels.rects["steps"]
+    assert panels.anchor == "bottom-left" and (l, b) == (16, 1040 - 16)
+    assert "[OrbPanels] anchor bottom-left (override)" in capsys.readouterr().out
+
+
+def test_a_dragged_panel_stays_for_this_task_only_and_is_never_saved(monkeypatch, capsys):
+    panels, wv, win, clock = _auto_panels(monkeypatch)
+    _start_task(panels)
     _show_all(wv)
     hwnd = panels.hwnds["steps"]
     panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    home = panels.rects["steps"][:2]
     clock.t += 1.0
     win.rects[hwnd] = (400, 500, 640, 676)                      # the user drags it
     panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
     moves = [c for c in win.calls if c[0] in ("move_only", "move")]
     panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
     assert [c for c in win.calls if c[0] in ("move_only", "move")] == moves   # left alone
-    assert api.saved == []
     clock.t += ob.DRAG_SETTLE_S + 0.1                           # it stopped moving
     panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
-    assert api.saved == ["steps"]
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
     assert panels.rects["steps"][:2] == (400, 500)              # stays where it was dropped
-    assert panels.user_rects() == [panels.rects["steps"]]
-    api.anchor = "bottom-left"                                  # a new preset: it stays put
-    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
-    assert panels.rects["steps"][:2] == (400, 500)
+    assert panels.obstacle_rects() == [panels.rects["steps"]]   # the orb goes around it
+    assert "placed by hand (this task)" in capsys.readouterr().out
+    assert not hasattr(panels._api, "save_panel_position")
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=False)  # the task ends
+    _start_task(panels)                                          # the next task forgets it
+    assert panels.rects["steps"][:2] != (400, 500) and panels._dragged == {}
+    assert home != (400, 500)
 
 
-def test_reset_puts_panels_back_at_the_preset(monkeypatch):
-    panels, api, wv, win, clock = _pos_panels(monkeypatch, positions={"steps": (0.5, 0.5)})
-    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
-    assert panels.rects["steps"][:2] == ob.panel_from_fraction((0.5, 0.5), (240, 176),
-                                                               ORB_PANELS_WORK)
-    api.positions.clear()
-    panels.reset_positions()
-    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
-    assert panels.rects["steps"][:2] == (1920 - 16 - 240, 16)    # top-right preset again
-
-
-@pytest.mark.parametrize("anchor, x", [("bottom-right", 1920 - 16 - 240), ("bottom-left", 16)])
-def test_bottom_presets_stack_from_the_bottom(monkeypatch, anchor, x):
-    panels, api, wv, win, clock = _pos_panels(monkeypatch, anchor=anchor)
-    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
-    l, t, r, b = panels.rects["steps"]
-    assert (l, b) == (x, 1040 - 16) and panels.side == anchor
-
-
-def test_panels_move_off_the_click_target_when_they_would_cover_it(monkeypatch):
-    panels, api, wv, win, clock = _pos_panels(monkeypatch)
-    click = (1700, 40, 1740, 80)                                 # under the top-right stack
-    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True, point=click)
-    assert not ob._overlaps(panels.rects["steps"], click)
-
-
-def test_the_orb_docks_clear_of_user_placed_panels():
+def test_the_orb_docks_clear_of_the_panels():
     orb = _behavior_orb(busy=True)
     orb._acted = True
     orb._win.fg_rect = (100, 100, 1000, 800)
     panel_rect = (1000, 100, 1300, 300)                          # right beside the window
-    orb.panels = SimpleNamespace(user_rects=lambda: [panel_rect], handles=lambda: [],
+    orb.panels = SimpleNamespace(obstacle_rects=lambda: [panel_rect], handles=lambda: [],
                                  rects={}, hide_all=lambda: None)
     orb._cur_target, _ = orb._target()
     x, y, side = orb._goal("executing")
@@ -4603,52 +4647,81 @@ def test_the_orb_docks_clear_of_user_placed_panels():
 # ORB BEHAVIOR SETTINGS TESTS
 # ============================================================
 
-def test_pointer_and_drift_default_on_and_round_trip(monkeypatch):
-    for env in ("MISTAI_ORB_POINTER", "MISTAI_ORB_IDLE_DRIFT", "MISTAI_ORB_FLIGHT",
-                "MISTAI_ORB_PANELS"):
+_ORB_ENVS = ("MISTAI_ORB_POINTER", "MISTAI_ORB_IDLE_DRIFT", "MISTAI_ORB_FLIGHT", "MISTAI_ORB_PANELS")
+
+
+def test_the_floating_orb_switch_drives_flight_pointer_and_drift(monkeypatch):
+    for env in _ORB_ENVS:
         monkeypatch.delenv(env, raising=False)
     api = _api()
-    assert api.orb_option("orb_pointer") is True and api.orb_option("orb_idle_drift") is True
+    api._orb = SimpleNamespace(show=lambda: True, hide=lambda: None)
     assert api.get_orb_options() == {"orb_flight": False, "orb_panels": False,
+                                     "orb_pointer": False, "orb_idle_drift": False}
+    assert api.set_floating_orb(True) == {"success": True, "enabled": True}
+    assert api.get_orb_options() == {"orb_flight": True, "orb_panels": False,
                                      "orb_pointer": True, "orb_idle_drift": True}
-    assert api.set_orb_option("orb_pointer", False) == {"success": True, "enabled": False}
-    assert api.memory.rows["orb_pointer"] == "off"
-    assert _api(api.memory).orb_option("orb_pointer") is False             # saved
-    monkeypatch.setenv("MISTAI_ORB_POINTER", "1")                          # env wins
-    assert _api(api.memory).orb_option("orb_pointer") is True
-    monkeypatch.setenv("MISTAI_ORB_IDLE_DRIFT", "0")
-    assert _api().orb_option("orb_idle_drift") is False
+    assert _api(api.memory).orb_option("orb_flight") is True         # saved, read back
+    assert api.set_floating_orb(False) == {"success": True, "enabled": False}
+    assert not any(api.orb_option(n) for n in ("orb_flight", "orb_pointer", "orb_idle_drift"))
+    # the orb window failed to open: the switch and its behaviors stay off
+    api._orb = SimpleNamespace(show=lambda: False, hide=lambda: None)
+    assert api.set_floating_orb(True)["success"] is False
+    assert api.orb_option("orb_flight") is False
 
 
-def test_the_panel_anchor_and_positions_settings(monkeypatch):
-    monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
-    api = _api()
-    assert api.get_panel_anchor() == {"anchor": "top-right", "presets": list(ob.PANEL_PRESETS)}
-    assert api.set_panel_anchor("bottom-left") == {"success": True, "anchor": "bottom-left"}
-    assert api.set_panel_anchor("middle")["success"] is False
-    assert _api(api.memory).panel_anchor_setting() == "bottom-left"
-    api.save_panel_position("answer", (0.25, 2.0))
-    assert api.panel_positions() == {"answer": (0.25, 1.0)}
-    assert _api(api.memory).panel_positions() == {"answer": (0.25, 1.0)}
-    resets = []
-    api._orb = SimpleNamespace(panels=SimpleNamespace(reset_positions=lambda: resets.append(1)))
-    assert api.reset_panel_positions() == {"success": True}
-    assert api.panel_positions() == {} and resets == [1]
-    assert _api(api.memory).panel_positions() == {}
+def test_the_old_per_behavior_switches_are_ignored_and_cannot_be_set(monkeypatch):
+    for env in _ORB_ENVS:
+        monkeypatch.delenv(env, raising=False)
+    memory = _Memory()
+    for name in ("orb_flight", "orb_pointer", "orb_idle_drift"):
+        memory.rows[name] = "on"                                  # saved by the old switches
+    memory.rows["floating_orb"] = "off"
+    api = _api(memory)
+    assert not any(api.orb_option(n) for n in ("orb_flight", "orb_pointer", "orb_idle_drift"))
+    memory.rows.update(floating_orb="on", orb_pointer="off", orb_idle_drift="off")
+    api = _api(memory)
+    assert api.orb_option("orb_pointer") is True and api.orb_option("orb_idle_drift") is True
+    for name in ("orb_flight", "orb_pointer", "orb_idle_drift"):
+        r = api.set_orb_option(name, False)
+        assert r["success"] is False and "Floating orb" in r["error"]
+    assert api.set_orb_option("orb_panels", True) == {"success": True, "enabled": True}
+
+
+@pytest.mark.parametrize("env, name", [("MISTAI_ORB_FLIGHT", "orb_flight"),
+                                       ("MISTAI_ORB_POINTER", "orb_pointer"),
+                                       ("MISTAI_ORB_IDLE_DRIFT", "orb_idle_drift")])
+def test_the_env_overrides_still_win_over_the_switch(monkeypatch, env, name):
+    for e in _ORB_ENVS:
+        monkeypatch.delenv(e, raising=False)
+    memory = _Memory()
+    memory.rows["floating_orb"] = "on"
+    monkeypatch.setenv(env, "0")
+    assert _api(memory).orb_option(name) is False
+    memory.rows["floating_orb"] = "off"
+    monkeypatch.setenv(env, "1")
+    assert _api(memory).orb_option(name) is True
+
+
+def test_there_are_no_panel_position_settings_any_more():
+    for fn in ("get_panel_anchor", "set_panel_anchor", "reset_panel_positions",
+               "save_panel_position", "panel_positions", "panel_anchor_setting"):
+        assert not hasattr(Api, fn), fn
+    for fn in ("panel_fraction", "panel_from_fraction", "parse_positions", "dump_positions"):
+        assert not hasattr(ob, fn), fn
+    assert not hasattr(op, "anchored_panels")
     assert tuple(config.PANEL_ANCHORS) == ob.PANEL_PRESETS
 
 
-def test_the_sidebar_has_the_new_switches_dropdown_and_reset():
-    for name, label in (("orb_pointer", "Orb points before clicking"),
-                        ("orb_idle_drift", "Idle drift")):
-        assert f'<span>{label}</span><div class="sw" id="sw-{name}"' in HTML
-        assert f"['sw-{name}','{label}']" in HTML                # keyboard + aria switch
-    for anchor in ob.PANEL_PRESETS:
-        assert f'<option value="{anchor}">' in HTML
-    assert 'id="btn-panel_reset"' in HTML
-    assert "const ORB_OPTIONS=['orb_flight','orb_pointer','orb_idle_drift','orb_panels'];" in HTML
-    for fn in ("get_panel_anchor", "set_panel_anchor", "reset_panel_positions",
-               "get_orb_options", "set_orb_option"):
+def test_the_sidebar_keeps_only_the_four_system_switches():
+    system = HTML.split('<div class="card-title">System</div>', 1)[1].split("</div>\n\n", 1)[0]
+    labels = re.findall(r"<span>([^<]+)</span><div class=\"sw\"", system)
+    assert labels == ["Wake word (beta)", "Captions", "Floating orb", "Task panels"]
+    for gone in ("Orb follows the task", "Orb points before clicking", "Idle drift",
+                 "Reset panel positions", "Panels: top right", 'id="sel-panel_anchor"',
+                 'id="btn-panel_reset"', "sw-orb_flight", "sw-orb_pointer", "sw-orb_idle_drift"):
+        assert gone not in HTML, gone
+    assert "const ORB_OPTIONS=['orb_panels'];" in HTML
+    for fn in ("get_orb_options", "set_orb_option", "get_floating_orb", "set_floating_orb"):
         assert callable(getattr(Api, fn))
     assert "pywebview-drag-region" in PANEL_HTML                 # panels drag by their top strip
     assert set(re.findall(r"pywebview\.api\.(\w+)", PANEL_HTML)) == {"panel_state", "dismiss"}
@@ -4656,35 +4729,28 @@ def test_the_sidebar_has_the_new_switches_dropdown_and_reset():
 
 _SIDEBAR = r"""
 const settle = () => new Promise(r => realSetTimeout(r, 30));
-const optCalls = [], anchorCalls = [];
-let resets = 0;
-pywebview.api.get_floating_orb = () => Promise.resolve(true);
+const optCalls = [], orbCalls = [];
+pywebview.api.get_floating_orb = () => Promise.resolve(false);
+pywebview.api.set_floating_orb = (on) => { orbCalls.push(on); return Promise.resolve({success: true, enabled: on}); };
 pywebview.api.get_orb_options = () => Promise.resolve(
-  {orb_flight: true, orb_pointer: true, orb_idle_drift: true, orb_panels: false});
+  {orb_flight: false, orb_pointer: false, orb_idle_drift: false, orb_panels: true});
 pywebview.api.set_orb_option = (n, on) => { optCalls.push([n, on]);
   return Promise.resolve({success: true, enabled: on}); };
-pywebview.api.get_panel_anchor = () => Promise.resolve({anchor: 'bottom-left'});
-pywebview.api.set_panel_anchor = (a) => { anchorCalls.push(a);
-  return Promise.resolve({success: true, anchor: a}); };
-pywebview.api.reset_panel_positions = () => { resets++; return Promise.resolve({success: true}); };
 (async () => {
   for (const fn of listeners['pywebviewready'] || []) fn();
   await settle();
-  const p = document.getElementById('sw-orb_pointer'), d = document.getElementById('sw-orb_idle_drift');
-  const before = [p.classList.contains('on'), d.classList.contains('on')];
-  await p.onclick(); await d.onclick();
-  const after = [p.classList.contains('on'), d.classList.contains('on')];
-  const sel = document.getElementById('sel-panel_anchor');
-  const a0 = sel.value; sel.value = 'top-left'; await sel.onchange();
-  await document.getElementById('btn-panel_reset').onclick();
-  console.log(JSON.stringify({before, after, optCalls, a0, anchorCalls, resets,
-                              errors: consoleErrors}));
+  const orb = document.getElementById('sw-orb'), panels = document.getElementById('sw-orb_panels');
+  const row = document.getElementById('row-orb_panels');
+  const before = [orb.classList.contains('on'), panels.classList.contains('on'), row.classList.contains('inactive')];
+  await orb.onclick(); await panels.onclick();
+  const after = [orb.classList.contains('on'), panels.classList.contains('on'), row.classList.contains('inactive')];
+  console.log(JSON.stringify({before, after, optCalls, orbCalls, errors: consoleErrors}));
 })();
 """
 
 
 @floating_orb_window_needs_node
-def test_the_sidebar_switches_and_dropdown_ask_python(tmp_path):
+def test_the_sidebar_switches_ask_python(tmp_path):
     cfg = {"gender": "female", "set_gender": _real_outputs(), "flags": {"is_dev": False}}
     prefix = _HARNESS.split("%PAGE%", 1)[0]
     f = tmp_path / "sidebar.js"
@@ -4693,9 +4759,8 @@ def test_the_sidebar_switches_and_dropdown_ask_python(tmp_path):
     out = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     res = json.loads(out.stdout)
-    assert res == {"before": [True, True], "after": [False, False],
-                   "optCalls": [["orb_pointer", False], ["orb_idle_drift", False]],
-                   "a0": "bottom-left", "anchorCalls": ["top-left"], "resets": 1, "errors": []}
+    assert res == {"before": [False, True, True], "after": [True, False, False],
+                   "optCalls": [["orb_panels", False]], "orbCalls": [True], "errors": []}
 
 
 def test_the_pulse_stays_inside_the_disc_and_respects_reduced_motion():

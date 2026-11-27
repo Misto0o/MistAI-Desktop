@@ -4,7 +4,7 @@
 #
 # Pure behavior for the floating orb (core/floating_orb.py applies it): where
 # the orb sits while pointing at a click target, when and where it drifts while
-# idle, whether a fullscreen app hides it, and where user-dragged panels go.
+# idle, whether a fullscreen app hides it, and where the task panels go.
 # No Win32, no threads, no logging: every input is a number, a rect or a fake
 # detector, so all of it is tested directly (tests/test_orb.py ORB BEHAVIOR).
 # Physical pixels throughout; rects are (l, t, r, b), right/bottom exclusive;
@@ -37,15 +37,13 @@
 #   24. FULLSCREEN ACTION TABLE
 #   25. FULLSCREEN WATCH
 #   26. PANEL PRESETS
-#   27. PANEL POSITION FROM A DRAG
-#   28. PANEL POSITION ON SHOW
-#   29. SAVED PANEL POSITIONS IN
-#   30. SAVED PANEL POSITIONS OUT
-#   31. PANEL DRAG SETTINGS
-#   32. PANEL DRAG DETECTION
+#   27. PANEL STACK RECTS
+#   28. PANEL PLACEMENT SCORING
+#   29. PANEL ANCHOR CHOICE (ONCE PER TASK)
+#   30. PANEL DRAG SETTINGS
+#   31. PANEL DRAG DETECTION
 # ============================================================
 
-import json
 import math
 import random
 from collections import namedtuple
@@ -183,7 +181,7 @@ def pointer_spot(target, work, side, gap=POINT_GAP, margin=POINT_MARGIN, avoid=(
     """(x, y, where) for the orb (a square of ``side``) BESIDE ``target`` (the
     control's rect), never on the click point (its centre): the first side of
     POINT_SIDES (right, left, below, above) whose spot lies fully inside
-    ``work`` and clear of the target and of ``avoid`` (user-placed panels);
+    ``work`` and clear of the target and of ``avoid`` (the task panels);
     then the same sides clamped into ``work`` that keep the click point
     ``margin`` outside the orb; then the work area's corner farthest from the
     click point. None when even that covers the point (a work area hardly
@@ -225,7 +223,7 @@ def pointer_spot(target, work, side, gap=POINT_GAP, margin=POINT_MARGIN, avoid=(
 
 def pointer_skip_reason(shown, flight_on, pointer_on, animations=True):
     """Why the orb does NOT point before a click ("" = it points): the orb is
-    hidden, flight ("Orb follows the task") is off, or the pointer setting
+    hidden, flight (the Floating orb switch) is off, or the pointer setting
     (orb_pointer / MISTAI_ORB_POINTER) is off. Each of these skips at once,
     so the click is not delayed. Windows animation effects off still points
     (the orb jumps there, no wait)."""
@@ -263,7 +261,7 @@ def capped_wait(wait, cap=POINT_WAIT_S, clock=None):
 
 def dock_clear_of(pos, side, work, obstacles, gap=8):
     """(x, y): ``pos`` for a square of ``side`` when it overlaps none of
-    ``obstacles`` (user-placed panels); else the first spot beside an
+    ``obstacles`` (the task panels); else the first spot beside an
     overlapping obstacle (below, above, left, right of it) that is inside
     ``work`` and clear of all of them; else ``pos`` unchanged."""
     x, y = pos
@@ -494,77 +492,102 @@ PANEL_PRESETS = ("top-right", "top-left", "top-center", "bottom-right", "bottom-
 
 
 # ============================================================
-# PANEL POSITION FROM A DRAG
+# PANEL STACK RECTS
 # ============================================================
+# Where a stack of panels would sit at one anchor, NOT clamped, so a stack
+# that does not fit the work area shows up as rects outside it.
 
-def panel_fraction(rect, work):
-    """(fx, fy): a dragged panel's top-left as fractions of the work area's
-    free room (0 = left/top edge, 1 = right/bottom edge), so it lands in the
-    same place on a monitor of another size or scale."""
-    l, t, r, b = rect
+def panel_stack(sizes, work, anchor, inset, gap):
+    """[(l, t, r, b)] per panel of ``sizes`` [(w, h)] stacked at ``anchor``
+    of ``work``: top anchors stack down from the top inset, bottom anchors
+    end at the bottom inset; left/right inset, or centered for top-center."""
     wl, wt, wr, wb = (int(v) for v in work)
-    room_x, room_y = max(1, (wr - wl) - (r - l)), max(1, (wb - wt) - (b - t))
-    return (round(_clamp((l - wl) / room_x, 0.0, 1.0), 4),
-            round(_clamp((t - wt) / room_y, 0.0, 1.0), 4))
-
-
-# ============================================================
-# PANEL POSITION ON SHOW
-# ============================================================
-
-def panel_from_fraction(frac, size, work):
-    """(x, y) for a panel of ``size`` (w, h) at saved fractions, clamped
-    fully on the work area."""
-    fx, fy = (_clamp(float(v), 0.0, 1.0) for v in frac)
-    w, h = size
-    wl, wt, wr, wb = (int(v) for v in work)
-    x = wl + int(round(fx * max(0, (wr - wl) - w)))
-    y = wt + int(round(fy * max(0, (wb - wt) - h)))
-    return _clamp(x, wl, wr - w), _clamp(y, wt, wb - h)
-
-
-# ============================================================
-# SAVED PANEL POSITIONS IN
-# ============================================================
-
-PANEL_KINDS = ("waiting", "error", "steps", "answer")
-
-
-def parse_positions(text):
-    """The saved panel_positions profile value -> {kind: (fx, fy)}; bad or
-    unknown entries are dropped, never raised."""
-    try:
-        raw = json.loads(text) if isinstance(text, str) and text else {}
-    except Exception:
-        return {}
-    out = {}
-    if not isinstance(raw, dict):
-        return out
-    for kind, val in raw.items():
-        try:
-            if kind in PANEL_KINDS and len(val) == 2:
-                fx, fy = float(val[0]), float(val[1])
-                if math.isfinite(fx) and math.isfinite(fy):
-                    out[kind] = (_clamp(fx, 0.0, 1.0), _clamp(fy, 0.0, 1.0))
-        except Exception:
-            continue
+    total = sum(h for _w, h in sizes) + gap * max(0, len(sizes) - 1)
+    y = (wb - inset - total) if anchor.startswith("bottom") else wt + inset
+    out = []
+    for w, h in sizes:
+        if anchor in ("top-left", "bottom-left"):
+            x = wl + inset
+        elif anchor == "top-center":
+            x = (wl + wr) // 2 - w // 2
+        else:
+            x = wr - inset - w
+        out.append((x, y, x + w, y + h))
+        y += h + gap
     return out
 
 
 # ============================================================
-# SAVED PANEL POSITIONS OUT
+# PANEL PLACEMENT SCORING
 # ============================================================
 
-def dump_positions(positions):
-    return json.dumps({k: [v[0], v[1]] for k, v in sorted(positions.items())
-                       if k in PANEL_KINDS})
+def _inside(rect, work):
+    return rect[0] >= work[0] and rect[1] >= work[1] and rect[2] <= work[2] and rect[3] <= work[3]
+
+
+def _area(a, b):
+    """Overlap area of rects a and b (0 when apart)."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return max(0, w) * max(0, h)
+
+
+def _stack_overlap(rects, obstacles):
+    return sum(_area(r, o) for r in rects for o in obstacles if o)
+
+
+# ============================================================
+# PANEL ANCHOR CHOICE (ONCE PER TASK)
+# ============================================================
+# At the start of each task the panel stack gets one anchor: every preset
+# whose stack lies inside the target monitor's work area and touches none of
+# the obstacles (the orb, the click target / element rect, the task's
+# window) is a candidate; one is picked at random (``rng``, injectable), not
+# the previous task's anchor when another candidate exists. With no
+# candidate: the least-overlapping preset, scored first by overlap with the
+# "hard" obstacles (orb, click target), then by overlap with the window, then
+# by the part outside the work area; ties are again picked at random
+# (avoiding the previous anchor). Returns (anchor, reason) with reason
+# "random" | "only" | "fallback".
+
+def choose_panel_anchor(stacks, work, hard=(), window=None, last=None, rng=None):
+    """``stacks``: {anchor: [rects]} (panel_stack per preset, in preset
+    order); ``hard``: rects that must stay uncovered (orb, element);
+    ``window``: the task's window rect or None; ``last``: the previous task's
+    anchor; ``rng``: a random.Random (a new one when None)."""
+    rng = rng or random.Random()
+    work = tuple(int(v) for v in work)
+    hard = [tuple(h) for h in hard or () if h]
+    soft = [tuple(window)] if window else []
+    order = [a for a in PANEL_PRESETS if a in stacks] + [a for a in stacks if a not in PANEL_PRESETS]
+    if not order:
+        return PANEL_PRESETS[0], "fallback"
+
+    def pick(cands):
+        if len(cands) > 1 and last in cands:
+            cands = [a for a in cands if a != last]
+        return cands[0] if len(cands) == 1 else rng.choice(cands)
+
+    clear = [a for a in order
+             if all(_inside(r, work) for r in stacks[a])
+             and _stack_overlap(stacks[a], hard + soft) == 0]
+    if clear:
+        return pick(clear), ("only" if len(clear) == 1 else "random")
+
+    def outside(rects):
+        return sum((r[2] - r[0]) * (r[3] - r[1]) - _area(r, work) for r in rects)
+
+    score = {a: (_stack_overlap(stacks[a], hard), _stack_overlap(stacks[a], soft),
+                 outside(stacks[a])) for a in order}
+    best = min(score.values())
+    return pick([a for a in order if score[a] == best]), "fallback"
 
 
 # ============================================================
 # PANEL DRAG SETTINGS
 # ============================================================
 
-DRAG_SETTLE_S = 0.6       # a dragged panel is saved once it stopped moving this long
+DRAG_SETTLE_S = 0.6       # a dragged panel is adopted (this task only) once still this long
 
 
 # ============================================================

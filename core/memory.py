@@ -7,16 +7,17 @@
 #
 # SECTION INDEX
 #   1. FACT KEYWORDS AND NORMALIZATION
-#   2. BUILT-IN RECALL
-#   3. MEMORY DATABASE
-#   4. TASK MEMORY
-#   5. HINT SETTINGS
-#   6. OPERATIONAL HINTS
-#   7. TASK STORE
-#   8. RESUMABLE STATUSES
-#   9. TASK RECORD
-#   10. TASK NAME SLUGS
-#   11. RESUMABLE TASKS
+#   2. FACTS TYPED IN SETTINGS
+#   3. BUILT-IN RECALL
+#   4. MEMORY DATABASE
+#   5. TASK MEMORY
+#   6. HINT SETTINGS
+#   7. OPERATIONAL HINTS
+#   8. TASK STORE
+#   9. RESUMABLE STATUSES
+#   10. TASK RECORD
+#   11. TASK NAME SLUGS
+#   12. RESUMABLE TASKS
 # ============================================================
 
 """
@@ -48,6 +49,48 @@ def _keywords(content):
 
 def _normalize_fact(text):
     return " ".join(str(text or "").casefold().split())
+
+
+# ============================================================
+# FACTS TYPED IN SETTINGS
+# ============================================================
+# Settings > ABOUT ME > "Add facts about me": the popup's text becomes one
+# fact per non-empty line, a leading bullet or "1." / "1)" dropped, spaces
+# collapsed, duplicates (any case) dropped. Caps: the whole text
+# FACTS_TEXT_MAX_CHARS (over it nothing is saved), one fact FACT_MAX_CHARS
+# (longer lines are left out), FACTS_PER_SAVE_MAX facts per save. Pure: no
+# logging, no database (Api.add_my_facts stores them with import_facts).
+
+FACTS_TEXT_MAX_CHARS = 20_000
+FACT_MAX_CHARS = 500
+FACTS_PER_SAVE_MAX = 200
+_FACT_BULLET_RX = re.compile(r"^\s*(?:[-*•·–]+|\d{1,3}[.)])\s+")
+
+
+def parse_fact_lines(text):
+    """(facts, info) for the popup's text; info = {too_big, duplicates,
+    too_long, over}. Anything but a string counts as empty."""
+    info = {"too_big": False, "duplicates": 0, "too_long": 0, "over": 0}
+    text = text if isinstance(text, str) else ""
+    if len(text) > FACTS_TEXT_MAX_CHARS:
+        info["too_big"] = True
+        return [], info
+    facts, seen = [], set()
+    for raw in text.splitlines():
+        line = " ".join(_FACT_BULLET_RX.sub("", raw).split())
+        key = _normalize_fact(line)
+        if not key:
+            continue
+        if len(line) > FACT_MAX_CHARS:
+            info["too_long"] += 1
+        elif key in seen:
+            info["duplicates"] += 1
+        elif len(facts) >= FACTS_PER_SAVE_MAX:
+            info["over"] += 1
+        else:
+            seen.add(key)
+            facts.append(line)
+    return facts, info
 
 
 # ============================================================

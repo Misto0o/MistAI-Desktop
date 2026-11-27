@@ -51,6 +51,8 @@ import pytest
 from core import config, planner, workspace as file_search
 from core.agent import AgentLoop, Timings
 from core.api import Api
+import core.api as api_mod
+from core import browser_signins as bsi
 from core.executor import Executor
 from core.tools import SPECS
 from core.config import (
@@ -1471,7 +1473,7 @@ def test_off_uses_the_clean_profile_and_never_reads_the_firefox_profile(tmp_path
     assert out.count("[Browser] profile: clean") == 3 and str(tmp_path) not in out
     s = bs.BrowserSession(firefox_signins=lambda: False)
     for refused in (s.use_daily_profile_copy, lambda: s.import_cookies("a.example")):
-        with pytest.raises(RuntimeError, match="Use my Firefox sign-ins"):
+        with pytest.raises(RuntimeError, match="Let Mist use sign-ins from my browser"):
             refused()
 
 
@@ -1509,19 +1511,167 @@ def test_the_api_hands_the_setting_to_the_browser_session():
     assert "BrowserSession(firefox_signins=self.get_firefox_signins)" in init
 
 
-def test_the_sidebar_switch_is_built_like_the_others():
+def test_the_setting_moved_into_settings_under_browser_sign_ins():
     from ui.html import HTML
-    assert ('<div class="toggle-row" id="row-firefox_signins"><span>Use my Firefox sign-ins</span>'
-            '<div class="sw" id="sw-firefox_signins" title="Copies your Firefox profile (cookies '
-            "and saved logins) into MistAI's own browser so it can use sites you are signed in "
-            "to. Off by default. Takes effect the next time MistAI's browser starts.\"></div></div>"
-            ) in HTML
+    assert 'id="sw-firefox_signins"' not in HTML and "Use my Firefox sign-ins" not in HTML
+    sec = HTML.index('id="sec-signins"')
+    assert sec < HTML.index('id="sw-signins"') < HTML.index('id="sel-signins-browser"') \
+        < HTML.index('id="btn-signin-browser"') < HTML.index('onclick="saveAPIKey()"')
+    assert ('<div class="toggle-row set-toggle"><span>Let Mist use sign-ins from my browser</span>'
+            '<div class="sw" id="sw-signins"></div></div>') in HTML
+    assert ">Sign in inside Mist's browser</button>" in HTML
     js = HTML.split("<script>")[-1]
-    assert "['sw-firefox_signins','Use my Firefox sign-ins']" in js
-    assert "runStep('signins',loadFirefoxSignins);" in js
-    load = re.search(r"async function loadFirefoxSignins\(\)\{.*?\n\}\n", js, re.S).group(0)
-    assert "pywebview.api.set_firefox_signins(!sw.classList.contains('on'))" in load
-    assert "setSw(sw,!!(r&&r.enabled));" in load
+    assert "['sw-signins','Let Mist use sign-ins from my browser']" in js
+    assert "runStep('signins',loadSignins);" in _fn_text(js, "openAPIModal")
+    assert "pywebview.api.set_browser_signins(enabled,source)" in js
+    assert "pywebview.api.open_signin_browser()" in js
+    # The sentences come from Python, not the page.
+    assert bsi.SIGNINS_EXPLANATION not in HTML and bsi.UNSUPPORTED_NOTE not in HTML
+
+
+def _fn_text(js, name):
+    return re.search(r"function " + name + r"\(.*?\n}\n", js, re.S).group(0)
+
+
+# -- detection (fake registry) ---------------------------------------------------------------
+
+_FAKE_INSTALLS = [
+    ("Mozilla Firefox", r'"C:\Program Files\Mozilla Firefox\firefox.exe"'),
+    ("Google Chrome", r'"C:\Program Files\Google\Chrome\Application\chrome.exe"'),
+    ("Microsoft Edge", r'"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"'),
+    ("Brave", r'"C:\Users\u\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"'),
+    ("Opera Stable", r'"C:\Users\u\AppData\Local\Programs\Opera\launcher.exe"'),
+    ("Opera GX Stable", r'"C:\Users\u\AppData\Local\Programs\Opera GX\launcher.exe"'),
+    ("Vivaldi", r'"C:\Users\u\AppData\Local\Vivaldi\Application\vivaldi.exe"'),
+    ("Internet Explorer", r'"C:\Program Files\Internet Explorer\iexplore.exe"'),
+    ("Razer AppEngine", r'"C:\Program Files\Razer\rzappengine.exe"'),   # not a browser
+    ("Mozilla Firefox", r'"C:\Program Files\Mozilla Firefox\firefox.exe"'),   # HKLM twice
+]
+
+
+def test_installed_browsers_are_found_once_each_in_a_fixed_order():
+    found = bsi.installed_browsers(lambda: _FAKE_INSTALLS, lambda: False)
+    assert [i for i, _l in found] == ["firefox", "chrome", "edge", "brave", "opera",
+                                      "opera-gx", "vivaldi"]
+    assert dict(found)["edge"] == "Microsoft Edge"
+    assert bsi.installed_browsers(lambda: [], lambda: True) == [("firefox", "Firefox")]
+    assert bsi.installed_browsers(lambda: 1 / 0, lambda: 1 / 0) == []       # never raises
+    assert bsi.installed_browsers(lambda: [("LibreWolf", "librewolf.exe")], lambda: False) == [
+        ("librewolf", "LibreWolf")]
+
+
+@pytest.mark.parametrize("progid, fam", [
+    ("FirefoxURL-308046B0AF4A39CB", "firefox"), ("ChromeHTML", "chrome"), ("MSEdgeHTM", "edge"),
+    ("BraveHTML", "brave"), ("OperaStable", "opera"), ("OperaGXStable", "opera-gx"),
+    ("VivaldiHTM.ABC", "vivaldi"), ("IE.HTTPS", None), (None, None),
+])
+def test_the_default_browser_comes_from_the_https_progid(progid, fam):
+    assert bsi.default_browser(lambda: progid) == fam
+    assert bsi.default_browser(lambda: 1 / 0) is None
+
+
+def test_only_firefox_is_supported_and_the_others_say_so():
+    found = bsi.installed_browsers(lambda: _FAKE_INSTALLS, lambda: False)
+    choices = bsi.browser_choices(found, default="chrome")
+    by_id = {c["id"]: c for c in choices}
+    assert by_id["firefox"]["supported"] is True and by_id["firefox"]["note"] == ""
+    for fam in ("chrome", "edge", "brave", "opera", "opera-gx", "vivaldi"):
+        assert by_id[fam]["supported"] is False
+        assert by_id[fam]["note"] == "Not supported - use Sign in inside Mist's browser instead"
+    assert [c["id"] for c in choices if c["default"]] == ["chrome"]
+    # Firefox is always offered (the existing behavior), marked when not found.
+    only_chrome = bsi.browser_choices([("chrome", "Google Chrome")])
+    assert only_chrome[0] == {"id": "firefox", "label": "Firefox (not found)", "supported": True,
+                              "note": "", "default": False}
+
+
+def test_the_source_defaults_to_the_default_browser_but_keeps_old_firefox_users():
+    choices = bsi.browser_choices([("firefox", "Firefox"), ("chrome", "Google Chrome")], "chrome")
+    assert bsi.resolve_source("", choices, switch_on=False, default="chrome") == "chrome"
+    assert bsi.resolve_source("", choices, switch_on=True, default="chrome") == "firefox"
+    assert bsi.resolve_source("chrome", choices, switch_on=True, default="firefox") == "chrome"
+    assert bsi.resolve_source("vivaldi", choices, switch_on=False, default=None) == "firefox"
+
+
+# -- the Api ---------------------------------------------------------------------------------
+
+def _fake_detection(monkeypatch, installs=_FAKE_INSTALLS, progid="ChromeHTML"):
+    monkeypatch.setattr(bsi, "registry_browsers", lambda: installs)
+    monkeypatch.setattr(bsi, "registry_default_progid", lambda: progid)
+    monkeypatch.setattr(bsi, "firefox_profile_exists", lambda: False)
+    monkeypatch.setattr(bsi.installed_browsers, "__defaults__", (lambda: installs, lambda: False))
+    monkeypatch.setattr(bsi.default_browser, "__defaults__", (lambda: progid,))
+
+
+def test_the_api_lists_browsers_preselects_the_default_and_saves_the_choice(monkeypatch, capsys):
+    monkeypatch.delenv("MISTAI_BROWSER_SEED_PROFILE", raising=False)
+    monkeypatch.delenv("MISTAI_VERBOSE_LOGS", raising=False)
+    _fake_detection(monkeypatch)
+    api = _signins_api()
+    s = api.get_browser_signins()
+    assert s["enabled"] is False and s["source"] == "chrome" and s["supported"] is False
+    assert s["note"] == bsi.UNSUPPORTED_NOTE and s["explanation"] == bsi.SIGNINS_EXPLANATION
+    assert "never saved passwords" in s["explanation"] and "always its own" in s["explanation"]
+    r = api.set_browser_signins(True, "chrome")                     # on, but not importable
+    assert r["success"] is True and r["enabled"] is True and r["supported"] is False
+    assert api.get_firefox_signins() is False                        # no seeding from Chrome
+    r = api.set_browser_signins(None, "firefox")
+    assert r["source"] == "firefox" and api.get_firefox_signins() is True
+    assert api.memory.rows == {"browser_seed_profile": "on", "browser_signins_source": "firefox"}
+    bad = api.set_browser_signins(None, "netscape")
+    assert bad["success"] is False and api.memory.rows["browser_signins_source"] == "firefox"
+    out = capsys.readouterr().out
+    assert "[Browser] browser sign-ins: on, chrome (not supported; applies to the next browser start)" in out
+    assert "Program Files" not in out
+
+
+def test_a_switch_that_was_on_before_keeps_seeding_from_firefox(monkeypatch):
+    monkeypatch.delenv("MISTAI_BROWSER_SEED_PROFILE", raising=False)
+    _fake_detection(monkeypatch)                                     # default browser: Chrome
+    api = _signins_api()
+    api.memory.rows["browser_seed_profile"] = "on"                   # saved by the old switch
+    assert api.get_firefox_signins() is True
+    assert api.get_browser_signins()["source"] == "firefox"
+    monkeypatch.setenv("MISTAI_BROWSER_SEED_PROFILE", "0")           # the env override still wins
+    assert api.get_firefox_signins() is False
+    monkeypatch.setenv("MISTAI_BROWSER_SEED_PROFILE", "1")
+    api.memory.rows.clear()
+    assert api.get_firefox_signins() is True
+
+
+def test_sign_in_inside_mists_browser_opens_its_own_browser(monkeypatch):
+    import threading as _t
+    api = _signins_api()
+    started = []
+    api.browser = SimpleNamespace(available=True, ensure_started=lambda: started.append(1))
+    api._agent_lock = _t.Lock()
+    api._focus_hwnd = lambda hwnd: started.append(("focus", hwnd))
+    monkeypatch.setattr(api_mod.clip, "playwright_window", lambda: 42)
+    monkeypatch.setattr(api_mod.threading, "Thread",
+                        lambda target, **k: SimpleNamespace(start=target))
+    r = api.open_signin_browser()
+    assert r["success"] is True and "Mist's own browser" in r["message"]
+    assert started == [1, ("focus", 42)]
+    api._agent_lock.acquire()                                         # a task is running
+    assert api.open_signin_browser()["success"] is False and started == [1, ("focus", 42)]
+    api._agent_lock.release()
+    api.browser = SimpleNamespace(available=False)
+    assert api.open_signin_browser()["success"] is False
+
+
+def test_firefox_seeding_copies_sign_ins_but_no_saved_passwords(tmp_path, monkeypatch):
+    assert bs._PROFILE_ESSENTIAL_FILES == ("cookies.sqlite", "permissions.sqlite")
+    assert bs._PROFILE_ESSENTIAL_DIRS == ("storage",)
+    src = tmp_path / "daily"
+    (src / "storage" / "default").mkdir(parents=True)
+    for name in ("cookies.sqlite", "permissions.sqlite", "logins.json", "key4.db", "cert9.db",
+                 "places.sqlite"):
+        (src / name).write_text("x", encoding="utf-8")
+    monkeypatch.setattr(bs, "find_default_firefox_profile", lambda: str(src))
+    dest = tmp_path / "mist"
+    _source, copied = bs.clone_daily_profile(str(dest))
+    assert sorted(copied) == ["cookies.sqlite", "permissions.sqlite", "storage"]
+    assert sorted(os.listdir(dest)) == ["cookies.sqlite", "permissions.sqlite", "storage"]
 
 
 # ============================================================

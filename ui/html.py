@@ -154,6 +154,28 @@ header{
 .card-note.error{color:var(--red)}
 .card-note:empty{display:none}
 select{background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:6px 8px;border-radius:6px;font-size:.78em;cursor:pointer;font-family:'DM Mono',monospace;pointer-events:auto;width:100%;margin-top:6px}
+[hidden]{display:none !important}
+
+/* Settings panel sections (API key, About me, Messages, Browser sign-ins) and
+   the Add facts popup above it. */
+.settings-panel{max-width:440px;max-height:88vh;overflow-y:auto}
+.settings-panel::-webkit-scrollbar{width:3px}
+.settings-panel::-webkit-scrollbar-thumb{background:rgba(0,217,255,0.15);border-radius:3px}
+.set-section{padding:12px 0;border-top:1px solid var(--border)}
+.set-section:first-of-type{border-top:none;padding-top:0}
+.set-section .card-title{margin-bottom:6px}
+.set-help{display:block;font-size:.72em;line-height:1.5;color:var(--muted2);margin:0 0 8px}
+.set-help:empty{display:none}
+.set-toggle{font-size:.78em;color:var(--text);font-family:'DM Sans',sans-serif;gap:12px;margin-bottom:6px}
+.set-btn{width:100%;flex:none;margin-top:8px}
+.set-sub{display:flex;align-items:center;gap:8px;font-size:.66em;color:var(--muted);font-family:'DM Mono',monospace;margin-top:6px}
+.link-btn{background:none;border:none;padding:0;color:var(--muted2);font:inherit;text-decoration:underline;cursor:pointer}
+.link-btn:hover{color:var(--red)}
+.settings-panel .modal-buttons{padding-top:12px;border-top:1px solid var(--border)}
+#factsModal{z-index:1001}
+#factsModal .modal-content{max-width:480px}
+.facts-input{min-height:180px;resize:vertical;line-height:1.5;margin-bottom:8px}
+#sel-signins-browser:disabled{opacity:.5;cursor:not-allowed}
 
 /* Shared states: one keyboard focus ring for everything focusable, the app
    font and the same easing on every text button, a visible pressed state,
@@ -207,14 +229,8 @@ button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{trans
       <div class="card-title">System</div>
       <div class="toggle-row"><span>Wake word (beta)</span><div class="sw" id="sw-wake"></div></div>
       <div class="toggle-row"><span>Captions</span><div class="sw" id="sw-cap"></div></div>
-      <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works"></div></div>
-      <div class="toggle-row" id="row-orb_flight"><span>Orb follows the task</span><div class="sw" id="sw-orb_flight" title="Needs the floating orb. The orb flies beside the window Mist is working in"></div></div>
-      <div class="toggle-row" id="row-orb_pointer"><span>Orb points before clicking</span><div class="sw" id="sw-orb_pointer" title="Needs the floating orb and Orb follows the task. The orb flies beside what Mist is about to click, then the click happens"></div></div>
-      <div class="toggle-row" id="row-orb_idle_drift"><span>Idle drift</span><div class="sw" id="sw-orb_idle_drift" title="Needs the floating orb. When nothing is happening the orb drifts a little now and then and comes back"></div></div>
-      <div class="toggle-row" id="row-orb_panels"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Needs the floating orb. Panels for the steps Mist takes and its answer; drag one by its top edge to move it"></div></div>
-      <div id="row-panel_anchor"><select id="sel-panel_anchor" aria-label="Task panel position" title="Where the task panels appear"><option value="top-right">Panels: top right</option><option value="top-left">Panels: top left</option><option value="top-center">Panels: top center</option><option value="bottom-right">Panels: bottom right</option><option value="bottom-left">Panels: bottom left</option></select>
-        <button class="btn-clear" id="btn-panel_reset" title="Put dragged panels back at the chosen position">Reset panel positions</button></div>
-      <div class="toggle-row" id="row-firefox_signins"><span>Use my Firefox sign-ins</span><div class="sw" id="sw-firefox_signins" title="Copies your Firefox profile (cookies and saved logins) into MistAI's own browser so it can use sites you are signed in to. Off by default. Takes effect the next time MistAI's browser starts."></div></div>
+      <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works: it follows the window Mist is using, points at what it is about to click and drifts a little when idle"></div></div>
+      <div class="toggle-row" id="row-orb_panels"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Needs the floating orb. Panels for the steps Mist takes and its answer, placed where they are out of the way; drag one by its top edge to move it for this task"></div></div>
     </div>
 
     <div class="card">
@@ -273,30 +289,60 @@ button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{trans
   </div>
 </div>
 
+<!-- SETTINGS (gear) PANEL: four sections, API KEY, ABOUT ME, MESSAGES and
+     BROWSER SIGN-INS. Every explanation that depends on a setting's state
+     comes from Python (Api.get_send_confirmation, Api.get_browser_signins). -->
 <div class="modal" id="apiModal">
-  <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="modal-content settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-title" id="settings-title">SETTINGS</div>
-    <div class="card-title">API key</div>
-    <input type="password" class="modal-input" id="apiKeyInput" placeholder="Enter your MistAI API key (mistai_...)" autocomplete="off" aria-label="MistAI API key"/>
-    <div class="modal-hint">Saved when you press Save; leave empty to keep the current key.</div>
-    <label id="backend-row" style="font-size:.75em;color:var(--muted);margin-bottom:12px;display:none">
-      <input type="checkbox" id="useBackend" checked/> Use MistAI backend
-    </label>
-    <div style="margin-bottom:12px">
-      <button class="btn-cancel" id="btn-import-facts" title="Add facts from your my_facts.json file">Import my facts</button>
-      <div class="card-note" id="facts-note"></div>
-    </div>
-    <div style="margin-bottom:12px">
-      <div class="card-title">Ask before sending a message</div>
-      <!-- Choices and explanations come from Api.get_ask_before_sending_options() (config). -->
-      <select id="sel-send"></select>
+    <section class="set-section" aria-labelledby="sec-api">
+      <div class="card-title" id="sec-api">API key</div>
+      <div class="set-help">Your MistAI key lets Mist reach its AI service. It is kept on this PC.</div>
+      <input type="password" class="modal-input" id="apiKeyInput" placeholder="Enter your MistAI API key (mistai_...)" autocomplete="off" aria-label="MistAI API key"/>
+      <div class="modal-hint">Saved when you press Save; leave empty to keep the current key.</div>
+      <label id="backend-row" style="font-size:.75em;color:var(--muted);display:none">
+        <input type="checkbox" id="useBackend" checked/> Use MistAI backend
+      </label>
+    </section>
+    <section class="set-section" aria-labelledby="sec-about">
+      <div class="card-title" id="sec-about">About me</div>
+      <div class="set-help">Things Mist should remember about you, used when they help with a request.</div>
+      <button class="btn-cancel set-btn" id="btn-add-facts" aria-haspopup="dialog">Add facts about me</button>
+      <div class="card-note" id="facts-note" role="status"></div>
+    </section>
+    <section class="set-section" aria-labelledby="sec-messages">
+      <div class="card-title" id="sec-messages">Messages</div>
+      <div class="toggle-row set-toggle"><span id="lbl-send">Ask me before sending a message for you</span><div class="sw" id="sw-send"></div></div>
+      <div class="set-help" id="send-help"></div>
       <div class="card-note" id="send-note"></div>
-      <div class="card-note" id="approvals-note"></div>
-      <button class="btn-cancel" id="btn-forget-approvals" title="Forget every remembered approval">Forget all</button>
-    </div>
+      <div class="set-sub" id="approvals-row" hidden><span id="approvals-note"></span><button class="link-btn" id="btn-forget-approvals" title="Forget every remembered approval">Forget all</button></div>
+    </section>
+    <section class="set-section" aria-labelledby="sec-signins">
+      <div class="card-title" id="sec-signins">Browser sign-ins</div>
+      <div class="toggle-row set-toggle"><span>Let Mist use sign-ins from my browser</span><div class="sw" id="sw-signins"></div></div>
+      <select id="sel-signins-browser" aria-label="Browser to use sign-ins from"></select>
+      <div class="card-note" id="signins-note" role="status"></div>
+      <button class="btn-cancel set-btn" id="btn-signin-browser">Sign in inside Mist's browser</button>
+      <div class="set-help" id="signins-help"></div>
+    </section>
     <div class="modal-buttons">
       <button class="btn-save" onclick="saveAPIKey()">Save</button>
       <button class="btn-cancel" onclick="closeAPIModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ADD FACTS POPUP (over Settings): Save stores the lines through
+     Api.add_my_facts; Esc or Cancel closes without saving; Tab stays inside. -->
+<div class="modal" id="factsModal">
+  <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="facts-title">
+    <div class="modal-title" id="facts-title">ADD FACTS ABOUT ME</div>
+    <label class="set-help" for="factsInput">Type or paste things Mist should know about you, one per line</label>
+    <textarea class="modal-input facts-input" id="factsInput" rows="10" maxlength="20000" spellcheck="true"></textarea>
+    <div class="card-note" id="facts-popup-note" role="status"></div>
+    <div class="modal-buttons">
+      <button class="btn-save" id="btn-facts-save">Save</button>
+      <button class="btn-cancel" id="btn-facts-cancel">Cancel</button>
     </div>
   </div>
 </div>
@@ -334,9 +380,8 @@ function makeSwitch(sw,label){
   sw.onkeydown=e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();if(sw.onclick)sw.onclick();}};
 }
 for(const [id,label] of [['sw-wake','Wake word'],['sw-cap','Captions'],['sw-orb','Floating orb'],
-  ['sw-orb_flight','Orb follows the task'],['sw-orb_pointer','Orb points before clicking'],
-  ['sw-orb_idle_drift','Idle drift'],['sw-orb_panels','Task panels'],
-  ['sw-firefox_signins','Use my Firefox sign-ins']]){
+  ['sw-orb_panels','Task panels'],['sw-send','Ask me before sending a message for you'],
+  ['sw-signins','Let Mist use sign-ins from my browser']]){
   const sw=document.getElementById(id);if(sw)makeSwitch(sw,label);
 }
 // Hint chips and resource links are divs too: Enter or Space clicks them.
@@ -375,7 +420,6 @@ window.addEventListener('pywebviewready',()=>{
   runStep('stats',updateStats);
   runStep('status',checkStatus);
   runStep('orb',loadOrbSetting);
-  runStep('signins',loadFirefoxSignins);
 });
 
 // Developer-only controls stay hidden (and unused) unless Python says this is
@@ -520,44 +564,24 @@ swCap.onclick=toggleCaptions;
 ctrlCaption.onclick=toggleCaptions;
 
 // Floating orb (off by default): Python saves the setting and shows or hides
-// a small always-on-top window with only the orb (core/floating_orb.py).
+// a small always-on-top window with only the orb (core/floating_orb.py). The
+// one switch also turns on following the task, pointing before clicks and
+// idle drift (Api.orb_option); task panels place themselves per task.
 const swOrb=document.getElementById('sw-orb');
 let orbOn=false;
-// The two orb options only act while the floating orb is on: dim them then.
-const ORB_OPTIONS=['orb_flight','orb_pointer','orb_idle_drift','orb_panels'];
+// "Task panels" only acts while the floating orb is on: dim it then.
+const ORB_OPTIONS=['orb_panels'];
 function showOrbDependents(){
-  for(const name of ORB_OPTIONS.concat(['panel_anchor'])){
+  for(const name of ORB_OPTIONS){
     const row=document.getElementById('row-'+name);
     if(row)row.classList.toggle('inactive',!orbOn);
   }
-}
-// Task panel position preset and "Reset panel positions" (dragged panels).
-async function loadPanelAnchor(){
-  const sel=document.getElementById('sel-panel_anchor'),reset=document.getElementById('btn-panel_reset');
-  if(!sel||typeof pywebview.api.get_panel_anchor!=='function')return;
-  const a=(await pywebview.api.get_panel_anchor())||{};
-  if(a.anchor)sel.value=a.anchor;
-  sel.onchange=async()=>{
-    try{
-      const r=await pywebview.api.set_panel_anchor(sel.value);
-      if(r&&r.anchor)sel.value=r.anchor;
-      if(r&&r.error)addMsg('Panels: '+r.error,'error');
-    }catch(e){console.error('Panel anchor error:',e);}
-  };
-  if(reset)reset.onclick=async()=>{
-    try{
-      const r=await pywebview.api.reset_panel_positions();
-      addMsg(r&&r.success?'Panel positions reset':'Panels: '+((r&&r.error)||'reset failed'),
-             r&&r.success?'system':'error');
-    }catch(e){console.error('Panel reset error:',e);}
-  };
 }
 async function loadOrbSetting(){
   if(typeof pywebview.api.get_floating_orb!=='function')return;
   orbOn=!!(await pywebview.api.get_floating_orb());
   setSw(swOrb,orbOn);
   showOrbDependents();
-  loadPanelAnchor();
   if(typeof pywebview.api.get_orb_options!=='function')return;
   const opts=(await pywebview.api.get_orb_options())||{};
   for(const name of ORB_OPTIONS){
@@ -583,22 +607,6 @@ swOrb.onclick=async()=>{
   }catch(e){console.error('Floating orb toggle error:',e);}
 };
 
-// "Use my Firefox sign-ins" (off by default): Python saves it; MistAI's
-// browser reads it the next time it starts (Api.get_firefox_signins).
-async function loadFirefoxSignins(){
-  if(typeof pywebview.api.get_firefox_signins!=='function')return;
-  const sw=document.getElementById('sw-firefox_signins');
-  setSw(sw,!!(await pywebview.api.get_firefox_signins()));
-  sw.onclick=async()=>{
-    try{
-      const r=await pywebview.api.set_firefox_signins(!sw.classList.contains('on'));
-      setSw(sw,!!(r&&r.enabled));
-      if(r&&r.error)addMsg('Firefox sign-ins: '+r.error,'error');
-      else addMsg((r&&r.enabled?'Firefox sign-ins on':'Firefox sign-ins off')
-        +': applies the next time the Mist browser starts','system');
-    }catch(e){console.error('Firefox sign-ins toggle error:',e);}
-  };
-}
 
 function showAskUserPrompt(question){
   addMsg(question, 'assistant');
@@ -663,59 +671,72 @@ async function answerConfirm(answer,label){
 function openAPIModal(){
   apiModal.classList.add('open');
   document.getElementById('apiKeyInput').focus();
-  if(ready){runStep('sending',loadSendSetting);runStep('approvals',loadApprovals);}
+  if(ready){runStep('sending',loadSendSetting);runStep('signins',loadSignins);}
 }
 function closeAPIModal(){
   if(!apiModal.classList.contains('open'))return;
+  closeFactsModal();
   apiModal.classList.remove('open');
   document.getElementById('btn-settings').focus();
 }
-// Escape closes Settings; Enter in the key field saves it.
+// Escape closes the Add facts popup first, else Settings; Enter in the key
+// field saves it.
 window.addEventListener('keydown',e=>{
-  if(e.key==='Escape')closeAPIModal();
+  if(e.key==='Escape'){if(factsOpen())closeFactsModal();else closeAPIModal();}
   else if(e.key==='Enter'&&e.target&&e.target.id==='apiKeyInput')saveAPIKey();
   else keyClick(e);
 });
 
-// Ask before sending (messages only): the choices, labels and explanations
-// come from Python, which also validates and saves the choice; the page only
-// shows labels and sends ids. Loaded when Settings opens.
-const selSend=document.getElementById('sel-send'),sendNote=document.getElementById('send-note');
-let sendHelp=new Map();
+// MESSAGES: one switch, "Ask me before sending a message for you". Python
+// maps it onto the ask-before-sending modes (on = always ask, off = ask when
+// unsure; it never turns asking fully off) and returns every sentence the page shows, plus the
+// remembered approvals count. Loaded when Settings opens.
+const swSend=document.getElementById('sw-send'),sendNote=document.getElementById('send-note');
+const sendHelpEl=document.getElementById('send-help');
 function showSendNote(text,isError){
   sendNote.textContent=text;
   sendNote.className='card-note'+(isError?' error':'');
 }
+function showSend(s){
+  setSw(swSend,!!s.on);
+  sendHelpEl.textContent=String(s.help||'');
+  showSendNote(s.on?'':String(s.note||s.off_help||''),false);
+  showApprovals(Number(s.approvals)||0);
+}
 async function loadSendSetting(){
   try{
-    const o=await pywebview.api.get_ask_before_sending_options();
-    const choices=(o&&Array.isArray(o.choices))?o.choices:[];
-    if(!choices.length)throw new Error('no choices were returned');
-    selSend.innerHTML='';sendHelp=new Map();
-    for(const c of choices){
-      const opt=document.createElement('option');
-      opt.value=String(c.id);opt.textContent=String(c.label||c.id);
-      sendHelp.set(String(c.id),String(c.help||''));
-      selSend.appendChild(opt);
-    }
-    selSend.value=o.current;
-    showSendNote(sendHelp.get(String(o.current))||'',false);
+    const s=await pywebview.api.get_send_confirmation();
+    if(!s||typeof s.on!=='boolean')throw new Error('no setting was returned');
+    showSend(s);
   }catch(e){
     console.error('[send] could not load the setting:',e);
     showSendNote('Could not load this setting: '+((e&&e.message)||e),true);
   }
 }
-// Remembered "Always for this person" approvals: only a count is shown.
-const approvalsNote=document.getElementById('approvals-note');
+swSend.onclick=async()=>{
+  if(!ready)return;
+  try{
+    const r=await pywebview.api.set_send_confirmation(!swSend.classList.contains('on'));
+    if(r&&typeof r.on==='boolean')showSend(r);
+    if(!(r&&r.success))showSendNote((r&&r.error)||'Could not save this setting',true);
+  }catch(err){
+    console.error('[send] save failed:',err);
+    await loadSendSetting();
+  }
+};
+// Remembered "Always for this person" approvals: a count and Forget all, as
+// small text, shown only while there is at least one.
+const approvalsNote=document.getElementById('approvals-note'),approvalsRow=document.getElementById('approvals-row');
+function showApprovals(n){
+  approvalsRow.hidden=!(n>0);
+  approvalsNote.textContent=n>0?'Remembered approvals: '+n:'';
+}
 async function loadApprovals(){
   try{
-    const n=Number(await pywebview.api.get_remembered_approvals_count())||0;
-    approvalsNote.textContent='Remembered approvals: '+n;
-    approvalsNote.className='card-note';
+    showApprovals(Number(await pywebview.api.get_remembered_approvals_count())||0);
   }catch(e){
     console.error('[approvals] could not load the count:',e);
-    approvalsNote.textContent='Could not load the remembered approvals';
-    approvalsNote.className='card-note error';
+    showApprovals(0);
   }
 }
 // Forget all asks first, in the page: the first click arms it, a second
@@ -740,20 +761,66 @@ btnForget.onclick=async()=>{
   }catch(err){console.error('[approvals] forget failed:',err);}
   await loadApprovals();
 };
-selSend.onchange=async e=>{
+
+// BROWSER SIGN-INS: the switch, the browser dropdown (browsers found on this
+// PC, from Python; an unsupported one says so) and "Sign in inside Mist's
+// browser". Every sentence comes from Python (Api.get_browser_signins).
+const swSignins=document.getElementById('sw-signins'),selBrowser=document.getElementById('sel-signins-browser');
+const signinsNote=document.getElementById('signins-note'),signinsHelp=document.getElementById('signins-help');
+const btnSigninBrowser=document.getElementById('btn-signin-browser');
+function showSigninsNote(text,isError){
+  signinsNote.textContent=String(text||'');
+  signinsNote.className='card-note'+(isError?' error':'');
+}
+function showSignins(s){
+  setSw(swSignins,!!s.enabled);
+  const browsers=Array.isArray(s.browsers)?s.browsers:[];
+  selBrowser.innerHTML='';
+  for(const b of browsers){
+    const opt=document.createElement('option');
+    opt.value=String(b.id);
+    opt.textContent=String(b.label||b.id)+(b.supported?'':' - '+String(b.note||'Not supported'));
+    selBrowser.appendChild(opt);
+  }
+  if(s.source)selBrowser.value=String(s.source);
+  showSigninsNote(s.supported===false?s.note:'',false);
+  signinsHelp.textContent=String(s.explanation||'');
+}
+async function loadSignins(){
+  try{
+    const s=await pywebview.api.get_browser_signins();
+    if(!s||!Array.isArray(s.browsers))throw new Error('no setting was returned');
+    showSignins(s);
+  }catch(e){
+    console.error('[signins] could not load the setting:',e);
+    showSigninsNote('Could not load this setting: '+((e&&e.message)||e),true);
+  }
+}
+async function saveSignins(enabled,source){
   if(!ready)return;
   try{
-    const r=await pywebview.api.set_ask_before_sending(e.target.value);
-    if(r&&r.success){
-      showSendNote(String(r.help||''),false);
-    }else{
-      await loadSendSetting();   // show the choice that is really saved
-      showSendNote((r&&r.error)||'Could not save this setting',true);
-    }
+    const r=await pywebview.api.set_browser_signins(enabled,source);
+    if(r&&Array.isArray(r.browsers))showSignins(r);
+    if(!(r&&r.success))showSigninsNote((r&&r.error)||'Could not save this setting',true);
+    else if(enabled!==null)addMsg('Browser sign-ins '+(r.enabled?'on':'off')
+      +': applies the next time the Mist browser starts','system');
   }catch(err){
-    console.error('[send] save failed:',err);
-    await loadSendSetting();
+    console.error('[signins] save failed:',err);
+    await loadSignins();
   }
+}
+swSignins.onclick=()=>saveSignins(!swSignins.classList.contains('on'),selBrowser.value||null);
+selBrowser.onchange=()=>saveSignins(null,selBrowser.value);
+btnSigninBrowser.onclick=async()=>{
+  if(!ready)return;
+  btnSigninBrowser.disabled=true;
+  try{
+    const r=await pywebview.api.open_signin_browser();
+    showSigninsNote((r&&r.message)||'',!(r&&r.success));
+  }catch(e){
+    console.error('[signins] could not open the browser:',e);
+    showSigninsNote("Could not open Mist's browser",true);
+  }finally{btnSigninBrowser.disabled=false;}
 };
 async function saveAPIKey(){
   if(!ready)return;
@@ -779,21 +846,61 @@ async function saveAPIKey(){
   closeAPIModal();
 }
 
-// "Import my facts": only when the user asks. Python reads the file and
-// reports what it added; the page shows that line as text.
-document.getElementById('btn-import-facts').onclick=async()=>{
-  if(!ready)return;
-  const note=document.getElementById('facts-note');
+// ABOUT ME > "Add facts about me": a popup over Settings with one text box.
+// Save sends the text to Python (Api.add_my_facts: one fact per line,
+// trimmed, deduped, capped) and shows how many were saved; the text itself
+// is never logged. Esc or Cancel closes without saving. Tab stays inside the
+// popup, and focus goes back to the button that opened it.
+const factsModal=document.getElementById('factsModal'),factsInput=document.getElementById('factsInput');
+const factsPopupNote=document.getElementById('facts-popup-note'),btnAddFacts=document.getElementById('btn-add-facts');
+const btnFactsSave=document.getElementById('btn-facts-save'),btnFactsCancel=document.getElementById('btn-facts-cancel');
+let factsOpener=null,factsSaving=false;
+function factsOpen(){return factsModal.classList.contains('open');}
+function openFactsModal(){
+  factsOpener=document.activeElement||btnAddFacts;
+  factsInput.value='';
+  factsPopupNote.textContent='';factsPopupNote.className='card-note';
+  factsModal.classList.add('open');
+  factsInput.focus();
+}
+function closeFactsModal(){
+  if(!factsOpen())return;
+  factsModal.classList.remove('open');
+  factsInput.value='';
+  const back=factsOpener&&typeof factsOpener.focus==='function'?factsOpener:btnAddFacts;
+  factsOpener=null;
+  back.focus();
+}
+// The focus trap: Tab and Shift+Tab cycle through the popup's own controls.
+factsModal.addEventListener('keydown',e=>{
+  if(e.key!=='Tab')return;
+  const items=[factsInput,btnFactsSave,btnFactsCancel].filter(el=>!el.disabled);
+  const i=items.indexOf(document.activeElement);
+  e.preventDefault();
+  const next=e.shiftKey?(i<=0?items.length-1:i-1):(i<0||i>=items.length-1?0:i+1);
+  items[next].focus();
+});
+btnAddFacts.onclick=()=>{if(ready)openFactsModal();};
+btnFactsCancel.onclick=closeFactsModal;
+btnFactsSave.onclick=async()=>{
+  if(!ready||factsSaving)return;
+  factsSaving=true;btnFactsSave.disabled=true;
   try{
-    const r=await pywebview.api.import_my_facts();
-    note.textContent=(r&&r.message)||'Import finished';
-    note.className='card-note'+(r&&r.success?'':' error');
-    if(r&&r.added)updateStats();
+    const r=await pywebview.api.add_my_facts(factsInput.value);
+    if(r&&r.success){
+      const note=document.getElementById('facts-note');
+      note.textContent=String(r.message||'Saved');note.className='card-note';
+      closeFactsModal();
+      updateStats();
+    }else{
+      factsPopupNote.textContent=String((r&&r.message)||'Could not save the facts');
+      factsPopupNote.className='card-note error';
+    }
   }catch(e){
-    console.error('[facts] import failed:',e);
-    note.textContent='Import failed: '+((e&&e.message)||e);
-    note.className='card-note error';
-  }
+    console.error('[facts] save failed:',(e&&e.name)||'error');
+    factsPopupNote.textContent='Could not save the facts';
+    factsPopupNote.className='card-note error';
+  }finally{factsSaving=false;btnFactsSave.disabled=false;}
 };
 
 btnSend.onclick=send;

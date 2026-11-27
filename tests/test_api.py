@@ -208,8 +208,10 @@ function makeEl(tag) {
     },
     textContent: '', value: '', className: '', disabled: false, placeholder: '',
     scrollTop: 0, scrollHeight: 0, onclick: null, onchange: null, onkeypress: null,
-    appendChild(c) { this.children.push(c); return c; }, remove() {}, focus() {},
-    setAttribute() {}, addEventListener() {}, querySelector() { return makeEl('x'); },
+    appendChild(c) { this.children.push(c); return c; }, remove() {},
+    focus() { globalThis.document.activeElement = this; },
+    setAttribute() {}, addEventListener(t, fn) { (this.handlers = this.handlers || {})[t] = fn; },
+    querySelector() { return makeEl('x'); },
     set innerHTML(_v) { this.children = []; }, get innerHTML() { return ''; },
   };
 }
@@ -230,7 +232,7 @@ const listeners = {};
 window.addEventListener = (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); };
 window.open = () => {};
 
-const calls = [];
+const calls = [], factsSent = [];
 function api(name, value) {
   return (...args) => {
     calls.push(name);
@@ -253,7 +255,7 @@ globalThis.pywebview = {api: {
   push_to_talk: api('push_to_talk', () => (CONFIG.ptt || []).shift() || {success: true}),
   start_wake_word_detection: api('start_wake_word_detection', {success: true}),
   stop_wake_word_detection: api('stop_wake_word_detection', {success: true}),
-  import_my_facts: api('import_my_facts', () => CONFIG.facts_result),
+  add_my_facts: api('add_my_facts', (t) => { factsSent.push(t); return CONFIG.facts_result; }),
   ask_mistai: api('ask_mistai', () => (CONFIG.ask || []).shift()),
 }};
 
@@ -300,6 +302,11 @@ let out_actions = [];
                         [m.className, m.textContent, m.classList.contains('voice')]),
                       facts: [document.getElementById('facts-note').textContent,
                               document.getElementById('facts-note').className],
+                      popup: {open: document.getElementById('factsModal').classList.contains('open'),
+                              note: [document.getElementById('facts-popup-note').textContent,
+                                     document.getElementById('facts-popup-note').className],
+                              input: document.getElementById('factsInput').value,
+                              focus: (document.activeElement || {}).tag || '', sent: factsSent.slice()},
                       statsCalls: calls.filter(c => c === 'get_memory_stats').length,
                       errors: consoleErrors.slice()});
   }
@@ -398,12 +405,12 @@ def test_a_step_that_never_answers_does_not_block_the_others(tmp_path):
 
 
 # ==========================================================================
-# moved from tests/test_ui_facts.py
-# The "Import my facts" button in Settings (ui/html.py #btn-import-facts).
-#
-# The page only shows what the REAL Api.import_my_facts() reports (computed
-# here against a temporary database and facts file). Node tests skip when Node
-# is missing.
+# moved from tests/test_ui_facts.py (rewritten for the Add facts popup)
+# Settings > ABOUT ME > "Add facts about me" (ui/html.py #btn-add-facts,
+# #factsModal). The page only shows what the REAL Api.add_my_facts() reports
+# (computed here against a temporary database). Node tests skip when Node is
+# missing. "Import my facts" (Api.import_my_facts, the file import) has no
+# button any more but stays for tools/ui_smoke.py.
 # ==========================================================================
 
 
@@ -413,20 +420,12 @@ def test_a_step_that_never_answers_does_not_block_the_others(tmp_path):
 
 @pytest.fixture
 def real_result(monkeypatch, tmp_path):
-    """real_result(content) -> what Api.import_my_facts() returns for a facts
-    file with that content (None: no file)."""
+    """real_result(text) -> what Api.add_my_facts(text) returns against a
+    temporary database."""
     monkeypatch.setenv("MISTAI_DB_PATH", str(tmp_path / "memory.db"))
-    path = tmp_path / "my_facts.json"
-    monkeypatch.setenv("MISTAI_MY_FACTS_PATH", str(path))
     api = Api.__new__(Api)
     api.memory = Memory()
-
-    def run(content):
-        if content is not None:
-            path.write_text(content, encoding="utf-8")
-        return api.import_my_facts()
-
-    yield run
+    yield api.add_my_facts
     api.memory.conn.close()
 
 
@@ -434,25 +433,36 @@ def real_result(monkeypatch, tmp_path):
 # UI PAGE TESTS (3)
 # ============================================================
 
-def test_the_button_sits_in_settings_and_shows_text_only():
-    assert '<button class="btn-cancel" id="btn-import-facts"' in HTML
-    assert HTML.index('id="btn-import-facts"') < HTML.index('onclick="saveAPIKey()"')
+def test_the_add_facts_button_sits_in_about_me_and_opens_a_popup():
+    assert '<button class="btn-cancel set-btn" id="btn-add-facts" aria-haspopup="dialog">Add facts about me</button>' in HTML
+    assert 'id="btn-import-facts"' not in HTML and "Import my facts" not in HTML
+    about = HTML.index('id="sec-about"')
+    assert about < HTML.index('id="btn-add-facts"') < HTML.index('id="sec-messages"')
+    assert '<div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="facts-title">' in HTML
+    assert "Type or paste things Mist should know about you, one per line" in HTML
+    assert '<textarea class="modal-input facts-input" id="factsInput"' in HTML
+    for b in ('id="btn-facts-save">Save</button>', 'id="btn-facts-cancel">Cancel</button>'):
+        assert b in HTML
     js = _script()
-    handler = js.split("document.getElementById('btn-import-facts').onclick=async()=>{", 1)[1] \
-        .split("\n};\n", 1)[0]
-    assert "const r=await pywebview.api.import_my_facts();" in handler
-    assert "note.textContent=(r&&r.message)||'Import finished';" in handler
-    assert "innerHTML" not in handler and "try{" in handler and "}catch(e){" in handler
+    save = js.split("btnFactsSave.onclick=async()=>{", 1)[1].split("\n};\n", 1)[0]
+    assert "const r=await pywebview.api.add_my_facts(factsInput.value);" in save
+    assert "innerHTML" not in save and "console.log" not in save
+    # A failure logs only the error's name, never the typed text.
+    assert "console.error('[facts] save failed:',(e&&e.name)||'error');" in save
+    assert "if(e.key==='Escape'){if(factsOpen())closeFactsModal();else closeAPIModal();}" in js
 
 
 # ============================================================
 # UI PAGE HELPERS (5)
 # ============================================================
 
-def _click(tmp_path, result=None, **config):
-    r = _run_page(tmp_path, actions=[{"click": "btn-import-facts"}], facts_result=result,
-                  **config)
-    return r["actions"][0], r
+_TYPE = "document.getElementById('factsInput').value = %s;"
+
+
+def _facts_run(tmp_path, result, *steps, **config):
+    actions = [{"click": "btn-add-facts"}] + list(steps)
+    r = _run_page(tmp_path, actions=actions, facts_result=result, **config)
+    return r["actions"], r
 
 
 # ============================================================
@@ -460,30 +470,58 @@ def _click(tmp_path, result=None, **config):
 # ============================================================
 
 @needs_node
-def test_a_missing_file_is_a_plain_note(tmp_path, real_result):
-    result = real_result(None)
-    snap, _ = _click(tmp_path, result)
-    assert snap["facts"] == [result["message"], "card-note"]          # not an error
-    assert snap["facts"][0].startswith("No facts file found.")
-    assert snap["errors"] == []
-
-
-@needs_node
-def test_an_import_reports_what_it_added_and_refreshes_the_counters(tmp_path, real_result):
-    result = real_result(json.dumps(["I park on level 3", "My dentist is Dr. Lee"]))
+def test_saving_facts_shows_how_many_closes_the_popup_and_refreshes_the_counters(tmp_path, real_result):
+    text = "I park on level 3\n- My dentist is Dr. Lee\nI park on level 3\n"
+    result = real_result(text)
+    assert result["success"] is True and result["added"] == 2
     before = _run_page(tmp_path, facts_result=result)["calls"].count("get_memory_stats")
-    snap, _ = _click(tmp_path, result)
-    assert snap["facts"] == ["Imported 2 facts (0 already saved, 0 restored).", "card-note"]
-    assert snap["statsCalls"] == before + 1            # the Facts count updates
+    acts, _ = _facts_run(tmp_path, result, {"js": _TYPE % json.dumps(text)},
+                         {"click": "btn-facts-save"})
+    opened, typed, saved = acts
+    assert opened["popup"]["open"] is True and opened["popup"]["focus"] == "#factsInput"
+    assert saved["popup"]["open"] is False and saved["popup"]["sent"] == [text]
+    assert saved["facts"] == ["Saved 2 facts. 1 was already saved.", "card-note"]
+    assert saved["popup"]["input"] == ""                            # the text is not kept
+    assert saved["popup"]["focus"] == "#btn-add-facts"              # focus goes back
+    assert saved["statsCalls"] == before + 1                       # the Facts count updates
+    assert saved["errors"] == []
 
 
 @needs_node
-def test_an_unreadable_file_and_a_failed_call_are_errors(tmp_path, real_result):
-    snap, _ = _click(tmp_path, real_result("{not json"))
-    assert snap["facts"][0].startswith("Could not read ") and snap["facts"][1] == "card-note error"
-    snap, r = _click(tmp_path, None, fail={"import_my_facts": "reject"})
-    assert snap["facts"] == ["Import failed: import_my_facts failed", "card-note error"]
-    assert any(e.startswith("[facts] import failed:") for e in snap["errors"])
+def test_escape_and_cancel_close_without_saving(tmp_path):
+    esc = {"js": "for (const fn of listeners['keydown']) fn({key: 'Escape', target: {}});"}
+    acts, r = _facts_run(tmp_path, {"success": True, "message": "x"},
+                         {"js": _TYPE % json.dumps("secret fact")}, esc)
+    assert acts[-1]["popup"]["open"] is False and acts[-1]["popup"]["sent"] == []
+    assert acts[-1]["popup"]["input"] == "" and acts[-1]["popup"]["focus"] == "#btn-add-facts"
+    acts, r = _facts_run(tmp_path, {"success": True, "message": "x"},
+                         {"js": _TYPE % json.dumps("secret fact")}, {"click": "btn-facts-cancel"})
+    assert acts[-1]["popup"]["open"] is False and acts[-1]["popup"]["sent"] == []
+    assert "add_my_facts" not in r["calls"] + r["after"]["calls"]
+
+
+@needs_node
+def test_tab_stays_inside_the_popup(tmp_path):
+    tab = ("const m = document.getElementById('factsModal');"
+           "m.handlers.keydown({key: 'Tab', shiftKey: %s, preventDefault() {}});")
+    acts, _ = _facts_run(tmp_path, {"success": True}, {"js": tab % "false"},
+                         {"js": tab % "false"}, {"js": tab % "false"}, {"js": tab % "true"})
+    assert [a["popup"]["focus"] for a in acts] == [
+        "#factsInput", "#btn-facts-save", "#btn-facts-cancel", "#factsInput", "#btn-facts-cancel"]
+
+
+@needs_node
+def test_nothing_to_save_and_a_failed_call_keep_the_popup_open(tmp_path, real_result):
+    result = real_result("   \n- \n")
+    assert result["success"] is False
+    acts, _ = _facts_run(tmp_path, result, {"click": "btn-facts-save"})
+    assert acts[-1]["popup"]["open"] is True
+    assert acts[-1]["popup"]["note"] == [result["message"], "card-note error"]
+    acts, _ = _facts_run(tmp_path, None, {"js": _TYPE % json.dumps("my secret line")},
+                         {"click": "btn-facts-save"}, fail={"add_my_facts": "reject"})
+    assert acts[-1]["popup"]["note"] == ["Could not save the facts", "card-note error"]
+    assert acts[-1]["errors"] == ["[facts] save failed: Error"]   # no text, no message
+    assert acts[-1]["popup"]["open"] is True
 
 
 # ==========================================================================
@@ -897,7 +935,7 @@ def _fn(name):
 
 def test_every_settings_switch_is_a_keyboard_switch_with_a_state():
     js = _script()
-    for sw in ("sw-wake", "sw-cap", "sw-orb", "sw-orb_flight", "sw-orb_panels"):
+    for sw in ("sw-wake", "sw-cap", "sw-orb", "sw-orb_panels", "sw-send", "sw-signins"):
         assert f"['{sw}'," in js, sw
     make = _fn("makeSwitch")
     assert "setAttribute('role','switch')" in make and "sw.tabIndex=0;" in make
@@ -927,13 +965,13 @@ def test_switch_helpers_run(tmp_path):
 
 
 def test_settings_is_a_labelled_dialog_that_escape_closes_and_returns_focus():
-    assert '<div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">' in HTML
+    assert '<div class="modal-content settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">' in HTML
     assert '<div class="modal-title" id="settings-title">SETTINGS</div>' in HTML
     assert "API CONFIGURATION" not in HTML
     close = _fn("closeAPIModal")
     assert "document.getElementById('btn-settings').focus();" in close
     assert "document.getElementById('apiKeyInput').focus();" in _fn("openAPIModal")
-    assert "if(e.key==='Escape')closeAPIModal();" in _script()
+    assert "if(e.key==='Escape'){if(factsOpen())closeFactsModal();else closeAPIModal();}" in _script()
 
 
 def test_the_api_key_is_a_password_field_cleared_after_saving():
@@ -966,12 +1004,22 @@ def test_focus_ring_contrast_and_reduced_motion_for_the_rest_of_the_page():
 
 
 def test_orb_options_say_they_need_the_orb_and_dim_without_it():
-    for name in ("orb_flight", "orb_panels"):
-        assert re.search(r'id="sw-' + name + r'" title="Needs the floating orb\.', HTML)
-        assert f'id="row-{name}"' in HTML
+    assert re.search(r'id="sw-orb_panels" title="Needs the floating orb\.', HTML)
+    assert 'id="row-orb_panels"' in HTML
     dep = _fn("showOrbDependents")
     assert "row.classList.toggle('inactive',!orbOn)" in dep
     assert "beside the floating orb: current step" not in HTML
+
+
+def test_settings_has_the_four_sections_in_order_with_save_and_close():
+    order = [HTML.index(f'id="{s}"') for s in ("sec-api", "sec-about", "sec-messages", "sec-signins")]
+    assert order == sorted(order)
+    titles = re.findall(r'<div class="card-title" id="sec-\w+">([^<]+)</div>', HTML)
+    assert titles == ["API key", "About me", "Messages", "Browser sign-ins"]
+    assert order[0] < HTML.index('id="apiKeyInput"') < HTML.index('id="backend-row"') < order[1]
+    assert "Your MistAI key lets Mist reach its AI service." in HTML
+    assert HTML.index('id="sec-signins"') < HTML.index('onclick="saveAPIKey()"')
+    assert '<button class="btn-cancel" onclick="closeAPIModal()">Close</button>' in HTML
 
 
 # ============================================================

@@ -65,6 +65,11 @@ from .config import (
     ASK_BEFORE_SENDING_CHOICES,
     ASK_BEFORE_SENDING_HELP,
     ASK_BEFORE_SENDING_LABELS,
+    SEND_SWITCH_HELP,
+    SEND_SWITCH_NEVER_NOTE,
+    SEND_SWITCH_OFF_HELP,
+    send_mode_for_switch,
+    send_switch_state,
     DEFAULT_GENDER,
     DEFAULT_HOTKEYS,
     DEFAULT_MODEL,
@@ -75,8 +80,6 @@ from .config import (
     orb_idle_drift_enabled,
     orb_panels_enabled,
     orb_pointer_enabled,
-    panel_anchor,
-    PANEL_ANCHORS,
     PTT_PAUSE_THRESHOLD,
     PTT_PHRASE_TIME_LIMIT,
     CONFIRM_LEAD_IN_SECONDS,
@@ -115,14 +118,14 @@ from .config import (
     voice_diag_enabled,
 )
 from .browser_session import NAV_TIMEOUT_MS
+from . import browser_signins
 from .caption import CaptionWindow
 from .click_handler import CoordinateValidator, ImprovedClickHandler, EnhancedUIANavigator
 from . import planner as conversation, workspace as file_search, live_state as clip
 from .live_state import EventBus, LiveStateTracker, window_belongs_to, FileWatcher, StateWatcher
 from .executor import Executor
 from .floating_orb import signal_scope, waiting_scope
-from .orb_behavior import dump_positions, parse_positions
-from .memory import Memory, recall_builtin, TaskStore
+from .memory import Memory, recall_builtin, TaskStore, parse_fact_lines, FACTS_TEXT_MAX_CHARS
 from .screen import WindowWatch, CohereVision
 from .tools import ToolRegistry
 from .tts import NeuralTTS, VoiceTimer, WakeCalibration, dropped_count as _tts_dropped
@@ -2474,11 +2477,13 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         """Save the setting and show or hide the orb window. A window that
         cannot be opened turns the setting back off."""
         enabled = bool(enabled)
+        cache = self.__dict__.setdefault("_orb_option_cache", {})
         try:
             self.memory.set_profile("floating_orb", "on" if enabled else "off")
         except Exception:
             return {"success": False, "enabled": self.get_floating_orb(),
                     "error": "Could not save the setting"}
+        cache["floating_orb"] = "on" if enabled else "off"
         orb = self._floating_orb()
         if not enabled:
             orb.hide()
@@ -2489,36 +2494,51 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             self.memory.set_profile("floating_orb", "off")
         except Exception:
             pass
+        cache["floating_orb"] = "off"
         return {"success": False, "enabled": False, "error": "The orb window could not be opened"}
 
-    # "Orb follows the task" and "Task panels" (default off; an env flag,
-    # MISTAI_ORB_FLIGHT / MISTAI_ORB_PANELS, overrides the saved value).
-    # "Orb points before clicking" (orb_pointer, MISTAI_ORB_POINTER) and "Idle
-    # drift" (orb_idle_drift, MISTAI_ORB_IDLE_DRIFT) default ON; the pointer
-    # only acts while "Orb follows the task" is on too.
+    # ------------------------------------------------------------
+    # ORB OPTIONS FROM THE FLOATING ORB SWITCH
+    # ------------------------------------------------------------
+    # The single "Floating orb" switch (profile "floating_orb") turns on the
+    # orb AND following the task (orb_flight), pointing before clicks
+    # (orb_pointer) and idle drift (orb_idle_drift); MISTAI_ORB_FLIGHT /
+    # MISTAI_ORB_POINTER / MISTAI_ORB_IDLE_DRIFT stay as developer-only
+    # overrides. The rows the old per-behavior switches saved are ignored
+    # (left in the database). "Task panels" (orb_panels, MISTAI_ORB_PANELS)
+    # keeps its own switch. Panel placement is automatic per task
+    # (core/floating_orb.py OrbPanels; MISTAI_PANEL_ANCHOR pins it).
     _ORB_OPTIONS = {"orb_flight": orb_flight_enabled, "orb_panels": orb_panels_enabled,
                     "orb_pointer": orb_pointer_enabled,
                     "orb_idle_drift": orb_idle_drift_enabled}
-    _ORB_OPTION_DEFAULTS = {"orb_pointer": "on", "orb_idle_drift": "on"}
+    _ORB_SWITCH_OPTIONS = ("orb_flight", "orb_pointer", "orb_idle_drift")
 
     def orb_option(self, name):
         """Is this orb option on? Read four times a second by the orb, so the
-        saved value is cached and refreshed by set_orb_option."""
+        saved values are cached and refreshed by set_floating_orb /
+        set_orb_option."""
         cache = self.__dict__.setdefault("_orb_option_cache", {})
-        default = self._ORB_OPTION_DEFAULTS.get(name, "off")
-        if name not in cache:
+        key = "floating_orb" if name in self._ORB_SWITCH_OPTIONS else name
+        if key not in cache:
             try:
-                cache[name] = self.memory.get_profile(name, default)
+                cache[key] = self.memory.get_profile(key, "off")
             except Exception:
-                cache[name] = default
-        return self._ORB_OPTIONS[name](cache[name])
+                cache[key] = "off"
+        if name in self._ORB_SWITCH_OPTIONS:
+            return self._ORB_OPTIONS[name](str(cache[key]) == "on")
+        return self._ORB_OPTIONS[name](cache[key])
 
     def get_orb_options(self):
         return {name: self.orb_option(name) for name in self._ORB_OPTIONS}
 
     def set_orb_option(self, name, enabled):
+        """Only "Task panels" has its own switch; the other options follow
+        the Floating orb switch."""
         if name not in self._ORB_OPTIONS:
             return {"success": False, "error": "Unknown option"}
+        if name in self._ORB_SWITCH_OPTIONS:
+            return {"success": False, "enabled": self.orb_option(name),
+                    "error": "This follows the Floating orb switch"}
         value = "on" if enabled else "off"
         try:
             self.memory.set_profile(name, value)
@@ -2527,70 +2547,6 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     "error": "Could not save the setting"}
         self.__dict__.setdefault("_orb_option_cache", {})[name] = value
         return {"success": True, "enabled": self.orb_option(name)}
-
-    # Task panel placement: a preset anchor (Settings dropdown, profile
-    # "panel_anchor"; MISTAI_PANEL_ANCHOR overrides) and the spots the user
-    # dragged panels to (profile "panel_positions", JSON {kind: [fx, fy]},
-    # fractions of the work area), cleared by "Reset panel positions".
-
-    def panel_anchor_setting(self):
-        cache = self.__dict__.setdefault("_orb_option_cache", {})
-        if "panel_anchor" not in cache:
-            try:
-                cache["panel_anchor"] = self.memory.get_profile("panel_anchor", "top-right")
-            except Exception:
-                cache["panel_anchor"] = "top-right"
-        return panel_anchor(cache["panel_anchor"])
-
-    def get_panel_anchor(self):
-        return {"anchor": self.panel_anchor_setting(), "presets": list(PANEL_ANCHORS)}
-
-    def set_panel_anchor(self, anchor):
-        anchor = str(anchor or "").strip().lower()
-        if anchor not in PANEL_ANCHORS:
-            return {"success": False, "anchor": self.panel_anchor_setting(),
-                    "error": "Unknown position"}
-        try:
-            self.memory.set_profile("panel_anchor", anchor)
-        except Exception:
-            return {"success": False, "anchor": self.panel_anchor_setting(),
-                    "error": "Could not save the setting"}
-        self.__dict__.setdefault("_orb_option_cache", {})["panel_anchor"] = anchor
-        return {"success": True, "anchor": self.panel_anchor_setting()}
-
-    def panel_positions(self):
-        """{kind: (fx, fy)} of the panels the user placed by hand (cached)."""
-        cache = self.__dict__.setdefault("_orb_option_cache", {})
-        if "panel_positions" not in cache:
-            try:
-                cache["panel_positions"] = parse_positions(
-                    self.memory.get_profile("panel_positions", ""))
-            except Exception:
-                cache["panel_positions"] = {}
-        return cache["panel_positions"]
-
-    def save_panel_position(self, kind, frac):
-        positions = dict(self.panel_positions())
-        positions[str(kind)] = (float(frac[0]), float(frac[1]))
-        positions = parse_positions(dump_positions(positions))
-        self.memory.set_profile("panel_positions", dump_positions(positions))
-        self.__dict__.setdefault("_orb_option_cache", {})["panel_positions"] = positions
-
-    def reset_panel_positions(self):
-        """Settings "Reset panel positions": every panel goes back to the preset."""
-        try:
-            self.memory.set_profile("panel_positions", "")
-        except Exception:
-            return {"success": False, "error": "Could not save the setting"}
-        self.__dict__.setdefault("_orb_option_cache", {})["panel_positions"] = {}
-        orb = self.__dict__.get("_orb")
-        panels = getattr(orb, "panels", None)
-        if panels is not None:
-            try:
-                panels.reset_positions()
-            except Exception:
-                pass
-        return {"success": True}
 
     # -- the orb pointer (core/floating_orb.py point_before_click) ------------
 
@@ -2631,25 +2587,115 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             rects = None
         return self._orb_point(rects[0]) if rects else False
 
-    # "Use my Firefox sign-ins" (default off; MISTAI_BROWSER_SEED_PROFILE
-    # overrides the saved value). Read when MistAI's browser starts, so a
-    # change applies to the next browser session.
-    def get_firefox_signins(self):
+    # ------------------------------------------------------------
+    # BROWSER SIGN-INS
+    # ------------------------------------------------------------
+    # Settings > BROWSER SIGN-INS: the switch "Let Mist use sign-ins from my
+    # browser" (profile "browser_seed_profile", default off,
+    # MISTAI_BROWSER_SEED_PROFILE overrides), the browser to copy from
+    # (profile "browser_signins_source"; the dropdown of installed browsers,
+    # core/browser_signins.py) and "Sign in inside Mist's browser". Only
+    # Firefox can be copied; any other choice leaves Mist's browser on its own
+    # clean profile. Read when MistAI's browser starts, so a change applies to
+    # the next browser session.
+
+    def _signins_switch(self):
         try:
             saved = self.memory.get_profile("browser_seed_profile", "off")
         except Exception:
             saved = "off"
         return browser_seed_profile_enabled(saved)
 
+    def _signins_saved_source(self):
+        try:
+            return str(self.memory.get_profile("browser_signins_source", "") or "").strip().lower()
+        except Exception:
+            return ""
+
+    def get_firefox_signins(self):
+        """Seed MistAI's browser from Firefox? The switch on and Firefox the
+        chosen browser (nothing saved yet = Firefox, the old Firefox-only
+        setting). Called by BrowserSession at each start; no registry read."""
+        if not self._signins_switch():
+            return False
+        return (self._signins_saved_source() or browser_signins.DEFAULT_SOURCE) == "firefox"
+
     def set_firefox_signins(self, enabled):
+        """The old Firefox-only switch (kept for scripts): sets the switch only."""
         value = "on" if enabled else "off"
         try:
             self.memory.set_profile("browser_seed_profile", value)
         except Exception:
             return {"success": False, "enabled": self.get_firefox_signins(),
                     "error": "Could not save the setting"}
-        print(f"[Browser] Use my Firefox sign-ins: {value} (applies to the next browser start)")
+        print(f"[Browser] browser sign-ins: {value} (applies to the next browser start)")
         return {"success": True, "enabled": self.get_firefox_signins()}
+
+    def _signin_choices(self):
+        installed = browser_signins.installed_browsers()
+        default = browser_signins.default_browser()
+        return browser_signins.browser_choices(installed, default), default
+
+    def get_browser_signins(self):
+        """For Settings: {enabled, source, supported, note, browsers, explanation}."""
+        choices, default = self._signin_choices()
+        on = self._signins_switch()
+        source = browser_signins.resolve_source(self._signins_saved_source(), choices, on, default)
+        supported = browser_signins.is_supported(source)
+        return {"enabled": on, "source": source, "supported": supported,
+                "note": "" if supported else browser_signins.UNSUPPORTED_NOTE,
+                "browsers": choices, "explanation": browser_signins.SIGNINS_EXPLANATION}
+
+    def set_browser_signins(self, enabled=None, source=None):
+        """Save the switch and/or the browser (validated against the browsers
+        found on this PC). Logs the switch and the browser's family id only."""
+        choices, default = self._signin_choices()
+        if source is not None:
+            source = str(source or "").strip().lower()
+            if source not in [c["id"] for c in choices]:
+                return dict(self.get_browser_signins(), success=False,
+                            error="That browser was not found on this PC")
+        try:
+            if enabled is not None:
+                self.memory.set_profile("browser_seed_profile", "on" if enabled else "off")
+            if source is not None:
+                self.memory.set_profile("browser_signins_source", source)
+        except Exception:
+            return dict(self.get_browser_signins(), success=False,
+                        error="Could not save the setting")
+        state = self.get_browser_signins()
+        print(f"[Browser] browser sign-ins: {'on' if state['enabled'] else 'off'}, "
+              f"{state['source']} ({'supported' if state['supported'] else 'not supported'}; "
+              "applies to the next browser start)")
+        return dict(state, success=True)
+
+    def open_signin_browser(self):
+        """"Sign in inside Mist's browser": start (or show) MistAI's own
+        browser so the user can sign in to sites once; the sign-ins stay in
+        MistAI's own profile. Not while a task runs (it may be using it)."""
+        lock = getattr(self, "_agent_lock", None)
+        if lock is not None and lock.locked():
+            return {"success": False,
+                    "message": "Mist is working on a task. Try again when it is done."}
+        browser = getattr(self, "browser", None)
+        if browser is None or not getattr(browser, "available", False):
+            return {"success": False,
+                    "message": "Mist's browser is not available (Playwright's Firefox is not installed)."}
+
+        def run():
+            try:
+                browser.ensure_started()
+                hwnd = clip.playwright_window()
+                if hwnd:
+                    self._focus_hwnd(hwnd)
+                print("[Browser] sign-in window " + ("shown" if hwnd else "not found"))
+            except Exception as e:
+                print(f"[Browser] sign-in window failed ({type(e).__name__})")
+
+        threading.Thread(target=run, daemon=True, name="SigninBrowser").start()
+        return {"success": True,
+                "message": "Opening Mist's browser. Sign in to your sites there; they stay "
+                           "signed in inside Mist's own browser."}
 
     def start_floating_orb_if_enabled(self):
         if self.get_floating_orb():
@@ -2703,6 +2749,31 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                         for c in ASK_BEFORE_SENDING_CHOICES],
             "current": self.ask_before_sending_mode(),
         }
+
+    # ------------------------------------------------------------
+    # MESSAGES SWITCH (SETTINGS)
+    # ------------------------------------------------------------
+    # "Ask me before sending a message for you": on = "always" (the default),
+    # off = "when_unsure"; the switch never selects "never" (config MESSAGES
+    # SWITCH MAPPING). The remembered approvals count rides along so the page
+    # shows "Remembered approvals" / "Forget all" only when there are some.
+
+    def get_send_confirmation(self):
+        mode = self.ask_before_sending_mode()
+        return {"on": send_switch_state(mode), "help": SEND_SWITCH_HELP,
+                "off_help": SEND_SWITCH_OFF_HELP,
+                "note": SEND_SWITCH_NEVER_NOTE if mode == "never" else "",
+                "approvals": self.get_remembered_approvals_count()}
+
+    def set_send_confirmation(self, on):
+        if not isinstance(on, bool):
+            return dict(self.get_send_confirmation(), success=False,
+                        error="Could not save this setting")
+        r = self.set_ask_before_sending(send_mode_for_switch(on))
+        if not r.get("success"):
+            return dict(self.get_send_confirmation(), success=False,
+                        error=r.get("error") or "Could not save this setting")
+        return dict(self.get_send_confirmation(), success=True)
 
     # -- Remembered send approvals ("Always for this person") ------------------
 
@@ -6085,6 +6156,42 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         return {"success": True, "added": added, "skipped": skipped,
                 "restored": restored, "message": summary}
 
+
+    # ------------------------------------------------------------
+    # ADD FACTS ABOUT ME (SETTINGS POPUP)
+    # ------------------------------------------------------------
+    # The popup's text: one fact per line, parsed by memory.parse_fact_lines
+    # (bullets dropped, trimmed, deduped, size-capped) and stored through the
+    # same Memory.import_facts as "Import my facts". Logs counts only.
+
+    def add_my_facts(self, text):
+        facts, info = parse_fact_lines(text)
+        if info["too_big"]:
+            return {"success": False, "added": 0,
+                    "message": f"That is too much text at once (over {FACTS_TEXT_MAX_CHARS:,} "
+                               "characters). Save it in parts."}
+        if not facts:
+            return {"success": False, "added": 0,
+                    "message": "Nothing to save. Type at least one fact, one per line."}
+        try:
+            added, skipped, restored = self.memory.import_facts(facts)
+        except Exception as e:
+            print(f"[Memory] facts from Settings not saved ({type(e).__name__})")
+            return {"success": False, "added": 0, "message": "Could not save the facts."}
+        skipped += info["duplicates"]
+        saved = added + restored
+        parts = [f"Saved {saved} fact{'s' if saved != 1 else ''}."]
+        if skipped:
+            parts.append(f"{skipped} {'was' if skipped == 1 else 'were'} already saved.")
+        if info["too_long"]:
+            parts.append(f"{info['too_long']} {'was' if info['too_long'] == 1 else 'were'} "
+                         "too long and left out.")
+        if info["over"]:
+            parts.append(f"{info['over']} over the limit for one save {'was' if info['over'] == 1 else 'were'} left out.")
+        print(f"[Memory] facts from Settings: {added} added, {restored} restored, "
+              f"{skipped} already saved, {info['too_long']} too long, {info['over']} over the cap")
+        return {"success": True, "added": saved, "skipped": skipped,
+                "too_long": info["too_long"], "over": info["over"], "message": " ".join(parts)}
 
     def find_file_roots(self):
         """Folders find_file searches, in order: the active workspace root,

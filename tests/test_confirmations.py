@@ -109,7 +109,11 @@ from core.config import (
     ASK_BEFORE_SENDING_DEFAULT,
     ASK_BEFORE_SENDING_HELP,
     ASK_BEFORE_SENDING_LABELS,
+    SEND_SWITCH_HELP,
+    SEND_SWITCH_NEVER_NOTE,
+    SEND_SWITCH_OFF_HELP,
     send_is_grounded,
+    send_mode_for_switch,
     recipient_match,
 )
 from core.planner import PlanRunner
@@ -1503,11 +1507,13 @@ class _Memory:
 # ASK BEFORE SENDING RUN
 # ============================================================
 
-def _ask_before_sending_run(monkeypatch, replies, answers, *, mode=None, goal=GOAL, seen=None,
+def _ask_before_sending_run(monkeypatch, replies, answers, *, mode="when_unsure", goal=GOAL, seen=None,
          confirm=("quick_message", "window_close")):
     """One phase through the real AgentLoop; quick_message runs the REAL
     Api._act_quick_message (vision answers `seen`, default exact), typed
-    confirmations answer from `answers`."""
+    confirmations answer from `answers`. ``mode`` is saved as the setting
+    ("when_unsure" unless given: the gate tests exercise that mode; None =
+    nothing saved, i.e. the default)."""
     replies = iter(json.dumps(r) for r in replies)
     answers = list(answers)
     seen = list(seen if seen is not None else [ASK_BEFORE_SENDING_CONTACT] * 3)
@@ -1594,24 +1600,70 @@ def _ask_before_sending_sent(rec):
 # ASK BEFORE SENDING TESTS
 # ============================================================
 
-def test_default_is_when_unsure():
-    assert ASK_BEFORE_SENDING_DEFAULT == "when_unsure"
+def test_default_is_always_the_safe_option():
+    assert ASK_BEFORE_SENDING_DEFAULT == "always"
     api = SimpleNamespace(memory=_Memory())
-    assert Api.ask_before_sending_mode(api) == "when_unsure"
+    assert Api.ask_before_sending_mode(api) == "always"
+
+
+def test_nothing_saved_asks_even_a_grounded_exact_send(monkeypatch):
+    rec = _ask_before_sending_run(monkeypatch, [ASK_BEFORE_SENDING_SEND, ASK_BEFORE_SENDING_DONE],
+                                  ["yes"], mode=None)
+    assert len(rec.asked) == 1 and _ask_before_sending_sent(rec)
 
 
 @pytest.mark.parametrize("stored", ["", "bogus", "ALWAYS ", None, 3])
 def test_a_bad_stored_value_falls_back_to_the_default(stored):
     api = SimpleNamespace(memory=_Memory(stored))
-    expected = "always" if stored == "ALWAYS " else "when_unsure"
-    assert Api.ask_before_sending_mode(api) == expected
+    assert Api.ask_before_sending_mode(api) == "always"
 
 
 def test_an_unreadable_profile_gives_the_default():
     def broken(*_a):
         raise OSError("locked")
     api = SimpleNamespace(memory=SimpleNamespace(get_profile=broken))
-    assert Api.ask_before_sending_mode(api) == "when_unsure"
+    assert Api.ask_before_sending_mode(api) == "always"
+
+
+# -- the Settings switch ("Ask me before sending a message for you") ---------------------
+
+
+def _switch_api(stored=None, approvals=0):
+    api = SimpleNamespace(memory=_Memory(stored))
+    for name in ("ask_before_sending_mode", "set_ask_before_sending", "get_send_confirmation"):
+        setattr(api, name, getattr(Api, name).__get__(api))
+    api.get_remembered_approvals_count = lambda: approvals
+    return api
+
+
+@pytest.mark.parametrize("stored, on, note", [
+    (None, True, ""), ("always", True, ""), ("when_unsure", False, ""),
+    ("never", False, SEND_SWITCH_NEVER_NOTE), ("bogus", True, ""),
+])
+def test_the_switch_shows_each_mode(stored, on, note):
+    s = _switch_api(stored, approvals=3).get_send_confirmation()
+    assert s == {"on": on, "help": SEND_SWITCH_HELP, "off_help": SEND_SWITCH_OFF_HELP,
+                 "note": note, "approvals": 3}
+
+
+def test_the_switch_maps_onto_always_and_when_unsure_never_never():
+    api = _switch_api("never")
+    r = Api.set_send_confirmation(api, True)
+    assert r["success"] is True and r["on"] is True
+    assert api.memory.profile == {"ask_before_sending": "always"}
+    r = Api.set_send_confirmation(api, False)
+    assert r["success"] is True and r["on"] is False and r["note"] == ""
+    assert api.memory.profile == {"ask_before_sending": "when_unsure"}   # still asks when unsure
+    for bad in ("never", "off", 0, None, "false"):
+        r = Api.set_send_confirmation(api, bad)
+        assert r["success"] is False and api.memory.profile == {"ask_before_sending": "when_unsure"}
+    assert {send_mode_for_switch(v) for v in (True, False)} == {"always", "when_unsure"}
+
+
+def test_a_saved_never_is_still_honored_until_the_switch_is_touched(monkeypatch):
+    rec = _ask_before_sending_run(monkeypatch, [ASK_BEFORE_SENDING_SEND, ASK_BEFORE_SENDING_DONE],
+                                  [], mode="never")
+    assert rec.asked == [] and _ask_before_sending_sent(rec)
 
 
 def test_set_validates_in_python_and_saves_the_profile_key():
@@ -1766,19 +1818,18 @@ def _ask_before_sending_script():
 # ASK BEFORE SENDING TESTS (2)
 # ============================================================
 
-def test_page_hardcodes_no_choice_id_label_or_help():
+def test_page_hardcodes_no_mode_id_label_or_help():
     for c in ASK_BEFORE_SENDING_CHOICES:            # ids, as a JS/HTML literal
         assert f"'{c}'" not in HTML and f'"{c}"' not in HTML, c
-    assert "when_unsure" not in HTML
-    for word in (*ASK_BEFORE_SENDING_LABELS.values(), *ASK_BEFORE_SENDING_HELP.values()):
+    assert "when_unsure" not in HTML and 'id="sel-send"' not in HTML
+    for word in (*ASK_BEFORE_SENDING_LABELS.values(), *ASK_BEFORE_SENDING_HELP.values(),
+                 SEND_SWITCH_HELP, SEND_SWITCH_OFF_HELP, SEND_SWITCH_NEVER_NOTE):
         assert word not in HTML, word
-    m = re.search(r'<select id="sel-send">(.*?)</select>', HTML, re.S)
-    assert m and m.group(1).strip() == ""
+    assert ('<div class="toggle-row set-toggle"><span id="lbl-send">Ask me before sending a '
+            'message for you</span><div class="sw" id="sw-send"></div></div>') in HTML
     js = _ask_before_sending_script()
-    assert "opt.value=String(c.id);opt.textContent=String(c.label||c.id);" in js
-    assert "pywebview.api.set_ask_before_sending(e.target.value)" in js
-    assert "innerHTML=" not in js.split("async function loadSendSetting", 1)[1].split(
-        "selSend.innerHTML=''", 1)[1].split("selSend.onchange", 1)[0]
+    assert "pywebview.api.set_send_confirmation(!swSend.classList.contains('on'))" in js
+    assert "get_ask_before_sending_options" not in js and "set_ask_before_sending" not in js
 
 
 # ============================================================
@@ -1794,6 +1845,7 @@ console.error = (...a) => errors.push(a.map(x => String(x && x.message || x)).jo
 function makeEl(tag) {
   const classes = new Set();
   return {tag, children: [], style: {}, dataset: {}, textContent: '', value: '', className: '',
+    hidden: false,
     classList: {add(c) { classes.add(c); }, remove(c) { classes.delete(c); },
       toggle(c, f) { (f === undefined ? !classes.has(c) : f) ? classes.add(c) : classes.delete(c); },
       contains(c) { return classes.has(c); }},
@@ -1808,9 +1860,10 @@ globalThis.window = globalThis;
 const listeners = {};
 window.addEventListener = (t, fn) => { (listeners[t] = listeners[t] || []).push(fn); };
 const calls = [];
+let state = CONFIG.initial;
 const impl = {
-  get_ask_before_sending_options: () => CONFIG.options,
-  set_ask_before_sending: (v) => CONFIG.set[v],
+  get_send_confirmation: () => state,
+  set_send_confirmation: (on) => { state = CONFIG.set[String(on)]; return state; },
 };
 globalThis.pywebview = {api: new Proxy({}, {get: (_t, name) => (...args) => {
   calls.push(name);
@@ -1821,17 +1874,19 @@ const settle = () => new Promise(r => realSetTimeout(r, 30));
 (async () => {
   for (const fn of listeners['pywebviewready'] || []) fn();
   await settle();
-  const sel = document.getElementById('sel-send'), note = document.getElementById('send-note');
-  const snap = () => ({options: sel.children.map(o => [o.value, o.textContent]), value: sel.value,
-                       note: [note.textContent, note.className]});
-  const before = {calls: calls.filter(c => c.includes('sending')), ...snap()};
+  const sw = document.getElementById('sw-send'), note = document.getElementById('send-note');
+  const help = document.getElementById('send-help'), row = document.getElementById('approvals-row');
+  const snap = () => ({on: sw.classList.contains('on'), help: help.textContent,
+                       note: [note.textContent, note.className], approvalsHidden: row.hidden,
+                       approvals: document.getElementById('approvals-note').textContent});
+  const before = {calls: calls.filter(c => c.includes('send_conf'))};
   openAPIModal();
   await settle();
   const opened = snap();
   const steps = [];
-  for (const v of CONFIG.change) { await sel.onchange({target: {value: v}}); await settle(); steps.push(snap()); }
+  for (let i = 0; i < CONFIG.clicks; i++) { await sw.onclick(); await settle(); steps.push(snap()); }
   console.log(JSON.stringify({before, opened, steps, errors: errors.filter(e => e.includes('[send]')),
-                              calls: calls.filter(c => c.includes('sending'))}));
+                              calls: calls.filter(c => c.includes('send_conf'))}));
 })();
 """
 
@@ -1840,14 +1895,17 @@ const settle = () => new Promise(r => realSetTimeout(r, 30));
 # ASK BEFORE SENDING RUN PAGE
 # ============================================================
 
-def _run_page(tmp_path, change):
-    api = SimpleNamespace(memory=_Memory())
-    api.ask_before_sending_mode = lambda: Api.ask_before_sending_mode(api)
-    options = Api.get_ask_before_sending_options(api)
-    sets = {v: Api.set_ask_before_sending(api, v) for v in change}
+def _run_page(tmp_path, stored, clicks, approvals=0):
+    """The page against the REAL Api switch outputs (a fake memory)."""
+    api = SimpleNamespace(memory=_Memory(stored))
+    for name in ("ask_before_sending_mode", "set_ask_before_sending", "get_send_confirmation"):
+        setattr(api, name, getattr(Api, name).__get__(api))
+    api.get_remembered_approvals_count = lambda: approvals
+    initial = api.get_send_confirmation()
+    sets = {"false": Api.set_send_confirmation(api, False), "true": Api.set_send_confirmation(api, True)}
     script = tmp_path / "page.js"
     script.write_text(_ASK_BEFORE_SENDING_HARNESS.replace("%CONFIG%", json.dumps(
-        {"options": options, "set": sets, "change": change})).replace("%PAGE%", _ask_before_sending_script()),
+        {"initial": initial, "set": sets, "clicks": clicks})).replace("%PAGE%", _ask_before_sending_script()),
         encoding="utf-8")
     out = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
@@ -1859,20 +1917,25 @@ def _run_page(tmp_path, change):
 # ============================================================
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-def test_whole_page_dropdown_renders_python_options_and_saves_ids(tmp_path):
-    r = _run_page(tmp_path, ["never", "bogus"])
-    assert r["before"]["options"] == [] and r["before"]["calls"] == []   # not loaded at startup
-    assert r["opened"]["options"] == [[c, ASK_BEFORE_SENDING_LABELS[c]]
-                                      for c in ASK_BEFORE_SENDING_CHOICES]
-    assert r["opened"]["value"] == "when_unsure"
-    assert r["opened"]["note"] == [ASK_BEFORE_SENDING_HELP["when_unsure"], "card-note"]
-    assert r["steps"][0]["note"] == [ASK_BEFORE_SENDING_HELP["never"], "card-note"]
-    # A refused id shows Python's error and reloads the saved choice.
-    assert r["steps"][1]["note"][1] == "card-note error"
-    assert "Choose one of" in r["steps"][1]["note"][0]
-    assert r["calls"] == ["get_ask_before_sending_options", "set_ask_before_sending",
-                          "set_ask_before_sending", "get_ask_before_sending_options"]
+def test_whole_page_switch_shows_python_text_and_saves(tmp_path):
+    r = _run_page(tmp_path, None, clicks=2)
+    assert r["before"]["calls"] == []                               # not loaded at startup
+    assert r["opened"] == {"on": True, "help": SEND_SWITCH_HELP, "note": ["", "card-note"],
+                           "approvalsHidden": True, "approvals": ""}
+    assert r["steps"][0]["on"] is False
+    assert r["steps"][0]["note"] == [SEND_SWITCH_OFF_HELP, "card-note"]
+    assert r["steps"][1]["on"] is True and r["steps"][1]["note"] == ["", "card-note"]
+    assert r["calls"] == ["get_send_confirmation", "set_send_confirmation", "set_send_confirmation"]
     assert r["errors"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_whole_page_a_saved_never_shows_its_note_and_approvals_only_when_some(tmp_path):
+    r = _run_page(tmp_path, "never", clicks=0, approvals=2)
+    assert r["opened"]["on"] is False
+    assert r["opened"]["note"] == [SEND_SWITCH_NEVER_NOTE, "card-note"]
+    assert r["opened"]["approvalsHidden"] is False
+    assert r["opened"]["approvals"] == "Remembered approvals: 2"
 
 
 # ============================================================
@@ -2149,8 +2212,11 @@ def test_page_strings():
     js = _remembered_approvals_script()
     assert "if(offerRemember)buttons.push(['remember','Always for this person','btn-cancel']);" in js
     assert "const offerRemember=arguments[1]===true;" in js
-    assert "approvalsNote.textContent='Remembered approvals: '+n;" in js
-    assert '<button class="btn-cancel" id="btn-forget-approvals"' in HTML
+    assert "approvalsNote.textContent=n>0?'Remembered approvals: '+n:'';" in js
+    assert "approvalsRow.hidden=!(n>0);" in js
+    # small secondary text, hidden until there is at least one approval
+    assert ('<div class="set-sub" id="approvals-row" hidden><span id="approvals-note"></span>'
+            '<button class="link-btn" id="btn-forget-approvals"') in HTML
 
 
 # ============================================================
@@ -2188,6 +2254,7 @@ const calls = [];
 let count = CONFIG.count;
 const impl = {
   get_remembered_approvals_count: () => count,
+  get_send_confirmation: () => ({on: false, help: 'h', off_help: 'o', note: '', approvals: count}),
   forget_remembered_approvals: () => { count = 0; return {success: true, removed: 2}; },
   submit_answer: (...a) => { submitted.push(a); return {success: true}; },
 };
@@ -2217,10 +2284,12 @@ const buttons = () => {
   openAPIModal(); await settle();
   const note = document.getElementById('approvals-note'), btn = document.getElementById('btn-forget-approvals');
   out.note = note.textContent;
+  out.rowHidden = document.getElementById('approvals-row').hidden;
   await btn.onclick(); await settle();
   out.armed = [btn.textContent, calls.filter(c => c === 'forget_remembered_approvals').length];
   await btn.onclick(); await settle();
-  out.forgot = [btn.textContent, calls.filter(c => c === 'forget_remembered_approvals').length, note.textContent];
+  out.forgot = [btn.textContent, calls.filter(c => c === 'forget_remembered_approvals').length, note.textContent,
+                document.getElementById('approvals-row').hidden];
   await btn.onclick(); timers.forEach(f => f()); await settle();
   out.disarmed = [btn.textContent, calls.filter(c => c === 'forget_remembered_approvals').length];
   out.errors = errors.filter(e => e.includes('[approvals]'));
@@ -2244,9 +2313,9 @@ def test_whole_page_third_button_and_forget_all(tmp_path):
     assert r["plain"] == ["Yes", "No"] and r["notTrue"] == ["Yes", "No"]
     assert r["offered"] == ["Yes", "No", "Always for this person"]
     assert r["submitted"] == [["remember", "button"]] and r["afterClick"] == []
-    assert r["note"] == "Remembered approvals: 2"
+    assert r["note"] == "Remembered approvals: 2" and r["rowHidden"] is False
     assert r["armed"] == ["Click again to forget all", 0]            # the first click only asks
-    assert r["forgot"] == ["Forget all", 1, "Remembered approvals: 0"]
+    assert r["forgot"] == ["Forget all", 1, "", True]                # none left: hidden
     assert r["disarmed"] == ["Forget all", 1]                        # timed out: nothing forgotten
     assert r["errors"] == []
 

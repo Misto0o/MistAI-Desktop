@@ -11,13 +11,13 @@
 # SECTION INDEX
 #   1. ORB LAYOUT GEOMETRY
 #   2. RESIZE ABOUT THE CENTER
-#   3. CLAMPING SQUARES TO THE WORK AREA
-#   4. DOCKING SIDE CHOICE
-#   5. DOCKING POSITION BESIDE A WINDOW
-#   6. RECT OVERLAP AND PANEL SPACING
-#   7. PANEL COLUMN LAYOUT
-#   8. PANEL COLLISION TEST
-#   9. PANEL ANCHORING
+#   3. STRAIGHT-LINE FLIGHT FRAMES
+#   4. CLAMPING SQUARES TO THE WORK AREA
+#   5. DOCKING SIDE CHOICE
+#   6. DOCKING POSITION BESIDE A WINDOW
+#   7. RECT OVERLAP AND PANEL SPACING
+#   8. PANEL COLUMN LAYOUT
+#   9. PANEL COLLISION TEST
 #   10. EASED SQUARE ALONG A FLIGHT
 #   11. FLIGHT TIMINGS
 #   12. FLIGHT PLANNING
@@ -57,19 +57,22 @@
 #   46. TIMER RESOLUTION BOOST ON
 #   47. TIMER RESOLUTION BOOST OFF
 #   48. FLIGHT PLAYER
-#   49. TASKBAR HIDING
-#   50. WIN32 FAILURE LOGGING
-#   51. ORB WINDOW HARDENING
-#   52. ORB CONTROLLER
-#   53. TASK PANELS
-#   54. TASK PANEL SETTINGS
-#   55. STEP LABELS
-#   56. TOOL CATEGORY LOOKUP
-#   57. PANEL MODEL
-#   58. PANEL PAGE BRIDGE
-#   59. PANEL WINDOW HARDENING
-#   60. PANEL ROUNDED CORNERS
-#   61. PANEL WINDOWS
+#   49. NO-ACTIVATE MOUSE ANSWER
+#   50. NO-ACTIVATE WINDOW SUBCLASS
+#   51. TASKBAR HIDING
+#   52. WIN32 FAILURE LOGGING
+#   53. ORB WINDOW HARDENING
+#   54. CREATE-TIME CORNER POSITION
+#   55. ORB CONTROLLER
+#   56. TASK PANELS
+#   57. TASK PANEL SETTINGS
+#   58. STEP LABELS
+#   59. TOOL CATEGORY LOOKUP
+#   60. PANEL MODEL
+#   61. PANEL PAGE BRIDGE
+#   62. PANEL WINDOW HARDENING
+#   63. PANEL ROUNDED CORNERS
+#   64. PANEL WINDOWS
 # ============================================================
 
 """
@@ -89,7 +92,7 @@ talks to Python only through OrbBridge (orb_state, talk), never the full Api.
 A WM_MOUSEACTIVATE subclass answers MA_NOACTIVATE so a click never activates
 it. A control thread (tick, 4 Hz) resizes it about its center per state
 (config ORB_SIZE_BIG/MEDIUM/SMALL), flies it beside the task's window when
-"Orb follows the task" is on (ORB LAYOUT GEOMETRY below), and drives the
+its flight is on (the Floating orb switch; ORB LAYOUT GEOMETRY below), and drives the
 task panels (TASK PANELS below).
 
 The window is opaque and cut to a circle with a window region rather than
@@ -104,6 +107,7 @@ Logs carry numbers and Win32 error codes only.
 """
 
 import ctypes
+import random
 import sys
 import threading
 import time
@@ -130,9 +134,9 @@ from .orb_behavior import (
     dock_clear_of,
     drift_target,
     fullscreen_action,
+    choose_panel_anchor,
     moved_by_user,
-    panel_fraction,
-    panel_from_fraction,
+    panel_stack,
     point_rect,
     pointer_skip_reason,
     pointer_spot,
@@ -143,7 +147,7 @@ from .config import (
     orb_frame_stats,
     orb_motion,
     orb_sizes,
-    panel_anchor,
+    panel_anchor_override,
     panel_blur_enabled,
 )
 
@@ -308,43 +312,6 @@ def _panel_column(sizes, work, anchor, inset, gap, y0=None):
 def _hits(spots, sizes, rect):
     return rect is not None and any(overlaps((x, y, x + w, y + h), rect)
                                     for (x, y), (w, h) in zip(spots, sizes))
-
-
-# ============================================================
-# PANEL ANCHORING
-# ============================================================
-
-def anchored_panels(sizes, work, anchor="top-right", scale=1.0, target_rect=None,
-                    maximized=False, orb=None):
-    """((x, y) per panel, anchor used): panels stacked downward from the top
-    of ``work`` (the target's monitor), inset PANEL_INSET and PANEL_GAP apart
-    (x ``scale``), at ``anchor``. Independent of the orb, except that they
-    never cover it (the stack moves below the orb, else to another anchor).
-    A non-maximized target covering the stack moves it to the first anchor of
-    PANEL_ORDER that is clear of it; a maximized one keeps ``anchor``."""
-    inset, gap = round(PANEL_INSET * scale), round(PANEL_GAP * scale)
-    order = [anchor] + [a for a in PANEL_ORDER if a != anchor]
-    choice = anchor
-    if target_rect is not None and not maximized:
-        choice = next((a for a in order
-                       if not _hits(_panel_column(sizes, work, a, inset, gap), sizes,
-                                    target_rect)), anchor)
-    orb_rect = (orb[0], orb[1], orb[0] + orb[2], orb[1] + orb[2]) if orb else None
-    spots = _panel_column(sizes, work, choice, inset, gap)
-    if not _hits(spots, sizes, orb_rect):
-        return spots, choice
-    if choice.startswith("bottom"):              # above the orb instead
-        total = sum(h for _w, h in sizes) + gap * max(0, len(sizes) - 1)
-        below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[1] - gap - total)
-    else:
-        below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[3] + gap)
-    if not _hits(below, sizes, orb_rect):
-        return below, choice
-    for a in order:
-        spots = _panel_column(sizes, work, a, inset, gap)
-        if not _hits(spots, sizes, orb_rect):
-            return spots, a
-    return spots, choice
 
 
 # -- time-based flights (fix: smooth movement) ------------------------------------------
@@ -2220,7 +2187,7 @@ class FloatingOrb:
 
     def _start_point(self, req):
         """Control thread: fly small beside the target, clear of the click
-        point and of user-placed panels, inside the target's work area."""
+        point and of the task panels, inside the target's work area."""
         rect, seq = tuple(req["rect"]), req.get("seq")
         work, scale = self._win.monitor_for_rect(rect)
         scale = scale or 1.0
@@ -2360,7 +2327,7 @@ class FloatingOrb:
 
     def _panel_obstacles(self):
         try:
-            return self.panels.user_rects() if self.panels is not None else []
+            return self.panels.obstacle_rects() if self.panels is not None else []
         except Exception:
             return []
 
@@ -3196,7 +3163,7 @@ class OrbPanels:
 
     OWN_MOVE_S = 0.5          # a rect mismatch this soon after our own move is not a drag
 
-    def __init__(self, api, win, webview=None, html=None, clock=time.monotonic):
+    def __init__(self, api, win, webview=None, html=None, clock=time.monotonic, rng=None):
         self._api, self._win = api, win
         self._webview, self._html = webview, html
         self.model = PanelModel(clock, lambda action: tool_categories(api, action))
@@ -3210,7 +3177,11 @@ class OrbPanels:
         self._was_busy = False
         self._drags = {}              # kind -> (last move seen at, rect) while dragged
         self._moved_at = {}           # kind -> when we last moved it
-        self.adopted = {}             # kind -> (x, y) of a drag saved this tick
+        self.adopted = {}             # kind -> (x, y) of a drag adopted this tick
+        self._dragged = {}            # kind -> (x, y) the user dropped it at, this task only
+        self.anchor = None            # this task's anchor (chosen on the first layout)
+        self._last_anchor = None      # the previous task's, never picked twice in a row
+        self._rng = rng or random.Random()
         self._work = None             # the work area of the latest update
         self._clock = clock
         self._unsubs = []
@@ -3225,49 +3196,69 @@ class OrbPanels:
     def handles(self):
         return [h for k, h in self.hwnds.items() if h and self.shown.get(k)]
 
-    def _positions(self):
-        """{kind: (fx, fy)} the user dragged panels to (Api, saved)."""
-        try:
-            return dict(self._api.panel_positions() or {})
-        except Exception:
-            return {}
+    def obstacle_rects(self):
+        """Rects of the shown panels: the orb docks and points clear of them
+        (the stack stays put for the task, so the orb goes around it)."""
+        return [r for k, r in self.rects.items() if self.shown.get(k)]
 
-    def _anchor(self):
-        try:
-            return self._api.panel_anchor_setting()
-        except Exception:
-            return panel_anchor()
+    # ------------------------------------------------------------
+    # PANEL ANCHOR FOR THIS TASK
+    # ------------------------------------------------------------
+    # Chosen once per task, the first time a panel is laid out
+    # (orb_behavior.choose_panel_anchor): a random preset clear of the orb,
+    # the click target and the task's window, inside the work area; not the
+    # previous task's when another is clear; MISTAI_PANEL_ANCHOR pins one.
 
-    def user_rects(self):
-        """Rects of the shown panels the user placed by hand (orb obstacles)."""
-        placed = self._positions()
-        return [r for k, r in self.rects.items() if k in placed and self.shown.get(k)]
+    def _choose_anchor(self, work, scale, target_rect, orb, point):
+        pinned = panel_anchor_override()
+        if pinned:
+            self.anchor, reason = pinned, "override"
+        else:
+            sizes = [tuple(round(v * scale) for v in SIZES[k]) for k in KINDS]
+            inset, gap = round(PANEL_INSET * scale), round(PANEL_GAP * scale)
+            stacks = {a: panel_stack(sizes, work, a, inset, gap) for a in PANEL_ORDER}
+            hard = [(orb[0], orb[1], orb[0] + orb[2], orb[1] + orb[2])] if orb else []
+            if point is not None:
+                hard.append(tuple(point))
+            self.anchor, reason = choose_panel_anchor(stacks, work, hard, target_rect,
+                                                      self._last_anchor, self._rng)
+        self._last_anchor = self.anchor
+        print(f"[OrbPanels] anchor {self.anchor} ({reason})")
 
     def _layout(self, kinds, sizes, work, scale, target_rect, maximized, orb, point):
-        """{kind: (x, y)}: dragged kinds at their saved place (clamped on
-        the work area), the rest stacked at the preset anchor, which also
-        moves off the click target when it would cover it."""
-        placed = self._positions()
+        """{kind: (x, y)}: panels the user dragged in this task where they
+        were dropped (clamped on the work area), the rest stacked at this
+        task's anchor, moved to another clear anchor only while they would
+        cover the click target ``point``."""
+        if not kinds:
+            return {}
+        if self.anchor is None:                   # the first panel of this task
+            self._choose_anchor(work, scale, target_rect, orb, point)
         out = {}
-        auto = [(k, s) for k, s in zip(kinds, sizes) if k not in placed]
-        for k, s in zip(kinds, sizes):
-            if k in placed:
-                out[k] = panel_from_fraction(placed[k], s, work)
+        wl, wt, wr, wb = (int(v) for v in work)
+        for k, (w, h) in zip(kinds, sizes):
+            if k in self._dragged:
+                x, y = self._dragged[k]
+                out[k] = (min(max(x, wl), max(wl, wr - w)), min(max(y, wt), max(wt, wb - h)))
+        auto = [(k, s) for k, s in zip(kinds, sizes) if k not in self._dragged]
         if auto:
             a_kinds, a_sizes = [k for k, _ in auto], [s for _, s in auto]
-            anchor = self._anchor()
-            spots, self.side = anchored_panels(a_sizes, work, anchor, scale,
-                                               target_rect, maximized, orb)
+            inset, gap = round(PANEL_INSET * scale), round(PANEL_GAP * scale)
+            spots, self.side = _panel_column(a_sizes, work, self.anchor, inset, gap), self.anchor
             if point is not None and _hits(spots, a_sizes, point):
-                again, side = anchored_panels(a_sizes, work, anchor, scale, point, False, orb)
-                if not _hits(again, a_sizes, point):
-                    spots, self.side = again, side
+                orb_rect = (orb[0], orb[1], orb[0] + orb[2], orb[1] + orb[2]) if orb else None
+                for a in PANEL_ORDER:
+                    again = _panel_column(a_sizes, work, a, inset, gap)
+                    if not _hits(again, a_sizes, point) and not _hits(again, a_sizes, orb_rect):
+                        spots, self.side = again, a
+                        break
             out.update(zip(a_kinds, spots))
         return out
 
     def _user_moved(self, kind, hwnd):
         """True while the user drags this panel (it is then left alone); a
-        drag that has settled DRAG_SETTLE_S is saved (Api) and adopted."""
+        drag that has settled DRAG_SETTLE_S is adopted for the rest of this
+        task only (never saved)."""
         try:
             actual = self._win.window_rect(hwnd)
         except Exception:
@@ -3286,20 +3277,10 @@ class OrbPanels:
         if now - drag[0] < DRAG_SETTLE_S:
             return True
         del self._drags[kind]
-        if self._work is not None:
-            frac = panel_fraction(drag[1], self._work)
-            try:
-                self._api.save_panel_position(kind, frac)
-                print(f"[OrbPanels] {kind} placed by hand")
-            except Exception as e:
-                print(f"[OrbPanels] could not save the position ({type(e).__name__})")
+        self._dragged[kind] = tuple(drag[1][:2])
+        print(f"[OrbPanels] {kind} placed by hand (this task)")
         self.adopted[kind] = tuple(drag[1][:2])      # this tick: stay where it was dropped
         return False
-
-    def reset_positions(self):
-        """After "Reset panel positions": forget drags in progress; the next
-        update puts every panel back at the preset."""
-        self._drags.clear()
 
     def _module(self):
         if self._webview is None:
@@ -3353,13 +3334,16 @@ class OrbPanels:
 
     def update(self, orb, target_rect, work, scale, busy, maximized=False, ended=False,
                speaking=False, point=None):
-        """Show, place or hide the panels for this tick: at the preset anchor
-        of ``work`` (the target's monitor, else the primary), never over the
-        orb, off the click target ``point`` when possible; a panel the user
-        dragged goes where it was dropped. Never raises."""
+        """Show, place or hide the panels for this tick: at this task's anchor
+        of ``work`` (the target's monitor, else the primary; chosen once per
+        task), off the click target ``point`` when possible; a panel the user
+        dragged in this task stays where it was dropped. Never raises."""
         try:
-            if busy and not self._was_busy:
+            if busy and not self._was_busy:          # a task starts: new anchor, drags forgotten
                 self.model.reset()
+                self.anchor = None
+                self._dragged.clear()
+                self._drags.clear()
             self._was_busy = busy
             if ended:
                 self.model.ended = True

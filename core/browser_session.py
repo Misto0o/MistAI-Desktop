@@ -37,14 +37,18 @@ Why Playwright launches its OWN Firefox instead of attaching to the daily
 one: CDP attach is Chromium-only, so this is a SEPARATE Firefox process with
 its own persistent profile folder.
 
-Profiles (Settings "Use my Firefox sign-ins", user_profile
-``browser_seed_profile``, env MISTAI_BROWSER_SEED_PROFILE; default OFF):
-- off: ~/MistAI/browser_profile_clean, a MistAI-owned profile that starts
-  empty. Nothing is read from the user's Firefox profile, not even its path.
-- on: ~/MistAI/browser_profile_from_daily, seeded once (when the folder does
-  not exist yet) with the login-carrying files of the user's default Firefox
-  profile (_PROFILE_ESSENTIAL_FILES / _PROFILE_ESSENTIAL_DIRS). Unchanged
-  from before the setting existed.
+Profiles (Settings > Browser sign-ins "Let Mist use sign-ins from my
+browser", user_profile ``browser_seed_profile``, env
+MISTAI_BROWSER_SEED_PROFILE; default OFF; seeding also needs Firefox chosen
+in its dropdown, core/browser_signins.py):
+- off (or another browser chosen): ~/MistAI/browser_profile_clean, a
+  MistAI-owned profile that starts empty and keeps whatever the user signs
+  in to inside it ("Sign in inside Mist's browser"). Nothing is read from
+  the user's Firefox profile, not even its path.
+- on with Firefox: ~/MistAI/browser_profile_from_daily, seeded once (when the
+  folder does not exist yet) with the sign-in files of the user's default
+  Firefox profile (_PROFILE_ESSENTIAL_FILES / _PROFILE_ESSENTIAL_DIRS: no
+  saved passwords).
 The choice is read when a session starts; a change applies to the next one.
 
 Threading: Playwright's sync API must stay on the thread that created it, so
@@ -94,14 +98,19 @@ from .config import verbose_logs
 # PROFILE FOLDERS AND OPT-IN SEEDING
 # ============================================================
 
-# Only the pieces that carry logins/sessions -- deliberately NOT a full
-# profile copy (cache2/ etc. can be gigabytes). storage/ is included because
-# many auth flows keep session state in IndexedDB, not just cookies.sqlite.
+# Only the pieces that keep the user SIGNED IN -- deliberately NOT a full
+# profile copy (cache2/ etc. can be gigabytes):
+# - cookies.sqlite: session cookies (plain SQLite, Firefox's own format);
+# - storage/: localStorage / IndexedDB, where many sites keep auth tokens;
+# - permissions.sqlite: per-site cookie exceptions and Storage Access grants
+#   (embedded sign-ins break without them when cookies are restricted).
+# NOT copied any more (2026-11-27): logins.json + key4.db are SAVED PASSWORDS
+# (and the key that unlocks them); a signed-in session never needs them, and
+# MistAI's automated browser should not be able to autofill them. cert9.db is
+# the certificate store, not a sign-in. A profile seeded before this change
+# still holds the older copies; nothing in it is deleted.
 _PROFILE_ESSENTIAL_FILES = (
     "cookies.sqlite",
-    "logins.json",
-    "key4.db",
-    "cert9.db",
     "permissions.sqlite",
 )
 _PROFILE_ESSENTIAL_DIRS = ("storage",)
@@ -109,12 +118,14 @@ _PROFILE_ESSENTIAL_DIRS = ("storage",)
 SEEDED_PROFILE_NAME = "browser_profile_from_daily"   # setting on (unchanged path)
 CLEAN_PROFILE_NAME = "browser_profile_clean"         # setting off (default)
 SEEDING_OFF_MESSAGE = (
-    "Using the user's Firefox sign-ins is off (Settings > Use my Firefox sign-ins), so "
-    "nothing is read from their Firefox profile. Tell the user they can turn it on.")
+    "Using the user's browser sign-ins is off, or the browser chosen is not Firefox "
+    "(Settings > Browser sign-ins > Let Mist use sign-ins from my browser), so nothing is "
+    "read from their Firefox profile. Tell the user they can turn it on with Firefox "
+    "chosen, or sign in inside Mist's browser.")
 
 
 def seeded_profile_dir():
-    """MistAI's browser profile when "Use my Firefox sign-ins" is on."""
+    """MistAI's browser profile when browser sign-ins are on with Firefox."""
     return os.path.join(os.path.expanduser("~"), "MistAI", SEEDED_PROFILE_NAME)
 
 
@@ -1198,7 +1209,7 @@ class BrowserSession:
     def __init__(self, profile_dir=None, firefox_signins=None, headless=False):
         """profile_dir: an explicit profile folder (scripts and tests); else the
         clean or seeded folder, chosen at each start. firefox_signins: a callable
-        -> bool, the "Use my Firefox sign-ins" setting, read at each start
+        -> bool, "seed from Firefox" (browser sign-ins on + Firefox chosen), read at each start
         (None = never seed)."""
         self._explicit_dir = profile_dir
         self.profile_dir = profile_dir or clean_profile_dir()
@@ -1234,7 +1245,7 @@ class BrowserSession:
 
     # -- Seeding decision --------------------------------------------------
     def seeding_enabled(self):
-        """The "Use my Firefox sign-ins" setting (False when unknown)."""
+        """Browser sign-ins on with Firefox chosen (False when unknown)."""
         try:
             return bool(self._seed_fn()) if callable(self._seed_fn) else False
         except Exception:
@@ -2287,8 +2298,8 @@ class BrowserSession:
 
     def import_cookies(self, domains):
         """Pull cookies for the given domain(s) out of the user's REAL Firefox
-        and inject them into this profile. Only when "Use my Firefox sign-ins"
-        is on (otherwise nothing is read from that profile).
+        and inject them into this profile. Only when browser sign-ins are on
+        with Firefox chosen (otherwise nothing is read from that profile).
 
         Returns (per_domain_counts, failures)."""
         if not self.seeding_enabled():
@@ -2347,7 +2358,7 @@ class BrowserSession:
 
     def use_daily_profile_copy(self):
         """Refresh the seeded profile from the user's real Firefox (a login
-        added since the first seed). Only when "Use my Firefox sign-ins" is on.
+        added since the first seed). Only when browser sign-ins are on with Firefox.
         Closes the session first: the profile is read at launch."""
         if not self.seeding_enabled():
             raise RuntimeError(SEEDING_OFF_MESSAGE)

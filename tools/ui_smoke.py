@@ -24,8 +24,8 @@ that heard nothing, and the page must show "Listening...", then the note,
 then its normal status; the wake word switch must be off at startup. A
 voice turn then goes through the real Api._voice_ask (ask_mistai stubbed on
 the instance) and must show the heard words with the mic, the reply and the
-step count, as text. "Import my facts" (no facts file: MISTAI_MY_FACTS_PATH
-points into this run's folder, never the user's file) must show a plain note.
+step count, as text. "Add facts about me" (Settings popup, the throwaway
+database of this run) must save one typed fact and show "Saved 1 fact.".
 
 Modes. "dev" is this source run. "build" acts as a release build: the real
 Api.get_ui_flags runs with sys.frozen set for that call only (pywebview reads
@@ -249,8 +249,8 @@ def main_mode(mode):
                  voice == [["msg user voice", VOICE_HEARD, True],
                            ["msg assistant", VOICE_REPLY, False],
                            ["msg memory", "Completed in 2 steps", False]], voice),
-                ("'Import my facts' with no file shows a plain note",
-                 facts[0].startswith("No facts file found.") and facts[1] == "card-note",
+                ("'Add facts about me' saves a typed fact and says how many",
+                 facts[0] == "Saved 1 fact." and facts[1] == "card-note",
                  facts),
                 ("a confirmation shows its question as text with Yes and No",
                  (confirm.get("shown") or {}).get("question") == CONFIRM_Q
@@ -310,8 +310,10 @@ def main_mode(mode):
                          for m in json.loads(window.evaluate_js(_CHAT))][-3:]
                 if window.evaluate_js("window.__x===1"):
                     voice.append("a script in the heard words RAN")
-                # Import my facts, through the real Api.import_my_facts (no file).
-                window.evaluate_js("document.getElementById('btn-import-facts').click()")
+                # Add facts about me, through the real Api.add_my_facts (temp database).
+                window.evaluate_js("document.getElementById('btn-add-facts').click();"
+                                   "document.getElementById('factsInput').value='I like green tea';"
+                                   "document.getElementById('btn-facts-save').click()")
                 facts = ["", ""]
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline and not facts[0]:

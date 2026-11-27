@@ -864,13 +864,13 @@ _PLAYBOOK = {
     "browser_import_cookies": (
         "Import one domain's cookies from the user's real Firefox (rarely needed)",
         "domain, or domain1|domain2",
-        "Works only when the user turned on Settings > Use my Firefox sign-ins (off by "
-        "default; then nothing is read from their Firefox). With it on, MistAI's browser "
+        "Works only when the user turned on Settings > Browser sign-ins with Firefox chosen "
+        "(off by default; then nothing is read from their Firefox). With it on, MistAI's browser "
         "already starts from their Firefox logins: call this only for ONE SPECIFIC domain "
         "missing from that copy."),
     "browser_use_daily_profile": (
         "Re-copy the user's Firefox logins into MistAI's browser (rarely needed)", "",
-        "Works only when Settings > Use my Firefox sign-ins is on, and only if the user wants "
+        "Works only when Settings > Browser sign-ins is on with Firefox, and only if the user wants "
         "a login added since the first copy."),
     "open_url": ("Open a page in the user's own browser for them to view (no reading/clicking)",
                  "url",

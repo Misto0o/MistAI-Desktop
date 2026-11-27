@@ -31,9 +31,9 @@ Read [Limits](#limits) before trusting it with anything important.
   crash.
 - **Floating orb and task panels (optional).** A small always-on-top orb
   shows whether Mist is listening, thinking or speaking, and can be held to
-  talk. With "Orb follows the task" it flies next to the window Mist is
-  working in; "Task panels" shows the steps and the answer at the top of the
-  screen. All three are off by default.
+  talk. It flies next to the window Mist is working in and points at what it
+  is about to click; "Task panels" shows the steps and the answer in a spot
+  chosen for each task, out of the way. Both are off by default.
 
 ## Limits
 
@@ -89,9 +89,11 @@ Create a `.env` file next to `assistant.py` with `MISTAI_API_KEY=...` and
 python assistant.py
 ```
 
-Settings (the gear) holds the API key, "Ask before sending a message",
-remembered approvals and "Import my facts". The sidebar holds the wake word,
-captions, the floating orb options and how Mist addresses you. The model is
+Settings (the gear) holds the API key, "Add facts about me", "Ask me before
+sending a message for you" (on by default) and browser sign-ins (Mist's own
+browser; sign-ins can be copied from Firefox, or made once inside Mist's
+browser). The sidebar holds the wake word, captions, the floating orb, task
+panels and how Mist addresses you. The model is
 always Nova, with Flux as the automatic fallback.
 
 Release build (CI does this on a `v*` tag; output `dist/MistAI.exe`):

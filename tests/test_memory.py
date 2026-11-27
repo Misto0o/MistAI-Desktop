@@ -291,6 +291,68 @@ def test_import_adds_new_facts_once_and_skips_duplicates_across_categories(
     assert "dentist" not in out.lower() and "park" not in out.lower()   # never logs facts
 
 
+# -- Add facts about me (Settings popup) ---------------------------------------------
+
+
+# ============================================================
+# ADD FACTS POPUP TESTS
+# ============================================================
+
+def test_popup_text_becomes_trimmed_deduped_facts_one_per_line():
+    from core.memory import parse_fact_lines
+
+    text = ("  My dentist is Dr. Lee  \n\n- I park on level 3\n* my dentist is  DR. LEE\n"
+            "1. I like tea\n2) I work   nights\n• \n   \nI park on level 3\n")
+    facts, info = parse_fact_lines(text)
+    assert facts == ["My dentist is Dr. Lee", "I park on level 3", "I like tea", "I work nights"]
+    assert info == {"too_big": False, "duplicates": 2, "too_long": 0, "over": 0}
+    assert parse_fact_lines(None) == ([], {"too_big": False, "duplicates": 0, "too_long": 0, "over": 0})
+    assert parse_fact_lines(["a list"])[0] == []
+    assert parse_fact_lines("I was born in 1990\n3 kids")[0] == ["I was born in 1990", "3 kids"]
+
+
+def test_popup_text_is_capped():
+    from core import memory as m
+
+    facts, info = m.parse_fact_lines("x" * (m.FACTS_TEXT_MAX_CHARS + 1))
+    assert facts == [] and info["too_big"] is True               # nothing saved at all
+    long = "y" * (m.FACT_MAX_CHARS + 1)
+    facts, info = m.parse_fact_lines(f"short one\n{long}\n")
+    assert facts == ["short one"] and info["too_long"] == 1
+    many = "\n".join(f"fact number {i}" for i in range(m.FACTS_PER_SAVE_MAX + 5))
+    facts, info = m.parse_fact_lines(many)
+    assert len(facts) == m.FACTS_PER_SAVE_MAX and info["over"] == 5
+
+
+def test_add_my_facts_stores_through_import_facts_and_never_logs_the_text(api, capsys):
+    calls = []
+    real = api.memory.import_facts
+    api.memory.import_facts = lambda facts: calls.append(list(facts)) or real(facts)
+    r = api.add_my_facts("My dentist is Dr. Lee\n- I park on level 3\nmy dentist is dr. lee\n")
+    assert calls == [["My dentist is Dr. Lee", "I park on level 3"]]   # the existing mechanism
+    assert r == {"success": True, "added": 2, "skipped": 1, "too_long": 0, "over": 0,
+                 "message": "Saved 2 facts. 1 was already saved."}
+    assert api.recall_facts(query="where do I park") == ["I park on level 3"]
+    again = api.add_my_facts("I park on level 3")
+    assert again["added"] == 0 and again["message"] == "Saved 0 facts. 1 was already saved."
+    assert api.add_my_facts("  \n  ")["success"] is False
+    too_big = api.add_my_facts("z" * 20_001)
+    assert too_big["success"] is False and "too much text" in too_big["message"]
+    out = capsys.readouterr()
+    low = (out.out + out.err).lower()
+    assert "dentist" not in low and "park" not in low and "zzzz" not in low
+    assert "[Memory] facts from Settings: 2 added, 0 restored, 1 already saved" in out.out
+
+
+def test_add_my_facts_reports_a_database_failure_without_text(api, capsys):
+    def broken(_facts):
+        raise OSError("disk full with my secret fact")
+    api.memory.import_facts = broken
+    r = api.add_my_facts("my secret fact")
+    assert r == {"success": False, "added": 0, "message": "Could not save the facts."}
+    assert "secret" not in capsys.readouterr().out
+
+
 # ============================================================
 # MEMORY HELPERS (4)
 # ============================================================
