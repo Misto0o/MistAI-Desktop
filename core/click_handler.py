@@ -226,6 +226,25 @@ def _compact_score(candidate: str, query: str) -> int:
 
 
 # ============================================================
+# ORB POINTER HOOK
+# ============================================================
+
+def call_pointer(owner, target):
+    """Right before a click: ``owner.pointer_fn(target)`` (Api._orb_point;
+    the floating orb flies beside the target, waiting at most
+    orb_behavior.POINT_WAIT_S). True when the orb pointed (the old click
+    marker is then skipped); False with no hook, a hook that raised, or the
+    pointer off (no wait then). Never raises."""
+    fn = getattr(owner, "pointer_fn", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(target))
+    except Exception:
+        return False
+
+
+# ============================================================
 # CLICK HANDLER CLASS
 # ============================================================
 
@@ -977,13 +996,17 @@ class ImprovedClickHandler:
 
             # The floating orb docks beside what the task touches (a point here).
             self.last_element_rect = ((x, y), time.monotonic())
+            # ...and, with its pointer on, flies there BEFORE the click
+            # (waits at most orb_behavior.POINT_WAIT_S; no wait otherwise).
+            pointed = call_pointer(self, (x, y))
 
             pyautogui.moveTo(x, y, duration=0.2)
             time.sleep(0.1)
             pyautogui.click()
             # The debug marker only AFTER the click was sent: it never sits
-            # between the pointer and the target.
-            self._show_debug_marker(x, y)
+            # between the pointer and the target. Not when the orb pointed.
+            if not pointed:
+                self._show_debug_marker(x, y)
             time.sleep(0.5)
             return True
         except Exception:
@@ -1423,6 +1446,11 @@ class EnhancedUIANavigator:
             ctype = getattr(element.element_info, "control_type", "") or ""
         except Exception:
             ctype = ""
+        try:                                  # the orb flies beside it first (pointer on)
+            r = element.rectangle()
+            call_pointer(self, (r.left, r.top, r.right, r.bottom))
+        except Exception:
+            pass
         routes = [("invoke", "iface_invoke", "Invoke"), ("toggle", "iface_toggle", "Toggle"),
                   ("select", "iface_selection_item", "Select")]
         if ctype in self.SELECT_FIRST_TYPES:
@@ -1445,7 +1473,11 @@ class EnhancedUIANavigator:
             except Exception:
                 pass
             return how
-        return "click" if self.click_element(element) else ""
+        self._already_pointed = True          # click_element: the orb pointed above
+        try:
+            return "click" if self.click_element(element) else ""
+        finally:
+            self._already_pointed = False
 
     def window_signature(self, window_title, fresh=True):
         """What a window's accessibility tree says (control type, name and
@@ -1457,7 +1489,11 @@ class EnhancedUIANavigator:
             return None
         return frozenset((i.control_type, i.name, i.value) for i in elements)
 
+    _already_pointed = False
+
     def click_element(self, element):
+        """A mouse click on the element's centre; the orb points first unless
+        activate_element already did (its no-pattern fallback)."""
         if element is None:
             return False
         try:
@@ -1467,6 +1503,8 @@ class EnhancedUIANavigator:
             # The floating orb docks beside the control the task touches.
             self.last_element_rect = ((rect.left, rect.top, rect.right, rect.bottom),
                                       time.monotonic())
+            if not self._already_pointed:
+                call_pointer(self, (rect.left, rect.top, rect.right, rect.bottom))
             pyautogui.moveTo(x, y, duration=0.15)
             time.sleep(0.05)
             pyautogui.click()

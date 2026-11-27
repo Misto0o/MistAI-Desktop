@@ -77,6 +77,15 @@
 #   70. ORB AUDIO LEVEL AND SHARED LOOK
 #   71. ORB AUDIO LEVEL HELPERS
 #   72. ORB AUDIO LEVEL TESTS
+#   73. ORB BEHAVIOR
+#   74. ORB BEHAVIOR HELPERS
+#   75. ORB BEHAVIOR POINTER TESTS
+#   76. ORB BEHAVIOR CLICK MARKER TESTS
+#   77. ORB BEHAVIOR DRAG TESTS
+#   78. ORB BEHAVIOR DRIFT TESTS
+#   79. ORB BEHAVIOR FULLSCREEN TESTS
+#   80. ORB BEHAVIOR PANEL TESTS
+#   81. ORB BEHAVIOR SETTINGS TESTS
 # ============================================================
 
 """The floating orb: window, states, layout geometry, motion and panels."""
@@ -481,10 +490,10 @@ class TestFloatingOrbWindow:
     def test_orb_state_survives_a_broken_api(self):
         assert fo.orb_state(SimpleNamespace()) == "idle"
 
-    def test_the_bridge_exposes_only_the_state_and_talk(self):
+    def test_the_bridge_exposes_only_the_state_talk_and_grab(self):
         bridge = fo.OrbBridge(_state_api(busy=True))
         public = [n for n in dir(bridge) if not n.startswith("_")]
-        assert public == ["orb_state", "talk"]
+        assert public == ["grab", "orb_state", "talk"]      # grab: orb-only (user drag)
         assert bridge.orb_state() == {"state": "thinking"}
 
     @pytest.mark.parametrize("work, scale, want", [
@@ -739,7 +748,7 @@ class TestFloatingOrbWindow:
         assert "58%" in ORB_HTML and "inset 0" not in ORB_HTML     # flat: no inner bevel
         assert not re.search(r"https?:|@import|url\(|<link|src=", ORB_HTML)
         calls = set(re.findall(r"pywebview\.api\.(\w+)", ORB_HTML))
-        assert calls == {"orb_state", "talk"}
+        assert calls == {"orb_state", "talk", "grab"}
         assert "prefers-reduced-motion" in ORB_HTML
 
     @floating_orb_window_needs_node
@@ -2074,8 +2083,10 @@ class TestOrbLayout:
         for t in both:
             assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-left", target_rect=t)[1] in (
                 "top-left", "top-right", "top-center")
-        wide = (0, 0, 1920, 600)                            # covers every anchor
-        assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-center", target_rect=wide)[1] == "top-center"
+        wide = (0, 0, 1920, 600)                            # covers every top anchor: bottom
+        assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-center", target_rect=wide)[1] == "bottom-right"
+        every = (0, 0, 1920, 1040)                          # covers every anchor: keeps it
+        assert ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-center", target_rect=every)[1] == "top-center"
 
     def test_a_maximized_target_keeps_the_configured_anchor(self):
         spots, used = ol.anchored_panels(PANELS, ORB_LAYOUT_WORK, "top-left", target_rect=(-8, -8, 1928, 1048),
@@ -2101,9 +2112,16 @@ class TestOrbLayout:
         monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
         assert panel_anchor() == "top-right"
         for raw, want in (("top-left", "top-left"), (" TOP-CENTER ", "top-center"),
-                          ("bottom-left", "top-right"), ("", "top-right")):
+                          ("bottom-left", "bottom-left"), ("middle", "top-right"),
+                          ("", "top-right")):
             monkeypatch.setenv("MISTAI_PANEL_ANCHOR", raw)
             assert panel_anchor() == want
+        # the env wins over the saved preset; a bad saved value is the default
+        monkeypatch.setenv("MISTAI_PANEL_ANCHOR", "top-left")
+        assert panel_anchor("bottom-right") == "top-left"
+        monkeypatch.delenv("MISTAI_PANEL_ANCHOR")
+        assert panel_anchor("bottom-right") == "bottom-right"
+        assert panel_anchor("sideways") == "top-right"
 
 
 # ============================================================
@@ -3495,7 +3513,7 @@ def test_the_bridge_reports_still_when_windows_animations_are_off():
     assert bridge.orb_state() == {"state": "thinking", "still": True}
     orb._win, orb._anim = SimpleNamespace(animations_enabled=lambda: True), (True, 0.0)
     assert bridge.orb_state() == {"state": "thinking"}
-    assert [n for n in dir(bridge) if not n.startswith("_")] == ["orb_state", "talk"]
+    assert [n for n in dir(bridge) if not n.startswith("_")] == ["grab", "orb_state", "talk"]
 
 
 def test_the_orb_goes_home_medium_after_an_error_with_flight_on():
@@ -3845,8 +3863,8 @@ def test_the_level_smoother_is_shared_and_respects_reduced_motion():
     assert "wrap.dataset.motion==='still'" in ORB_LEVEL_JS
     assert "requestAnimationFrame" in ORB_LEVEL_JS
     assert "ATTACK_S=0.05,DECAY_S=0.25" in ORB_LEVEL_JS          # fast attack, slower decay
-    # the orb page never pushes or adds calls: only orb_state and talk
-    assert set(re.findall(r"pywebview\.api\.(\w+)", ORB_HTML)) == {"orb_state", "talk"}
+    # the orb page never pushes or adds calls: only orb_state, talk and grab
+    assert set(re.findall(r"pywebview\.api\.(\w+)", ORB_HTML)) == {"orb_state", "talk", "grab"}
     assert "evaluate_js" not in ORB_HTML
 
 
@@ -3932,3 +3950,819 @@ def test_main_page_speaking_look_does_not_wait_for_the_slow_check():
     assert "kickFastSync(FAST_SYNC_HOLD_MS)" in HTML[j:j + 400]
     k = HTML.index("async function syncBusy()")
     assert "kickFastSync(0)" in HTML[k:k + 500]
+
+
+# ============================================================
+# ORB BEHAVIOR
+# ============================================================
+
+# Stage 2: pointer before clicks, user drag vs flight, idle drift, fullscreen
+# awareness, movable panels. Pure rules in core/orb_behavior.py; the wiring
+# in core/floating_orb.py tested with fakes (no window; the only real wait is
+# the pointer's 0.35 s cap where a test says so).
+
+import random as _random
+
+from core import orb_behavior as ob
+
+BEHAVIOR_WORK = (0, 0, 1920, 1040)
+
+
+# ============================================================
+# ORB BEHAVIOR HELPERS
+# ============================================================
+
+class _BehaviorClock:
+    def __init__(self, t=100.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class _BehaviorWin:
+    """The few Win32 calls the stage 2 wiring uses."""
+
+    def __init__(self, fg=55, fg_rect=(100, 100, 1000, 800), monitor=(0, 0, 1920, 1080),
+                 note=None, cursor=(10, 10)):
+        self.fg, self.fg_rect, self.monitor_full, self.note = fg, fg_rect, monitor, note
+        self.cursor, self.shows, self.styles = cursor, [], []
+        self.orb_rect = None
+
+    def foreground(self):
+        return self.fg
+
+    def window_rect(self, hwnd):
+        if hwnd == self.fg:
+            return self.fg_rect
+        return self.orb_rect
+
+    def monitor_for_rect(self, rect):
+        return BEHAVIOR_WORK, 1.0
+
+    def monitor_rect(self, hwnd):
+        return self.monitor_full
+
+    def notification_state(self):
+        return self.note
+
+    def cursor_pos(self):
+        return self.cursor
+
+    def set_click_through(self, hwnd, on):
+        self.styles.append(on)
+
+    def window_info(self, hwnd):
+        return (1234, "game.exe", "GameWindow")
+
+    def browser_window(self):
+        return None
+
+    def show(self, hwnd, on):
+        self.shows.append(on)
+
+    def animations_enabled(self):
+        return True
+
+
+class _BehaviorTween:
+    def __init__(self, land=True):
+        self.running, self.side, self.in_flight, self.goal = False, 82, False, None
+        self.plays, self.cancels, self.land = [], 0, land
+
+    def play(self, plan, on_frame=None, done=None, motion=None):
+        self.plays.append((plan, motion))
+        if on_frame and self.land:          # land=False: the flight never gets there
+            on_frame(plan[-1][1])
+        if done and self.land:
+            done()
+
+    def cancel(self):
+        self.cancels += 1
+
+
+def _behavior_orb(options=("orb_flight", "orb_pointer"), busy=False, land=True, bus=None,
+                  win=None):
+    lock = threading.Lock()
+    if busy:
+        lock.acquire()
+    api = SimpleNamespace(_ptt_wants_mic=lambda: False, tts=SimpleNamespace(speaking=False),
+                          _agent_lock=lock, _last_opened_app=None,
+                          _window_belongs_to=lambda hwnd, a: False,
+                          orb_option=lambda n: n in options,
+                          _stop_requested=threading.Event(),
+                          click_handler=SimpleNamespace(last_element_rect=None),
+                          bus=bus)
+    orb = fo.FloatingOrb(api, webview=_OrbFixesWebview(), html="<p>")
+    orb.visible, orb.hwnd, orb.scale = True, 4242, 1.0
+    orb.square = orb.home = (1700, 900, 82)
+    orb._win = win or _BehaviorWin()
+    orb._win.orb_rect = (1700, 900, 1782, 982)
+    orb._tween = _BehaviorTween(land)
+    orb._clock = _BehaviorClock()
+    orb._was_busy = busy
+    return orb
+
+
+class _BehaviorBus:
+    """Delivers at once and lets the orb's control loop run one tick, so a
+    point lands inside publish() (the real bus is a dispatch thread)."""
+
+    def __init__(self):
+        self.orb, self.published = None, []
+
+    def publish(self, name, data=None, source=""):
+        self.published.append(name)
+        self.orb._on_bus(events.Event(name, data or {}, source))
+        self.orb.tick()
+
+    def subscribe(self, name, fn):
+        return lambda: None
+
+
+# ============================================================
+# ORB BEHAVIOR POINTER TESTS
+# ============================================================
+
+def _spot_ok(spot, target, work, side):
+    x, y, _where = spot
+    wl, wt, wr, wb = work
+    assert wl <= x and x + side <= wr and wt <= y and y + side <= wb       # inside the work area
+    assert ob.clear_of_point(x, y, side, ob.click_point(target))            # never on the click
+
+
+@pytest.mark.parametrize("target", [
+    (900, 500, 1000, 540),            # middle of the screen
+    (1880, 500, 1920, 540),           # right edge
+    (0, 500, 40, 540),                # left edge
+    (0, 0, 40, 30),                   # top-left corner
+    (1880, 0, 1920, 30),              # top-right corner
+    (0, 1010, 40, 1040),              # bottom-left corner
+    (1880, 1010, 1920, 1040),         # bottom-right corner
+    (0, 400, 1920, 440),              # a full-width bar
+    (900, 0, 1000, 1040),             # a full-height column
+    (-50, -50, 20, 20),               # partly off the work area
+])
+def test_the_pointer_spot_is_beside_the_target_and_never_on_the_click_point(target):
+    for side in (28, 45, 82):
+        spot = ob.pointer_spot(target, BEHAVIOR_WORK, side)
+        assert spot is not None
+        _spot_ok(spot, target, BEHAVIOR_WORK, side)
+
+
+def test_the_pointer_prefers_right_then_left_below_above():
+    assert ob.pointer_spot((900, 500, 1000, 540), BEHAVIOR_WORK, 28)[2] == "right"
+    assert ob.pointer_spot((1880, 500, 1920, 540), BEHAVIOR_WORK, 28)[2] == "left"
+    assert ob.pointer_spot((0, 400, 1920, 440), BEHAVIOR_WORK, 28)[2] == "below"
+    assert ob.pointer_spot((0, 1000, 1920, 1040), BEHAVIOR_WORK, 28)[2] == "above"
+    x, y, _ = ob.pointer_spot((900, 500, 1000, 540), BEHAVIOR_WORK, 28)
+    assert x == 1000 + ob.POINT_GAP and y == 520 - 14                        # vertically centred
+
+
+def test_the_pointer_avoids_user_placed_panels_and_tiny_work_areas():
+    target = (900, 500, 1000, 540)
+    panel = (1005, 400, 1300, 700)                                           # right of the target
+    x, y, where = ob.pointer_spot(target, BEHAVIOR_WORK, 28, avoid=[panel])
+    assert where == "left" and not ob._overlaps(ob.square_rect(x, y, 28), panel)
+    assert ob.pointer_spot(target, (0, 0, 20, 20), 28) is None               # smaller than the orb
+    tiny = (0, 0, 60, 60)                                                    # barely bigger
+    spot = ob.pointer_spot((20, 20, 40, 40), tiny, 28)
+    assert spot is None or ob.clear_of_point(spot[0], spot[1], 28, (30, 30))
+
+
+def test_point_rect_turns_points_into_boxes_and_rejects_junk():
+    assert ob.point_rect((100, 50), 24) == (76, 26, 124, 74)
+    assert ob.point_rect((1, 2, 30, 40), 24) == (1, 2, 30, 40)
+    assert ob.point_rect((5, 5, 5, 9), 24) is None                           # empty
+    assert ob.point_rect("x", 24) is None and ob.point_rect(None, 24) is None
+
+
+@pytest.mark.parametrize("shown, flight, pointer, want", [
+    (False, True, True, "hidden"), (True, False, True, "flight-off"),
+    (True, True, False, "pointer-off"), (True, True, True, ""),
+])
+def test_the_pointer_skip_table(shown, flight, pointer, want):
+    assert ob.pointer_skip_reason(shown, flight, pointer) == want
+
+
+def test_the_capped_wait_never_exceeds_its_cap():
+    t = [0.0]
+
+    def clock():
+        return t[0]
+
+    def never(timeout):
+        t[0] += timeout                     # a wait that runs to its timeout
+        return False
+
+    landed, waited = ob.capped_wait(never, 0.35, clock)
+    assert not landed and waited == pytest.approx(0.35)
+    landed, waited = ob.capped_wait(never, 99, clock)        # a silly cap is bounded too
+    assert waited <= ob.POINT_WAIT_S * 2
+    assert ob.capped_wait(lambda timeout: True, 0.35, clock) == (True, 0.0)
+    assert ob.capped_wait(lambda timeout: 1 / 0, 0.35, clock)[0] is False
+
+
+def test_dock_clear_of_moves_off_user_panels_only_when_needed():
+    assert ob.dock_clear_of((100, 100), 28, BEHAVIOR_WORK, []) == (100, 100)
+    panel = (90, 90, 400, 300)
+    x, y = ob.dock_clear_of((100, 100), 28, BEHAVIOR_WORK, [panel])
+    assert not ob._overlaps(ob.square_rect(x, y, 28), panel)
+    assert 0 <= x <= 1920 - 28 and 0 <= y <= 1040 - 28
+
+
+def test_point_at_skips_at_once_when_hidden_flight_off_or_pointer_off():
+    for options, visible in ((("orb_flight", "orb_pointer"), False), (("orb_pointer",), True),
+                             (("orb_flight",), True)):
+        bus = _BehaviorBus()
+        orb = _behavior_orb(options, bus=bus)
+        bus.orb = orb
+        orb.visible = visible
+        t0 = time.perf_counter()
+        assert orb.point_at((500, 400)) is False
+        assert time.perf_counter() - t0 < 0.05 and bus.published == []      # no event, no wait
+    assert Api._orb_point(_api(), (1, 2)) is False                           # no orb at all
+
+
+def test_point_at_flies_beside_the_target_pulses_and_releases_the_click():
+    bus = _BehaviorBus()
+    orb = _behavior_orb(busy=True, bus=bus)
+    bus.orb = orb
+    t0 = time.perf_counter()
+    assert orb.point_at((960, 520, 1000, 560)) is True
+    assert time.perf_counter() - t0 < 0.1                                    # landed: no cap wait
+    assert bus.published == [events.ORB_POINT]
+    plan, _motion = orb._tween.plays[-1]
+    x, y, side = plan[-1][1]
+    assert ob.clear_of_point(x, y, side, (980, 540), ob.POINT_MARGIN)
+    assert orb.pulse == 1 and orb.dock == "pointer" and orb.last_point["landed"]
+    assert orb._dwell_until == orb._clock() + ob.POINT_HOLD_S
+    assert orb.state() == "executing"                                        # small beside it
+    assert fo.OrbBridge(orb._api, orb).orb_state()["pulse"] == 1
+
+
+def test_point_at_waits_at_most_the_cap_when_the_flight_never_lands(capsys):
+    bus = _BehaviorBus()
+    orb = _behavior_orb(busy=True, land=False, bus=bus)
+    bus.orb = orb
+    t0 = time.perf_counter()
+    assert orb.point_at((500, 400)) is True
+    waited = time.perf_counter() - t0
+    assert ob.POINT_WAIT_S - 0.02 <= waited < ob.POINT_WAIT_S + 0.15
+    assert orb.last_point["landed"] is False
+    assert "[FloatingOrb] point capped after" in capsys.readouterr().out
+
+
+def test_a_point_in_flight_is_not_retargeted_to_the_window_dock():
+    orb = _behavior_orb(busy=True)
+    orb.dock = "pointer"
+    orb._tween.running = orb._tween.in_flight = True
+    orb._tween.goal = (10, 10, 28)
+    orb._tween.retarget = lambda goal: pytest.fail("retargeted")
+    orb._follow_in_flight()
+
+
+# ============================================================
+# ORB BEHAVIOR CLICK MARKER TESTS
+# ============================================================
+
+def _marker_handler(monkeypatch, pointed):
+    h = ch.ImprovedClickHandler.__new__(ch.ImprovedClickHandler)
+    h.last_method, h.last_query, h._refused = "OCR", "", False
+    h.outside_target = lambda x, y, m: None
+    order = []
+    h.pointer_fn = lambda target: order.append(("point", tuple(target))) or pointed
+    monkeypatch.setattr(h, "_show_debug_marker", lambda x, y: order.append(("marker", x, y)))
+    monkeypatch.setattr(ch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch.pyautogui, "size", lambda: (1920, 1080))
+    monkeypatch.setattr(ch.pyautogui, "moveTo", lambda *a, **k: order.append(("move",)))
+    monkeypatch.setattr(ch.pyautogui, "click", lambda *a, **k: order.append(("click",)))
+    return h, order
+
+
+def test_the_orb_points_before_the_click_and_replaces_the_marker(monkeypatch):
+    h, order = _marker_handler(monkeypatch, pointed=True)
+    assert h._execute_click((500, 400)) is True
+    assert order == [("point", (500, 400)), ("move",), ("click",)]           # no ring marker
+
+
+def test_without_the_orb_pointer_the_old_marker_stays_after_the_click(monkeypatch):
+    h, order = _marker_handler(monkeypatch, pointed=False)
+    assert h._execute_click((500, 400)) is True
+    assert order == [("point", (500, 400)), ("move",), ("click",), ("marker", 500, 400)]
+    h.pointer_fn = lambda target: 1 / 0                                      # a broken hook
+    assert ch.call_pointer(h, (1, 1)) is False
+
+
+def test_uia_activation_points_once_before_the_pattern_runs():
+    calls = []
+    nav = ch.EnhancedUIANavigator.__new__(ch.EnhancedUIANavigator)
+    nav.pointer_fn = lambda target: calls.append(("point", target)) or True
+    rect = SimpleNamespace(left=10, top=20, right=110, bottom=60)
+    el = SimpleNamespace(element_info=SimpleNamespace(control_type="Button"),
+                         rectangle=lambda: rect,
+                         iface_invoke=SimpleNamespace(Invoke=lambda: calls.append(("invoke",))))
+    assert nav.activate_element(el) == "invoke"
+    assert calls == [("point", (10, 20, 110, 60)), ("invoke",)]
+
+
+# ============================================================
+# ORB BEHAVIOR DRAG TESTS
+# ============================================================
+
+def test_a_grab_cancels_the_flight_and_pauses_the_orb_until_release():
+    orb = _behavior_orb(busy=False)
+    orb._tween.running = True
+    orb.square = (1500, 800, 82)                 # mid-flight somewhere
+    orb.user_grab(True)
+    assert orb._tween.cancels == 1 and orb._grabbed
+    plays = len(orb._tween.plays)
+    orb.tick()
+    assert len(orb._tween.plays) == plays        # no motion while held
+    orb._tween.running = False
+    orb._win.orb_rect = (1200, 500, 1282, 582)   # where the user dropped it
+    orb.user_grab(False)
+    orb.tick()
+    assert orb.home == (1200, 500, 82) and orb.square == (1200, 500, 82)   # the new home
+    assert not orb._grabbed
+
+
+def test_a_grab_without_a_release_expires():
+    orb = _behavior_orb()
+    orb.user_grab(True)
+    orb._clock.t += orb.GRAB_MAX_S + 1
+    assert orb._grab_active() is False and orb._released
+
+
+def test_the_bridge_grab_reaches_only_the_orb():
+    orb = _behavior_orb()
+    bridge = fo.OrbBridge(orb._api, orb)
+    assert bridge.grab(True) == {"ok": True} and orb._grabbed
+    assert bridge.grab(False) == {"ok": True} and not orb._grabbed
+
+
+# ============================================================
+# ORB BEHAVIOR DRIFT TESTS
+# ============================================================
+
+def _facts(**kw):
+    base = dict(enabled=True, idle=True, busy=False, panels=False, fullscreen=False,
+                grabbed=False, animations=True)
+    base.update(kw)
+    return ob.DriftFacts(**base)
+
+
+def test_drift_waits_a_random_20_to_60_seconds_then_goes():
+    p = ob.DriftPlanner(rng=_random.Random(1))
+    assert p.update(0.0, _facts()) is None
+    assert 20.0 <= p.delay <= 60.0
+    assert p.update(p.delay - 0.1, _facts()) is None
+    assert p.update(p.delay, _facts()) == "go" and p.phase == "away"
+    start = p.delay
+    pause = p.away_until - start - ob.DRIFT_FLIGHT_S
+    assert ob.DRIFT_PAUSE_S[0] <= pause <= ob.DRIFT_PAUSE_S[1]
+    assert p.update(p.away_until - 0.1, _facts()) is None
+    assert p.update(p.away_until, _facts()) == "home" and p.phase == "rest"
+
+
+@pytest.mark.parametrize("change", [dict(busy=True), dict(idle=False), dict(panels=True),
+                                    dict(fullscreen=True), dict(enabled=False),
+                                    dict(animations=False)])
+def test_drift_never_starts_and_comes_home_at_once_when_not_allowed(change):
+    p = ob.DriftPlanner(rng=_random.Random(2))
+    for t in range(0, 200, 5):
+        assert p.update(float(t), _facts(**change)) is None
+    p = ob.DriftPlanner(rng=_random.Random(2))
+    p.update(0.0, _facts())
+    assert p.update(p.delay, _facts()) == "go"
+    assert p.update(p.delay + 0.25, _facts(**change)) == "home"
+
+
+def test_a_grab_while_away_stops_the_drift_without_a_flight():
+    p = ob.DriftPlanner(rng=_random.Random(3))
+    p.update(0.0, _facts())
+    p.update(p.delay, _facts())
+    assert p.update(p.delay + 1, _facts(grabbed=True)) == "stop" and p.phase == "rest"
+
+
+def test_a_near_cursor_defers_the_drift_and_ends_it_and_is_only_read_when_due():
+    reads = []
+
+    def near():
+        reads.append(1)
+        return True
+
+    p = ob.DriftPlanner(rng=_random.Random(4))
+    p.update(0.0, _facts(), near)
+    first = p.delay
+    for t in range(1, int(first)):
+        p.update(float(t), _facts(), near)
+    assert reads == []                                        # resting: never read
+    assert p.update(first, _facts(), near) is None and reads == [1]
+    assert p.idle_since == first                              # the wait restarts
+    p2 = ob.DriftPlanner(rng=_random.Random(4))
+    p2.update(0.0, _facts())
+    p2.update(p2.delay, _facts())
+    assert p2.update(p2.delay + 0.25, _facts(), lambda: True) == "home"
+
+
+@pytest.mark.parametrize("home", [(1822, 942, 82), (0, 0, 82), (900, 500, 82)])
+def test_the_drift_target_is_a_short_hop_inside_the_work_area(home):
+    rng = _random.Random(5)
+    for _ in range(50):
+        x, y, side = ob.drift_target(home, BEHAVIOR_WORK, rng)
+        assert side == home[2]
+        assert 0 <= x <= 1920 - side and 0 <= y <= 1040 - side   # never over the taskbar
+        d = math.hypot(x - home[0], y - home[1])
+        assert ob.DRIFT_DIST[0] - 1 <= d <= ob.DRIFT_DIST[1] + 1
+    assert ob.drift_target((0, 0, 82), (0, 0, 82, 82), rng) == (0, 0, 82)   # no room: stays
+
+
+def _drifting_orb(seed):
+    orb = _behavior_orb(options=("orb_idle_drift",))
+    orb._drift = ob.DriftPlanner(rng=_random.Random(seed))
+    orb.tick()                                                # starts the idle clock
+    orb._clock.t += orb._drift.delay + 0.01
+    orb.tick()
+    return orb
+
+
+def test_the_orb_drifts_calmly_while_idle_and_returns_home():
+    orb = _drifting_orb(6)
+    plan, motion = orb._tween.plays[-1]
+    assert motion == "calm" and orb.dock == "drift" and orb.state() == "idle"
+    assert plan[-1][1] != orb.home and orb.square == plan[-1][1]
+    orb._clock.t = orb._drift.away_until
+    orb.tick()
+    plan, motion = orb._tween.plays[-1]
+    assert motion == "calm" and plan[-1][1] == orb.home
+
+
+def test_a_task_cancels_the_drift_at_once():
+    orb = _drifting_orb(7)
+    assert orb._drift.phase == "away"
+    orb._api._agent_lock.acquire()                            # a task starts
+    orb.tick()
+    assert orb._drift.phase == "rest" and orb.dock != "drift"
+
+
+def test_no_drift_with_the_setting_off_or_the_cursor_near():
+    orb = _behavior_orb(options=())
+    for _ in range(10):
+        orb._clock.t += 30
+        orb.tick()
+    assert orb._tween.plays == []
+    orb = _behavior_orb(options=("orb_idle_drift",))
+    orb._win.cursor = (1741, 941)                             # on the orb
+    for _ in range(10):
+        orb._clock.t += 30
+        orb.tick()
+    assert orb._tween.plays == []
+
+
+# ============================================================
+# ORB BEHAVIOR FULLSCREEN TESTS
+# ============================================================
+
+def test_covers_monitor_is_the_full_screen_not_the_work_area():
+    mon = (0, 0, 1920, 1080)
+    assert ob.covers_monitor((0, 0, 1920, 1080), mon)
+    assert ob.covers_monitor((-1, -1, 1921, 1081), mon)
+    assert not ob.covers_monitor((-8, -8, 1928, 1048), mon)          # maximized: work area only
+    assert not ob.covers_monitor(None, mon) and not ob.covers_monitor((0, 0, 1, 1), None)
+
+
+@pytest.mark.parametrize("covers, note, fs", [
+    (False, None, False), (True, None, True), (False, 1, False), (False, 2, True),
+    (False, 3, True), (False, 4, True), (False, 5, False),
+])
+def test_is_fullscreen_from_the_rect_or_the_notification_state(covers, note, fs):
+    assert ob.is_fullscreen(ob.FullscreenFacts(covers, note)) is fs
+
+
+@pytest.mark.parametrize("fs, busy, want", [(True, False, "hide"), (True, True, "stay"),
+                                            (False, False, "show"), (False, True, "show")])
+def test_the_fullscreen_decision_table(fs, busy, want):
+    assert ob.fullscreen_action(fs, busy) == want
+
+
+def test_the_fullscreen_watch_polls_at_its_interval_and_needs_two_readings():
+    seen = [ob.FullscreenFacts(True, None)]
+    calls = []
+
+    def detector():
+        calls.append(1)
+        return seen[0]
+
+    w = ob.FullscreenWatch(detector, interval=1.0, confirm=2)
+    assert w.poll(0.0) is False                       # one reading is not enough
+    assert w.poll(0.5) is False and len(calls) == 1   # within the interval: not read
+    assert w.poll(1.0) is True
+    seen[0] = ob.FullscreenFacts(False, None)
+    assert w.poll(2.0) is True and w.poll(3.0) is False
+    bad = ob.FullscreenWatch(lambda: 1 / 0, confirm=1)
+    assert bad.poll(0.0) is False
+
+
+def test_a_fullscreen_app_hides_the_idle_orb_and_a_task_shows_it_again(capsys):
+    win = _BehaviorWin(fg_rect=(0, 0, 1920, 1080))
+    orb = _behavior_orb(options=(), win=win)
+    orb._fs = ob.FullscreenWatch(orb._fullscreen_facts, interval=0.0, confirm=1)
+    orb.tick()
+    assert win.shows == [False] and orb.fs_hidden
+    assert "[FloatingOrb] fullscreen app in front: orb hidden" in capsys.readouterr().out
+    orb._api._agent_lock.acquire()                     # a task starts: visible, no drift
+    orb.tick()
+    assert win.shows == [False, True] and not orb.fs_hidden
+    assert orb._drift_step("idle", True) is False
+
+
+def test_our_own_window_or_the_shell_never_counts_as_fullscreen():
+    win = _BehaviorWin(fg_rect=(0, 0, 1920, 1080))
+    win.window_info = lambda hwnd: (1, "explorer.exe", "Progman")    # the desktop
+    orb = _behavior_orb(win=win)
+    assert orb._fullscreen_facts().covers is False
+
+
+# ============================================================
+# ORB BEHAVIOR PANEL TESTS
+# ============================================================
+
+def test_panel_fractions_round_trip_and_clamp_on_any_monitor():
+    rect = (1500, 600, 1780, 740)
+    frac = ob.panel_fraction(rect, BEHAVIOR_WORK)
+    assert ob.panel_from_fraction(frac, (280, 140), BEHAVIOR_WORK) == (1500, 600)
+    small = (0, 0, 1280, 680)                               # a smaller monitor: kept on it
+    x, y = ob.panel_from_fraction(frac, (280, 140), small)
+    assert 0 <= x <= 1280 - 280 and 0 <= y <= 680 - 140
+    assert ob.panel_fraction((5000, -300, 5280, -160), BEHAVIOR_WORK) == (1.0, 0.0)   # off screen
+    other = (-1920, 0, 0, 1040)
+    assert ob.panel_from_fraction((0.0, 0.0), (280, 140), other) == (-1920, 0)
+
+
+def test_saved_panel_positions_parse_safely():
+    good = ob.dump_positions({"answer": (0.5, 0.25), "steps": (1.0, 0.0)})
+    assert ob.parse_positions(good) == {"answer": (0.5, 0.25), "steps": (1.0, 0.0)}
+    assert ob.parse_positions("{bad") == {} and ob.parse_positions("") == {}
+    assert ob.parse_positions('{"nope": [0, 0], "answer": [2, -1], "steps": ["x"]}') == {
+        "answer": (1.0, 0.0)}
+    assert ob.parse_positions('["answer"]') == {}
+
+
+def test_moved_by_user_ignores_tiny_differences():
+    assert not ob.moved_by_user((10, 10, 50, 50), (11, 12, 51, 52))
+    assert ob.moved_by_user((10, 10, 50, 50), (30, 10, 70, 50))
+    assert not ob.moved_by_user(None, (1, 1, 2, 2))
+
+
+class _PosApi(SimpleNamespace):
+    def panel_positions(self):
+        return self.positions
+
+    def save_panel_position(self, kind, frac):
+        self.positions[kind] = tuple(frac)
+        self.saved.append(kind)
+
+    def panel_anchor_setting(self):
+        return self.anchor
+
+
+def _pos_panels(monkeypatch, anchor="top-right", positions=None):
+    monkeypatch.setattr(op, "panel_blur_enabled", lambda: False)
+    api = _PosApi(bus=_Bus(), positions=dict(positions or {}), saved=[], anchor=anchor)
+    wv, win, clock = _OrbPanelsWebview(), _OrbPanelsWin(), _OrbPanelsClock()
+    win.rects = {}
+    panels = op.OrbPanels(api, win, webview=wv, html="<p>", clock=clock)
+    panels._was_busy = True                                     # mid-task: no model reset
+    panels.model.steps = [{"label": "Clicking", "action": "uia_click", "state": "run"}]
+    return panels, api, wv, win, clock
+
+
+def test_a_dragged_panel_is_left_alone_saved_once_settled_and_wins_over_the_preset(monkeypatch):
+    panels, api, wv, win, clock = _pos_panels(monkeypatch)
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    _show_all(wv)
+    hwnd = panels.hwnds["steps"]
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    clock.t += 1.0
+    win.rects[hwnd] = (400, 500, 640, 676)                      # the user drags it
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    moves = [c for c in win.calls if c[0] in ("move_only", "move")]
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    assert [c for c in win.calls if c[0] in ("move_only", "move")] == moves   # left alone
+    assert api.saved == []
+    clock.t += ob.DRAG_SETTLE_S + 0.1                           # it stopped moving
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    assert api.saved == ["steps"]
+    assert panels.rects["steps"][:2] == (400, 500)              # stays where it was dropped
+    assert panels.user_rects() == [panels.rects["steps"]]
+    api.anchor = "bottom-left"                                  # a new preset: it stays put
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    assert panels.rects["steps"][:2] == (400, 500)
+
+
+def test_reset_puts_panels_back_at_the_preset(monkeypatch):
+    panels, api, wv, win, clock = _pos_panels(monkeypatch, positions={"steps": (0.5, 0.5)})
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    assert panels.rects["steps"][:2] == ob.panel_from_fraction((0.5, 0.5), (240, 176),
+                                                               ORB_PANELS_WORK)
+    api.positions.clear()
+    panels.reset_positions()
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    assert panels.rects["steps"][:2] == (1920 - 16 - 240, 16)    # top-right preset again
+
+
+@pytest.mark.parametrize("anchor, x", [("bottom-right", 1920 - 16 - 240), ("bottom-left", 16)])
+def test_bottom_presets_stack_from_the_bottom(monkeypatch, anchor, x):
+    panels, api, wv, win, clock = _pos_panels(monkeypatch, anchor=anchor)
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True)
+    l, t, r, b = panels.rects["steps"]
+    assert (l, b) == (x, 1040 - 16) and panels.side == anchor
+
+
+def test_panels_move_off_the_click_target_when_they_would_cover_it(monkeypatch):
+    panels, api, wv, win, clock = _pos_panels(monkeypatch)
+    click = (1700, 40, 1740, 80)                                 # under the top-right stack
+    panels.update(None, None, ORB_PANELS_WORK, 1.0, busy=True, point=click)
+    assert not ob._overlaps(panels.rects["steps"], click)
+
+
+def test_the_orb_docks_clear_of_user_placed_panels():
+    orb = _behavior_orb(busy=True)
+    orb._acted = True
+    orb._win.fg_rect = (100, 100, 1000, 800)
+    panel_rect = (1000, 100, 1300, 300)                          # right beside the window
+    orb.panels = SimpleNamespace(user_rects=lambda: [panel_rect], handles=lambda: [],
+                                 rects={}, hide_all=lambda: None)
+    orb._cur_target, _ = orb._target()
+    x, y, side = orb._goal("executing")
+    assert not ob._overlaps(ob.square_rect(x, y, side), panel_rect)
+
+
+# ============================================================
+# ORB BEHAVIOR SETTINGS TESTS
+# ============================================================
+
+def test_pointer_and_drift_default_on_and_round_trip(monkeypatch):
+    for env in ("MISTAI_ORB_POINTER", "MISTAI_ORB_IDLE_DRIFT", "MISTAI_ORB_FLIGHT",
+                "MISTAI_ORB_PANELS"):
+        monkeypatch.delenv(env, raising=False)
+    api = _api()
+    assert api.orb_option("orb_pointer") is True and api.orb_option("orb_idle_drift") is True
+    assert api.get_orb_options() == {"orb_flight": False, "orb_panels": False,
+                                     "orb_pointer": True, "orb_idle_drift": True}
+    assert api.set_orb_option("orb_pointer", False) == {"success": True, "enabled": False}
+    assert api.memory.rows["orb_pointer"] == "off"
+    assert _api(api.memory).orb_option("orb_pointer") is False             # saved
+    monkeypatch.setenv("MISTAI_ORB_POINTER", "1")                          # env wins
+    assert _api(api.memory).orb_option("orb_pointer") is True
+    monkeypatch.setenv("MISTAI_ORB_IDLE_DRIFT", "0")
+    assert _api().orb_option("orb_idle_drift") is False
+
+
+def test_the_panel_anchor_and_positions_settings(monkeypatch):
+    monkeypatch.delenv("MISTAI_PANEL_ANCHOR", raising=False)
+    api = _api()
+    assert api.get_panel_anchor() == {"anchor": "top-right", "presets": list(ob.PANEL_PRESETS)}
+    assert api.set_panel_anchor("bottom-left") == {"success": True, "anchor": "bottom-left"}
+    assert api.set_panel_anchor("middle")["success"] is False
+    assert _api(api.memory).panel_anchor_setting() == "bottom-left"
+    api.save_panel_position("answer", (0.25, 2.0))
+    assert api.panel_positions() == {"answer": (0.25, 1.0)}
+    assert _api(api.memory).panel_positions() == {"answer": (0.25, 1.0)}
+    resets = []
+    api._orb = SimpleNamespace(panels=SimpleNamespace(reset_positions=lambda: resets.append(1)))
+    assert api.reset_panel_positions() == {"success": True}
+    assert api.panel_positions() == {} and resets == [1]
+    assert _api(api.memory).panel_positions() == {}
+    assert tuple(config.PANEL_ANCHORS) == ob.PANEL_PRESETS
+
+
+def test_the_sidebar_has_the_new_switches_dropdown_and_reset():
+    for name, label in (("orb_pointer", "Orb points before clicking"),
+                        ("orb_idle_drift", "Idle drift")):
+        assert f'<span>{label}</span><div class="sw" id="sw-{name}"' in HTML
+        assert f"['sw-{name}','{label}']" in HTML                # keyboard + aria switch
+    for anchor in ob.PANEL_PRESETS:
+        assert f'<option value="{anchor}">' in HTML
+    assert 'id="btn-panel_reset"' in HTML
+    assert "const ORB_OPTIONS=['orb_flight','orb_pointer','orb_idle_drift','orb_panels'];" in HTML
+    for fn in ("get_panel_anchor", "set_panel_anchor", "reset_panel_positions",
+               "get_orb_options", "set_orb_option"):
+        assert callable(getattr(Api, fn))
+    assert "pywebview-drag-region" in PANEL_HTML                 # panels drag by their top strip
+    assert set(re.findall(r"pywebview\.api\.(\w+)", PANEL_HTML)) == {"panel_state", "dismiss"}
+
+
+_SIDEBAR = r"""
+const settle = () => new Promise(r => realSetTimeout(r, 30));
+const optCalls = [], anchorCalls = [];
+let resets = 0;
+pywebview.api.get_floating_orb = () => Promise.resolve(true);
+pywebview.api.get_orb_options = () => Promise.resolve(
+  {orb_flight: true, orb_pointer: true, orb_idle_drift: true, orb_panels: false});
+pywebview.api.set_orb_option = (n, on) => { optCalls.push([n, on]);
+  return Promise.resolve({success: true, enabled: on}); };
+pywebview.api.get_panel_anchor = () => Promise.resolve({anchor: 'bottom-left'});
+pywebview.api.set_panel_anchor = (a) => { anchorCalls.push(a);
+  return Promise.resolve({success: true, anchor: a}); };
+pywebview.api.reset_panel_positions = () => { resets++; return Promise.resolve({success: true}); };
+(async () => {
+  for (const fn of listeners['pywebviewready'] || []) fn();
+  await settle();
+  const p = document.getElementById('sw-orb_pointer'), d = document.getElementById('sw-orb_idle_drift');
+  const before = [p.classList.contains('on'), d.classList.contains('on')];
+  await p.onclick(); await d.onclick();
+  const after = [p.classList.contains('on'), d.classList.contains('on')];
+  const sel = document.getElementById('sel-panel_anchor');
+  const a0 = sel.value; sel.value = 'top-left'; await sel.onchange();
+  await document.getElementById('btn-panel_reset').onclick();
+  console.log(JSON.stringify({before, after, optCalls, a0, anchorCalls, resets,
+                              errors: consoleErrors}));
+})();
+"""
+
+
+@floating_orb_window_needs_node
+def test_the_sidebar_switches_and_dropdown_ask_python(tmp_path):
+    cfg = {"gender": "female", "set_gender": _real_outputs(), "flags": {"is_dev": False}}
+    prefix = _HARNESS.split("%PAGE%", 1)[0]
+    f = tmp_path / "sidebar.js"
+    f.write_text(prefix.replace("%CONFIG%", json.dumps(cfg)) + _script() + _SIDEBAR,
+                 encoding="utf-8")
+    out = subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res == {"before": [True, True], "after": [False, False],
+                   "optCalls": [["orb_pointer", False], ["orb_idle_drift", False]],
+                   "a0": "bottom-left", "anchorCalls": ["top-left"], "resets": 1, "errors": []}
+
+
+def test_the_pulse_stays_inside_the_disc_and_respects_reduced_motion():
+    css = ORB_HTML
+    assert '.orb-wrap[data-pulse="1"] .ring{animation:pulse .6s ease-out 1}' in css
+    assert "inset:8%" in css.split(".ring,.ripple{", 1)[1].split("}", 1)[0]   # the inner ring
+    still = '.orb-wrap[data-motion="still"]'
+    assert f"{still},{still} .disc,{still} .disc::after,{still} .ring" in css
+
+
+def test_uia_mouse_fallback_points_once_not_twice(monkeypatch):
+    calls = []
+    nav = ch.EnhancedUIANavigator.__new__(ch.EnhancedUIANavigator)
+    nav.pointer_fn = lambda target: calls.append("point") or True
+    monkeypatch.setattr(ch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch.pyautogui, "moveTo", lambda *a, **k: None)
+    monkeypatch.setattr(ch.pyautogui, "click", lambda *a, **k: calls.append("click"))
+    rect = SimpleNamespace(left=10, top=20, right=110, bottom=60)
+    el = SimpleNamespace(element_info=SimpleNamespace(control_type="Pane"), rectangle=lambda: rect)
+    assert nav.activate_element(el) == "click"
+    assert calls == ["point", "click"]
+    calls.clear()
+    assert nav.click_element(el) is True                    # called directly: points itself
+    assert calls == ["point", "click"]
+
+
+def test_the_pointer_flight_shrinks_quickly_then_flies_small():
+    plan = ob.pointer_plan((1700, 900, 82), (500, 400, 28))
+    assert plan[0] == ((1700, 900, 82), (1727, 927, 28), ob.POINT_RESIZE_S, 0.0)
+    assert plan[1][:2] == ((1727, 927, 28), (500, 400, 28))
+    assert ob.pointer_plan((10, 10, 28), (500, 400, 28)) == [((10, 10, 28), (500, 400, 28), 0.5, 0.15)]
+    assert ob.arrived((505, 400, 28), (500, 400, 28), 12)
+    assert not ob.arrived((520, 400, 28), (500, 400, 28), 12)
+    assert not ob.arrived((500, 400, 82), (500, 400, 28), 12)            # not shrunk yet
+
+
+@pytest.mark.parametrize("d", [150, 400, 1000, 1700])
+def test_the_point_spring_arrives_fast_with_almost_no_overshoot(d):
+    f = fo.Flight((0, 0), (d, 0), 0.0, "point", 0.0)
+    t, arrived_at, over = 0.0, None, 0.0
+    while t < 1.5:
+        x, y, done = f.at(t)
+        if arrived_at is None and math.hypot(x - d, y) <= ob.POINT_ARRIVE_PX:
+            arrived_at = t
+        over = max(over, x - d)
+        if done:
+            break
+        t += 0.002
+    assert arrived_at is not None and arrived_at < 0.3                  # well under the 0.35 s cap
+    assert over < 4                                                     # never swings over the target
+
+
+def test_point_at_releases_on_arrival_before_the_spring_settles():
+    bus = _BehaviorBus()
+    orb = _behavior_orb(busy=True, bus=bus)
+    bus.orb = orb
+    goal = []
+
+    def play(plan, on_frame=None, done=None, motion=None):
+        goal.append((plan[-1][1], motion))
+        x, y, s = plan[-1][1]
+        on_frame((x + 30, y, s))            # still on its way: not released
+        assert orb._point_waits
+        on_frame((x + 5, y, s))             # within POINT_ARRIVE_PX: released
+        assert not orb._point_waits
+
+    orb._tween.play = play
+    assert orb.point_at((900, 500, 1000, 540)) is True
+    assert orb.last_point["landed"] and goal[0][1] == ob.POINT_MOTION == "point"
+    assert orb.pulse == 1

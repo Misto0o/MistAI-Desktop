@@ -2011,6 +2011,33 @@ class BrowserSession:
         except Exception:
             return False
 
+    # The floating orb's pointer (Api._orb_point_page): the element's viewport
+    # rect and the window metrics the search tour already maps to the screen.
+    pointer_fn = None
+    pointer_active_fn = None
+    _POINT_INFO_JS = """(e) => {
+      const r = e.getBoundingClientRect();
+      return {screenX: window.screenX, screenY: window.screenY,
+              outerWidth: window.outerWidth, innerWidth: window.innerWidth,
+              outerHeight: window.outerHeight, innerHeight: window.innerHeight,
+              dpr: window.devicePixelRatio, found: 1,
+              rects: [[r.left, r.top, r.right, r.bottom, 0]]};
+    }"""
+
+    def _point_orb(self, loc):
+        """Worker thread, right before the click: let the orb fly beside the
+        element when its pointer is on (capped wait, in the hook). Numbers
+        only; never raises, never delays a click when no hook is set."""
+        fn, active = self.pointer_fn, self.pointer_active_fn
+        if not callable(fn):
+            return False
+        try:
+            if callable(active) and not active():
+                return False                  # orb hidden / flight or pointer off: no evaluate
+            return bool(fn(loc.evaluate(self._POINT_INFO_JS, timeout=500)))
+        except Exception:
+            return False
+
     def _click_located(self, loc, entry, how=""):
         """Worker thread: scroll into view, refuse a covered target, click,
         then report what happened."""
@@ -2041,6 +2068,7 @@ class BrowserSession:
             page.wait_for_timeout(300)
             how = "Restored MistAI's minimized browser window, then " + (how or "Clicked ").lower()
         self._downloads, self._new_pages, self.last_download = [], [], None
+        self._point_orb(loc)
         try:
             loc.click(timeout=CLICK_TIMEOUT_MS)
         except Exception as e:

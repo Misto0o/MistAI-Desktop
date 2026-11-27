@@ -746,20 +746,36 @@ def orb_panels_enabled(saved=None):
     return _env_or_saved("MISTAI_ORB_PANELS", saved)
 
 
+def orb_pointer_enabled(saved="on"):
+    """MISTAI_ORB_POINTER, else Settings "Orb points before clicking" (default
+    on). Acts only while flight ("Orb follows the task") is on too."""
+    return _env_or_saved("MISTAI_ORB_POINTER", "on" if saved is None else saved)
+
+
+def orb_idle_drift_enabled(saved="on"):
+    """MISTAI_ORB_IDLE_DRIFT, else Settings "Idle drift" (default on)."""
+    return _env_or_saved("MISTAI_ORB_IDLE_DRIFT", "on" if saved is None else saved)
+
+
 def browser_seed_profile_enabled(saved=None):
     """MISTAI_BROWSER_SEED_PROFILE, else Settings "Use my Firefox sign-ins"
     (default off): copy the user's Firefox logins into MistAI's browser."""
     return _env_or_saved("MISTAI_BROWSER_SEED_PROFILE", saved)
 
 
-PANEL_ANCHORS = ("top-right", "top-left", "top-center")   # also the fallback order
+PANEL_ANCHORS = ("top-right", "top-left", "top-center",
+                 "bottom-right", "bottom-left")   # also the fallback order
 
 
-def panel_anchor():
-    """MISTAI_PANEL_ANCHOR = top-right (default) | top-center | top-left, read at
-    call time; anything else is the default."""
+def panel_anchor(saved=None):
+    """MISTAI_PANEL_ANCHOR (top-right | top-left | top-center | bottom-right |
+    bottom-left), read at call time, else the saved Settings preset, else
+    top-right; anything invalid is skipped."""
     v = os.environ.get("MISTAI_PANEL_ANCHOR", "").strip().lower()
-    return v if v in PANEL_ANCHORS else "top-right"
+    if v in PANEL_ANCHORS:
+        return v
+    s = str(saved or "").strip().lower()
+    return s if s in PANEL_ANCHORS else "top-right"
 
 
 def panel_blur_enabled():

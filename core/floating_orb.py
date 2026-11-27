@@ -4,72 +4,72 @@
 #
 # The optional floating orb and everything it needs: pure layout geometry
 # (docking, tours, panel anchors), spring motion and frame pacing, the orb
-# window itself, and the task panels beside it.
+# window itself, and the task panels beside it. Stage 2 behavior (pointer,
+# idle drift, fullscreen, panel positions) is decided in core/orb_behavior.py;
+# this file only wires it to Win32, the threads and the pages.
 #
 # SECTION INDEX
 #   1. ORB LAYOUT GEOMETRY
 #   2. RESIZE ABOUT THE CENTER
-#   3. STRAIGHT-LINE FLIGHT FRAMES
-#   4. CLAMPING SQUARES TO THE WORK AREA
-#   5. DOCKING SIDE CHOICE
-#   6. DOCKING POSITION BESIDE A WINDOW
-#   7. RECT OVERLAP AND PANEL SPACING
-#   8. PANEL COLUMN LAYOUT
-#   9. PANEL COLLISION TEST
-#   10. PANEL ANCHORING
-#   11. EASED SQUARE ALONG A FLIGHT
-#   12. FLIGHT TIMINGS
-#   13. FLIGHT PLANNING
-#   14. WORK AREA COVERAGE
-#   15. DOCKING INSIDE A MAXIMIZED WINDOW
-#   16. TOUR REJECTION REASONS
-#   17. SEARCH RESULT LINK CLASSIFICATION
-#   18. PAGE TO SCREEN RECT MAPPING
-#   19. PAGE MARGIN SPOT
-#   20. SEARCH RESULT TOUR PLAN
-#   21. ANSWER PANEL SPOT
-#   22. ORB MOTION
-#   23. SPRING SETTINGS
-#   24. CRITICAL DAMPING SETTLE POINT
-#   25. SPRING PARAMETERS PER DISTANCE
-#   26. DAMPED SPRING FORMULA
-#   27. RETARGETABLE SPRING FLIGHT
-#   28. REFRESH RATE VALIDATION
-#   29. FRAME TIMING STATISTICS
-#   30. FRAME STATS LOG LINE
-#   31. ORB WINDOW SETTINGS
-#   32. ORB STATE SIGNALS
-#   33. ORB SIGNAL MODEL
-#   34. ORB STATE FROM PYTHON FACTS
-#   35. AUDIO LEVEL PER STATE
-#   36. ORB PAGE BRIDGE
-#   37. HOME PLACEMENT ON THE PRIMARY MONITOR
-#   38. ROUND REGION BOX
-#   39. ORB SIZE PER STATE
-#   40. WIN32 CALLS
-#   41. MOVING AND RESIZING THE WINDOW
-#   42. FRAME PACING
-#   43. TEST FRAME PACER
-#   44. TIMER RESOLUTION BOOST STATE
-#   45. TIMER RESOLUTION BOOST ON
-#   46. TIMER RESOLUTION BOOST OFF
-#   47. FLIGHT PLAYER
-#   48. NO-ACTIVATE MOUSE ANSWER
-#   49. NO-ACTIVATE WINDOW SUBCLASS
-#   50. TASKBAR HIDING
-#   51. WIN32 FAILURE LOGGING
-#   52. ORB WINDOW HARDENING
-#   53. CREATE-TIME CORNER POSITION
-#   54. ORB CONTROLLER
-#   55. TASK PANELS
-#   56. TASK PANEL SETTINGS
-#   57. STEP LABELS
-#   58. TOOL CATEGORY LOOKUP
-#   59. PANEL MODEL
-#   60. PANEL PAGE BRIDGE
-#   61. PANEL WINDOW HARDENING
-#   62. PANEL ROUNDED CORNERS
-#   63. PANEL WINDOWS
+#   3. CLAMPING SQUARES TO THE WORK AREA
+#   4. DOCKING SIDE CHOICE
+#   5. DOCKING POSITION BESIDE A WINDOW
+#   6. RECT OVERLAP AND PANEL SPACING
+#   7. PANEL COLUMN LAYOUT
+#   8. PANEL COLLISION TEST
+#   9. PANEL ANCHORING
+#   10. EASED SQUARE ALONG A FLIGHT
+#   11. FLIGHT TIMINGS
+#   12. FLIGHT PLANNING
+#   13. WORK AREA COVERAGE
+#   14. DOCKING INSIDE A MAXIMIZED WINDOW
+#   15. TOUR REJECTION REASONS
+#   16. SEARCH RESULT LINK CLASSIFICATION
+#   17. PAGE TO SCREEN RECT MAPPING
+#   18. PAGE MARGIN SPOT
+#   19. SEARCH RESULT TOUR PLAN
+#   20. ANSWER PANEL SPOT
+#   21. ORB MOTION
+#   22. SPRING SETTINGS
+#   23. CRITICAL DAMPING SETTLE POINT
+#   24. SPRING PARAMETERS PER DISTANCE
+#   25. DAMPED SPRING FORMULA
+#   26. RETARGETABLE SPRING FLIGHT
+#   27. REFRESH RATE VALIDATION
+#   28. FRAME TIMING STATISTICS
+#   29. FRAME STATS LOG LINE
+#   30. ORB WINDOW SETTINGS
+#   31. ORB STATE SIGNALS
+#   32. POINT BEFORE A CLICK
+#   33. ORB POINTER ACTIVE
+#   34. ORB SIGNAL MODEL
+#   35. ORB STATE FROM PYTHON FACTS
+#   36. AUDIO LEVEL PER STATE
+#   37. ORB PAGE BRIDGE
+#   38. HOME PLACEMENT ON THE PRIMARY MONITOR
+#   39. ROUND REGION BOX
+#   40. ORB SIZE PER STATE
+#   41. WIN32 CALLS
+#   42. MOVING AND RESIZING THE WINDOW
+#   43. FRAME PACING
+#   44. TEST FRAME PACER
+#   45. TIMER RESOLUTION BOOST STATE
+#   46. TIMER RESOLUTION BOOST ON
+#   47. TIMER RESOLUTION BOOST OFF
+#   48. FLIGHT PLAYER
+#   49. TASKBAR HIDING
+#   50. WIN32 FAILURE LOGGING
+#   51. ORB WINDOW HARDENING
+#   52. ORB CONTROLLER
+#   53. TASK PANELS
+#   54. TASK PANEL SETTINGS
+#   55. STEP LABELS
+#   56. TOOL CATEGORY LOOKUP
+#   57. PANEL MODEL
+#   58. PANEL PAGE BRIDGE
+#   59. PANEL WINDOW HARDENING
+#   60. PANEL ROUNDED CORNERS
+#   61. PANEL WINDOWS
 # ============================================================
 
 """
@@ -110,6 +110,33 @@ import time
 import math
 
 from . import live_state as events
+from . import orb_behavior as behavior
+from .orb_behavior import (
+    DRAG_SETTLE_S,
+    HOVER_PX,
+    POINT_GAP,
+    POINT_HOLD_S,
+    POINT_MARGIN,
+    POINT_PAD,
+    POINT_WAIT_S,
+    DriftFacts,
+    DriftPlanner,
+    FullscreenFacts,
+    FullscreenWatch,
+    capped_wait,
+    clear_of_point,
+    click_point,
+    covers_monitor,
+    dock_clear_of,
+    drift_target,
+    fullscreen_action,
+    moved_by_user,
+    panel_fraction,
+    panel_from_fraction,
+    point_rect,
+    pointer_skip_reason,
+    pointer_spot,
+)
 from .config import (
     orb_background,
     orb_debug_capture,
@@ -245,7 +272,7 @@ def overlaps(a, b):
 
 PANEL_INSET = 16      # logical px from the work area's edges
 PANEL_GAP = 12        # logical px between stacked panels
-PANEL_ORDER = ("top-right", "top-left", "top-center")
+PANEL_ORDER = ("top-right", "top-left", "top-center", "bottom-right", "bottom-left")
 
 
 # ============================================================
@@ -253,11 +280,17 @@ PANEL_ORDER = ("top-right", "top-left", "top-center")
 # ============================================================
 
 def _panel_column(sizes, work, anchor, inset, gap, y0=None):
+    """Top anchors stack down from the top inset (or ``y0``); bottom anchors
+    end at the bottom inset (or at ``y0`` from above when given)."""
     wl, wt, wr, wb = (int(v) for v in work)
-    y = wt + inset if y0 is None else y0
+    if anchor.startswith("bottom"):
+        total = sum(h for _w, h in sizes) + gap * max(0, len(sizes) - 1)
+        y = (wb - inset - total) if y0 is None else y0
+    else:
+        y = wt + inset if y0 is None else y0
     out = []
     for w, h in sizes:
-        if anchor == "top-left":
+        if anchor in ("top-left", "bottom-left"):
             x = wl + inset
         elif anchor == "top-center":
             x = (wl + wr) // 2 - w // 2
@@ -300,7 +333,11 @@ def anchored_panels(sizes, work, anchor="top-right", scale=1.0, target_rect=None
     spots = _panel_column(sizes, work, choice, inset, gap)
     if not _hits(spots, sizes, orb_rect):
         return spots, choice
-    below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[3] + gap)
+    if choice.startswith("bottom"):              # above the orb instead
+        total = sum(h for _w, h in sizes) + gap * max(0, len(sizes) - 1)
+        below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[1] - gap - total)
+    else:
+        below = _panel_column(sizes, work, choice, inset, gap, y0=orb_rect[3] + gap)
     if not _hits(below, sizes, orb_rect):
         return below, choice
     for a in order:
@@ -589,6 +626,8 @@ LIVELY_SETTLE_S = 0.52     # + the anticipation: everything settled by ~0.6 s
 CALM_SETTLE_S = 0.6
 LIVELY_MIN_OMEGA = 18.0    # rad/s: short hops stay snappy
 CALM_MIN_OMEGA = 12.0
+POINT_ZETA = 0.9           # "point" (the pointer's flight before a click): within
+POINT_SETTLE_S = 0.4       # 12 px in ~0.21 s, overshoot under 3 px at 1700 px
 MAX_OMEGA = 60.0
 ANTICIPATION_S = 0.06
 ANTICIPATION_PX = 8.0
@@ -628,6 +667,10 @@ def spring_params(distance, motion="lively"):
     d = max(1.0, float(distance))
     if motion == "calm":
         return 1.0, min(MAX_OMEGA, max(CALM_MIN_OMEGA, _critical_x(d) / CALM_SETTLE_S))
+    if motion == "point":                    # the pointer: quick, barely any overshoot
+        amplitude = d / math.sqrt(1.0 - POINT_ZETA * POINT_ZETA)
+        need = math.log(max(1.0, amplitude / SETTLE_PX)) / (POINT_ZETA * POINT_SETTLE_S)
+        return POINT_ZETA, min(MAX_OMEGA, max(LIVELY_MIN_OMEGA, need))
     share = min(1.0, max(0.0, (math.log10(d) - 2.0) / 1.2))
     zeta = 0.58 + 0.10 * share
     amplitude = d / math.sqrt(1.0 - zeta * zeta)          # the envelope from rest
@@ -665,7 +708,7 @@ class Flight:
     the size never changes in flight). ``at(t)`` -> (x, y, done)."""
 
     def __init__(self, start, target, t0, motion="lively", bow=0.0):
-        self.motion = motion if motion in ("lively", "calm") else "lively"
+        self.motion = motion if motion in ("lively", "calm", "point") else "lively"
         self.bow = max(0.0, float(bow))
         self._begin((float(start[0]), float(start[1])), (0.0, 0.0), target, t0, fresh=True)
 
@@ -981,6 +1024,37 @@ def task_finished(api, result):
 
 
 # ============================================================
+# POINT BEFORE A CLICK
+# ============================================================
+
+def point_before_click(api, target):
+    """Called by every click path right BEFORE it sends the click, with the
+    target's screen rect or point (physical px). When the orb points
+    (shown, flight on, pointer on), it publishes events.ORB_POINT, waits at
+    most POINT_WAIT_S for the orb to land beside the target and returns True
+    (the caller then skips the old click marker). Otherwise it returns False
+    at once: no wait, no event. Never raises."""
+    try:
+        orb = api.__dict__.get("_orb") if hasattr(api, "__dict__") else None
+        return bool(orb is not None and orb.point_at(target))
+    except Exception:
+        return False
+
+
+# ============================================================
+# ORB POINTER ACTIVE
+# ============================================================
+
+def pointer_active(api):
+    """Would a click now be pointed at by the orb (and its marker skipped)?"""
+    try:
+        orb = api.__dict__.get("_orb") if hasattr(api, "__dict__") else None
+        return bool(orb is not None and orb.pointer_reason() == "")
+    except Exception:
+        return False
+
+
+# ============================================================
 # ORB SIGNAL MODEL
 # ============================================================
 
@@ -1154,9 +1228,25 @@ class OrbBridge:
             out = {"state": orb.state()}
             if not orb.animations_on():
                 out["still"] = True
+            pulse = getattr(orb, "pulse", 0)
+            if pulse:
+                out["pulse"] = pulse          # a change plays the one-shot pulse
+            if getattr(orb, "fast_poll", lambda: False)():
+                out["fast"] = True            # pointing: poll fast so the pulse is on time
         if out["state"] in LEVEL_STATES:
             out["level"] = state_level(self._api, out["state"])
         return out
+
+    def grab(self, on):
+        """The page's pointer-down (True) / release (False) on the orb: a
+        user drag cancels the orb's own motion until the release."""
+        orb = self._orb
+        if orb is not None:
+            try:
+                orb.user_grab(bool(on))
+            except Exception:
+                pass
+        return {"ok": True}
 
     def talk(self, kind):
         """Push-to-talk from the orb: "start" (a hold began; only when not
@@ -1382,6 +1472,36 @@ class Win32:
 
         mon = win32api.MonitorFromPoint((0, 0), MONITOR_DEFAULTTOPRIMARY)
         return mon, tuple(win32api.GetMonitorInfo(mon)["Work"])
+
+    def monitor_rect(self, hwnd):
+        """The full rect (taskbar strip included) of the monitor ``hwnd`` is
+        on, or None."""
+        try:
+            import win32api
+
+            mon = win32api.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            return tuple(win32api.GetMonitorInfo(mon)["Monitor"])
+        except Exception:
+            return None
+
+    def notification_state(self):
+        """SHQueryUserNotificationState (QUNS_*), or None when unknown."""
+        try:
+            v = ctypes.c_int(0)
+            if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(v)) == 0:
+                return v.value
+        except Exception:
+            pass
+        return None
+
+    def cursor_pos(self):
+        """(x, y) of the mouse pointer in physical px, or None."""
+        from ctypes import wintypes
+
+        pt = wintypes.POINT()
+        if not self.user32.GetCursorPos(ctypes.byref(pt)):
+            return None
+        return pt.x, pt.y
 
     def monitor_scale(self, monitor, hwnd=None):
         """Effective DPI / 96 of ``monitor`` (GetDpiForMonitor), else of the
@@ -1651,7 +1771,8 @@ class Tween:
         except Exception:
             return default
 
-    def play(self, segments, on_frame=None, done=None):
+    def play(self, segments, on_frame=None, done=None, motion=None):
+        """``motion``: "calm" for an idle drift; None = MISTAI_ORB_MOTION."""
         self.cancel()
         old = self._thread
         if old is not None and old.is_alive() and old is not threading.current_thread():
@@ -1660,7 +1781,7 @@ class Tween:
         stop = self._stop = threading.Event()
         self._leg, self._pending = None, None
         self.goal = tuple(segments[-1][1]) if segments else None
-        opts = {"motion": orb_motion(), "stats": orb_frame_stats(),
+        opts = {"motion": motion or orb_motion(), "stats": orb_frame_stats(),
                 "animate": bool(self._ask("animations_enabled", True)),
                 "hz": valid_refresh(self._ask("refresh_rate", 60))}
         if opts["animate"] != Tween._logged_animate:
@@ -1988,8 +2109,25 @@ class FloatingOrb:
         self._anim = (True, 0.0)           # (Windows animation effects on, read at)
         self._clock = time.monotonic
         self._sleep = time.sleep           # the tour's one re-read (tests: no-op)
+        # Stage 2 (core/orb_behavior.py decides, this class applies):
+        self.pulse = 0                     # bumped when a pointer flight lands
+        self._fast_until_page = 0.0        # the page polls fast until then
+        self._point_req = None             # the latest ORB_POINT payload
+        self._point_lock = threading.Lock()
+        self._point_seq = 0
+        self._point_waits = {}             # seq -> Event set when the orb landed
+        self.point_target = None           # (rect, at) of the latest pointed click
+        self.last_point = None             # {"landed", "waited"} of the latest point_at
+        self._grabbed = False              # the user holds the orb (pointer down)
+        self._grab_at = 0.0
+        self._released = False             # a grab ended: adopt the new spot as home
+        self._drift = DriftPlanner()
+        self._fs = FullscreenWatch(self._fullscreen_facts)
+        self.fs_hidden = False             # hidden because a fullscreen app is in front
 
     TICK_S = 0.25
+    GRAB_MAX_S = 30.0         # a grab whose release never arrived expires
+    FAST_PAGE_S = 2.0         # the page's fast poll after a point starts
     DWELL_S = 1.5             # a docked arrival stays put this long
     ANIM_CHECK_S = 5.0        # re-read the Windows animation setting this often
     FAST_TICK_S = 0.1
@@ -1999,7 +2137,7 @@ class FloatingOrb:
         """The orb's state now (orb_state with this orb's signals; docked
         beside the task's window counts as executing)."""
         return orb_state(self._api, self.signals,
-                         docked=self.dock not in (None, "answer", "tour"))
+                         docked=self.dock not in (None, "answer", "tour", "drift"))
 
     def animations_on(self):
         """Windows animation effects (SPI_GETCLIENTAREAANIMATION), re-read
@@ -2020,11 +2158,211 @@ class FloatingOrb:
         except Exception:
             return False
 
+    def _option(self, name):
+        try:
+            return bool(self._api.orb_option(name))
+        except Exception:
+            return False
+
     def _busy(self):
         try:
             return self._api._agent_lock.locked()
         except Exception:
             return False
+
+    # -- the pointer (fly beside a click target BEFORE the click) -------------
+
+    def pointer_reason(self):
+        """"" when a click now gets pointed at, else the skip label."""
+        shown = bool(self.visible and self._tween is not None and self.square)
+        return pointer_skip_reason(shown, self._flight_on(), self._option("orb_pointer"))
+
+    def fast_poll(self):
+        return self._clock() < self._fast_until_page
+
+    def point_at(self, target):
+        """The clicking thread: publish the target (events.ORB_POINT), wait
+        for the landing at most POINT_WAIT_S. True when the pointer is
+        active (even if no spot fits or the cap was hit), False when it is
+        skipped (then nothing waited)."""
+        if self.pointer_reason():
+            return False
+        rect = point_rect(target, max(1, round(POINT_PAD * self.scale)))
+        if rect is None:
+            return False
+        ev = threading.Event()
+        with self._point_lock:
+            self._point_seq += 1
+            seq = self._point_seq
+            self._point_waits = {seq: ev}          # only the newest click waits
+        self.point_target = (rect, self._clock())
+        try:
+            self._api.bus.publish(events.ORB_POINT, {"rect": rect, "seq": seq}, "Orb")
+        except Exception:
+            self._point_req = {"rect": rect, "seq": seq}
+            self._kick.set()
+        landed, waited = capped_wait(ev.wait, POINT_WAIT_S)
+        self.last_point = {"landed": landed, "waited": round(waited, 3)}
+        print(f"[FloatingOrb] point {'landed' if landed else 'capped'} after {waited:.2f}s")
+        return True
+
+    def _point_done(self, seq, landed=True):
+        """A pointer flight landed (tween thread) or could not start: hold
+        the spot POINT_HOLD_S, pulse once, release the waiting click."""
+        with self._point_lock:
+            ev = self._point_waits.pop(seq, None)
+        if ev is None:
+            return                           # already released (arrived, then landed)
+        if landed:
+            self._dwell_until = self._clock() + POINT_HOLD_S
+            self.pulse += 1
+        ev.set()
+
+    def _start_point(self, req):
+        """Control thread: fly small beside the target, clear of the click
+        point and of user-placed panels, inside the target's work area."""
+        rect, seq = tuple(req["rect"]), req.get("seq")
+        work, scale = self._win.monitor_for_rect(rect)
+        scale = scale or 1.0
+        small = max(1, round(orb_sizes()[2] * scale))
+        spot = pointer_spot(rect, work, small, round(POINT_GAP * scale),
+                            round(POINT_MARGIN * scale), avoid=self._panel_obstacles())
+        if spot is None or not clear_of_point(spot[0], spot[1], small, click_point(rect)):
+            print("[FloatingOrb] point skipped (no-room)")
+            self._point_done(seq, landed=False)
+            return
+        x, y, where = spot
+        goal = (x, y, small)
+        self._cancel_tour()
+        self.dock = "pointer"
+        if self.dock != self._logged_dock:
+            self._logged_dock = self.dock
+        print(f"[FloatingOrb] point {where} size {small}")
+        self._fast_until_page = self._clock() + self.FAST_PAGE_S
+        if max(abs(a - b) for a, b in zip(goal, self.square)) <= 2:
+            self._point_done(seq)
+            return
+        plan = behavior.pointer_plan(self.square, goal, FLIGHT_S)
+        self._dwell_until = self._clock() + sum(s[2] for s in plan) + POINT_HOLD_S
+        near = max(2, round(behavior.POINT_ARRIVE_PX * scale))
+
+        def frame(sq):                       # tween thread, per frame: no logging
+            self.square = sq
+            if behavior.arrived(sq, goal, near):
+                self._point_done(seq)        # close enough: release the click now
+
+        self._tween.play(plan, on_frame=frame, done=lambda: self._point_done(seq),
+                         motion=behavior.POINT_MOTION)
+
+    # -- user drag ------------------------------------------------------------
+
+    def user_grab(self, on):
+        """Pointer down on the orb: stop its own motion (flight, tour,
+        drift) until the release; the release adopts the dragged spot."""
+        self._grab_at = self._clock()
+        if on:
+            self._grabbed = True
+            self._drift.reset()
+            self._tour = None
+            if self._tween is not None:
+                self._tween.cancel()
+        else:
+            if self._grabbed:
+                self._released = True
+            self._grabbed = False
+            self._kick.set()
+
+    def _grab_active(self):
+        if self._grabbed and self._clock() - self._grab_at > self.GRAB_MAX_S:
+            self._grabbed, self._released = False, True     # the release never came
+        return self._grabbed
+
+    # -- idle drift -------------------------------------------------------------
+
+    def _cursor_near(self):
+        try:
+            pos = self._win.cursor_pos()
+        except Exception:
+            return False
+        if not pos or not self.square:
+            return False
+        x, y, side = self.square
+        return math.hypot(pos[0] - (x + side / 2), pos[1] - (y + side / 2)) < (
+            HOVER_PX * self._here_scale() + side / 2)
+
+    def _drift_step(self, state, busy):
+        """True while the drift owns the orb this tick (flying or resting
+        at the drift spot). Calm motion; nothing runs per frame at rest."""
+        if self.home is None:
+            return False
+        panels = bool(self.panels is not None and self.panels.handles())
+        facts = DriftFacts(enabled=self._option("orb_idle_drift"), idle=state == "idle",
+                           busy=busy, panels=panels, fullscreen=self._fs.active,
+                           grabbed=self._grabbed, animations=self.animations_on())
+        act = self._drift.update(self._clock(), facts, self._cursor_near)
+        if act == "go":
+            if self.square != self.home or self._tween.running:
+                self._drift.reset()
+                return False
+            work, scale = self._win.monitor_for_rect(behavior.square_rect(*self.home))
+            goal = drift_target(self.home, work, scale=scale or self.scale)
+            if goal == tuple(self.home):
+                self._drift.reset()
+                return False
+            self.dock = "drift"
+            print("[FloatingOrb] drift out")
+            self._tween.play([(self.square, goal, 1.0, 0.0)], on_frame=self._set_square,
+                             motion="calm")
+            return True
+        if act == "home":
+            print("[FloatingOrb] drift home")
+            self.dock = None
+            if busy or self.square[2] != self.home[2]:
+                return False                         # the normal goal takes over
+            self._tween.play([(self.square, self.home, 1.0, 0.0)],
+                             on_frame=self._set_square, motion="calm")
+            return True
+        return self._drift.phase == "away"
+
+    # -- fullscreen ----------------------------------------------------------------
+
+    def _fullscreen_facts(self):
+        """FullscreenFacts for the window in front (ours and the shell never
+        count) plus the shell's notification state."""
+        win = self._win
+        covers = False
+        hwnd = win.foreground()
+        if hwnd and not self._ignored(hwnd):
+            covers = covers_monitor(win.window_rect(hwnd), win.monitor_rect(hwnd))
+        note = getattr(win, "notification_state", lambda: None)()
+        return FullscreenFacts(covers, note)
+
+    def _sync_fullscreen(self, busy):
+        """Hide the orb (never activating anything) while a fullscreen app
+        is in front and no task runs; show it again without activation.
+        True while hidden (the tick then does nothing else)."""
+        if not hasattr(self._win, "monitor_rect"):
+            return False
+        act = fullscreen_action(self._fs.poll(self._clock()), busy)
+        if act == "hide" and not self.fs_hidden:
+            self._tween.cancel()
+            self._drift.reset()
+            self._win.show(self.hwnd, False)
+            if self.panels is not None:
+                self.panels.hide_all()
+            self.fs_hidden = True
+            print("[FloatingOrb] fullscreen app in front: orb hidden")
+        elif act != "hide" and self.fs_hidden:
+            self._win.show(self.hwnd, True)
+            self.fs_hidden = False
+            print(f"[FloatingOrb] orb shown again ({'task' if busy else 'fullscreen ended'})")
+        return self.fs_hidden
+
+    def _panel_obstacles(self):
+        try:
+            return self.panels.user_rects() if self.panels is not None else []
+        except Exception:
+            return []
 
     def _element_rect(self, window_rect, scale):
         """The rect the current task's last click touched (a UIA control's
@@ -2167,7 +2505,9 @@ class FloatingOrb:
             else:
                 self.dock = dock_side(rect, work, small, 8)
                 pos = dock_position(rect, work, small)
-            return pos + (small,)
+            # Panels the user placed by hand are obstacles too.
+            pos = dock_clear_of(pos, small, work, self._panel_obstacles())
+            return tuple(pos) + (small,)
         if busy or state == "speaking":
             # No target yet (or it left the front): stay where it is.
             return resize_about_center(x, y, side, round(medium * self._here_scale()))
@@ -2210,6 +2550,10 @@ class FloatingOrb:
         go home."""
         try:
             name, data = ev.name, ev.data or {}
+            if name == events.ORB_POINT:
+                self._point_req = dict(data)         # the control thread flies it
+                self._kick.set()
+                return
             if name in (events.ACTION_EXECUTED, events.ACTION_FAILED):
                 # After every step: re-check now, then every 0.1 s for a while
                 # (the foreground can change a moment later, e.g. a launch).
@@ -2334,6 +2678,8 @@ class FloatingOrb:
         tw = self._tween
         if self._tour is not None or not getattr(tw, "in_flight", False):
             return
+        if self.dock in ("pointer", "drift"):
+            return                                   # those flights keep their own goal
         dest = getattr(tw, "goal", None)
         if not dest:
             return
@@ -2366,9 +2712,12 @@ class FloatingOrb:
             monitor, work = self._win.primary_work_area()
             scale = self._win.monitor_scale(monitor)
         speaking = bool(getattr(getattr(self._api, "tts", None), "speaking", False))
+        point = None
+        if self.point_target and self._clock() - self.point_target[1] < POINT_HOLD_S * 2:
+            point = self.point_target[0]              # keep panels off the click target
         self.panels.update(self.square, rect, work, scale or self.scale, busy,
                            maximized=maximized, ended=self.aborted or self._stop_requested(),
-                           speaking=speaking)
+                           speaking=speaking, point=point)
 
     def _sync_click_through(self):
         """Click-through while flight is on and the agent acts, so the orb can
@@ -2382,9 +2731,11 @@ class FloatingOrb:
             except Exception as e:
                 print(f"[FloatingOrb] click-through error ({type(e).__name__})")
 
-    def _adopt_drag(self):
+    def _adopt_drag(self, user=False):
         """The user dragged the orb: take the real rect as the square, and as
-        the new home while the orb is at home."""
+        the new home while the orb is at home, or after a grab the page
+        reported (``user``: a drag from a drift spot moves home too); never
+        while a task runs."""
         try:
             rect = self._win.window_rect(self.hwnd)
         except Exception:
@@ -2396,8 +2747,10 @@ class FloatingOrb:
         if real != self.square:
             at_home = self.square == self.home
             self.square = real
-            if at_home and not self._busy():
+            if (at_home or user) and not self._busy():
                 self.home = real
+                if user:
+                    print("[FloatingOrb] dragged: new home")
 
     def tick(self):
         """One controller step: tween towards the goal for the current state.
@@ -2417,6 +2770,18 @@ class FloatingOrb:
                     self._pre_task_fg = None
             self._was_busy = busy
             self._sync_click_through()
+            if self._grab_active():
+                return                               # the user holds the orb
+            if self._released:                       # a drag just ended
+                self._released = False
+                self._adopt_drag(user=True)
+                self._drift.reset()
+            if self._sync_fullscreen(busy):
+                return                               # hidden for a fullscreen app
+            req, self._point_req = self._point_req, None
+            if req:
+                self._start_point(req)               # a click is waiting for this
+                return
             try:
                 self._cur_target, why = self._target() if busy else (None, "idle")
             except Exception:
@@ -2424,12 +2789,14 @@ class FloatingOrb:
             if busy and self._flight_on():
                 self._log_target(self._cur_target, why)
             self._sync_panels(busy)
+            state = self.state()
+            if self._drift_step(state, busy):
+                return                               # drifting (calm), or resting away
             if self._tween.running:
                 self._follow_in_flight()
                 return
             if busy and self._tour_step():
                 return                               # touring the results
-            state = self.state()
             if self._clock() < self._dwell_until and not (self.aborted or state == "waiting"
                                                           or self._stop_requested()):
                 return                               # minimum dwell at a dock
@@ -2484,6 +2851,7 @@ class FloatingOrb:
             else:
                 self.window.show()
             self.visible = True
+            self.fs_hidden = False
             return True
         except Exception as e:
             print(f"[FloatingOrb] could not show the orb ({type(e).__name__})")
@@ -2523,8 +2891,8 @@ class FloatingOrb:
                 self._tween.side = w
                 try:
                     for name in (events.ACTION_EXECUTED, events.ACTION_FAILED,
-                                 events.TASK_FAILED,
-                                 events.TASK_PAUSED, events.AGENT_STEP, events.ORB_SIGNAL):
+                                 events.TASK_FAILED, events.TASK_PAUSED,
+                                 events.AGENT_STEP, events.ORB_SIGNAL, events.ORB_POINT):
                         self._api.bus.subscribe(name, self._on_bus)
                     for name in (events.ORB_SIGNAL, events.AGENT_STEP,
                                  events.ACTION_EXECUTED, events.ACTION_FAILED):
@@ -2826,6 +3194,8 @@ class OrbPanels:
     """The three panel windows. update() is called from the orb's control
     loop with the orb square, the target rect (or None) and the work area."""
 
+    OWN_MOVE_S = 0.5          # a rect mismatch this soon after our own move is not a drag
+
     def __init__(self, api, win, webview=None, html=None, clock=time.monotonic):
         self._api, self._win = api, win
         self._webview, self._html = webview, html
@@ -2838,6 +3208,11 @@ class OrbPanels:
         self.style = None
         self.sizes = {}               # kind -> actual (w, h) the corners were cut for
         self._was_busy = False
+        self._drags = {}              # kind -> (last move seen at, rect) while dragged
+        self._moved_at = {}           # kind -> when we last moved it
+        self.adopted = {}             # kind -> (x, y) of a drag saved this tick
+        self._work = None             # the work area of the latest update
+        self._clock = clock
         self._unsubs = []
         try:
             bus = api.bus
@@ -2849,6 +3224,82 @@ class OrbPanels:
 
     def handles(self):
         return [h for k, h in self.hwnds.items() if h and self.shown.get(k)]
+
+    def _positions(self):
+        """{kind: (fx, fy)} the user dragged panels to (Api, saved)."""
+        try:
+            return dict(self._api.panel_positions() or {})
+        except Exception:
+            return {}
+
+    def _anchor(self):
+        try:
+            return self._api.panel_anchor_setting()
+        except Exception:
+            return panel_anchor()
+
+    def user_rects(self):
+        """Rects of the shown panels the user placed by hand (orb obstacles)."""
+        placed = self._positions()
+        return [r for k, r in self.rects.items() if k in placed and self.shown.get(k)]
+
+    def _layout(self, kinds, sizes, work, scale, target_rect, maximized, orb, point):
+        """{kind: (x, y)}: dragged kinds at their saved place (clamped on
+        the work area), the rest stacked at the preset anchor, which also
+        moves off the click target when it would cover it."""
+        placed = self._positions()
+        out = {}
+        auto = [(k, s) for k, s in zip(kinds, sizes) if k not in placed]
+        for k, s in zip(kinds, sizes):
+            if k in placed:
+                out[k] = panel_from_fraction(placed[k], s, work)
+        if auto:
+            a_kinds, a_sizes = [k for k, _ in auto], [s for _, s in auto]
+            anchor = self._anchor()
+            spots, self.side = anchored_panels(a_sizes, work, anchor, scale,
+                                               target_rect, maximized, orb)
+            if point is not None and _hits(spots, a_sizes, point):
+                again, side = anchored_panels(a_sizes, work, anchor, scale, point, False, orb)
+                if not _hits(again, a_sizes, point):
+                    spots, self.side = again, side
+            out.update(zip(a_kinds, spots))
+        return out
+
+    def _user_moved(self, kind, hwnd):
+        """True while the user drags this panel (it is then left alone); a
+        drag that has settled DRAG_SETTLE_S is saved (Api) and adopted."""
+        try:
+            actual = self._win.window_rect(hwnd)
+        except Exception:
+            actual = None
+        now = self._clock()
+        drag = self._drags.get(kind)
+        # Our own moves are posted (SWP_ASYNCWINDOWPOS): right after one the
+        # window may not be there yet, which is not a drag.
+        ours = now - self._moved_at.get(kind, -1e9) < self.OWN_MOVE_S
+        if actual and not ours and moved_by_user(self.rects.get(kind), actual):
+            self.rects[kind] = tuple(actual)
+            self._drags[kind] = (now, tuple(actual))
+            return True
+        if drag is None:
+            return False
+        if now - drag[0] < DRAG_SETTLE_S:
+            return True
+        del self._drags[kind]
+        if self._work is not None:
+            frac = panel_fraction(drag[1], self._work)
+            try:
+                self._api.save_panel_position(kind, frac)
+                print(f"[OrbPanels] {kind} placed by hand")
+            except Exception as e:
+                print(f"[OrbPanels] could not save the position ({type(e).__name__})")
+        self.adopted[kind] = tuple(drag[1][:2])      # this tick: stay where it was dropped
+        return False
+
+    def reset_positions(self):
+        """After "Reset panel positions": forget drags in progress; the next
+        update puts every panel back at the preset."""
+        self._drags.clear()
 
     def _module(self):
         if self._webview is None:
@@ -2901,10 +3352,11 @@ class OrbPanels:
         return aw, ah
 
     def update(self, orb, target_rect, work, scale, busy, maximized=False, ended=False,
-               speaking=False):
-        """Show, place or hide the panels for this tick: anchored to the top of
-        ``work`` (the target's monitor, else the primary), never over the orb.
-        Never raises."""
+               speaking=False, point=None):
+        """Show, place or hide the panels for this tick: at the preset anchor
+        of ``work`` (the target's monitor, else the primary), never over the
+        orb, off the click target ``point`` when possible; a panel the user
+        dragged goes where it was dropped. Never raises."""
         try:
             if busy and not self._was_busy:
                 self.model.reset()
@@ -2914,13 +3366,19 @@ class OrbPanels:
             self.model.mark_speaking(speaking)
             if self.model.expired() and not busy:
                 self.model.reset()
+            self._work = tuple(work)
             kinds = [k for k in ALL_KINDS if self.model.visible(k, busy)]
             sizes = [tuple(round(v * scale) for v in SIZES[k]) for k in kinds]
-            spots, self.side = anchored_panels(sizes, work, panel_anchor(), scale,
-                                               target_rect, maximized, orb)
-            for kind, (x, y), (w, h) in zip(kinds, spots, sizes):
-                self.rects[kind] = (x, y, x + w, y + h)
+            spots = self._layout(kinds, sizes, work, scale, target_rect, maximized, orb, point)
+            for kind, (w, h) in zip(kinds, sizes):
+                x, y = spots[kind]
                 hwnd = self.hwnds.get(kind)
+                if hwnd and self.shown.get(kind) and self._user_moved(kind, hwnd):
+                    continue                  # the user is moving it: leave it there
+                x, y = self.adopted.pop(kind, (x, y))
+                if (self.rects.get(kind) or (None, None))[:2] != (x, y) or not self.shown.get(kind):
+                    self._moved_at[kind] = self._clock()
+                self.rects[kind] = (x, y, x + w, y + h)
                 if kind not in self.windows:
                     self._create(kind, x, y, w, h, scale)
                 elif hwnd:

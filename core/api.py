@@ -72,7 +72,11 @@ from .config import (
     GENDER_CHOICES,
     MODEL_CHOICES,
     orb_flight_enabled,
+    orb_idle_drift_enabled,
     orb_panels_enabled,
+    orb_pointer_enabled,
+    panel_anchor,
+    PANEL_ANCHORS,
     PTT_PAUSE_THRESHOLD,
     PTT_PHRASE_TIME_LIMIT,
     CONFIRM_LEAD_IN_SECONDS,
@@ -117,6 +121,7 @@ from . import planner as conversation, workspace as file_search, live_state as c
 from .live_state import EventBus, LiveStateTracker, window_belongs_to, FileWatcher, StateWatcher
 from .executor import Executor
 from .floating_orb import signal_scope, waiting_scope
+from .orb_behavior import dump_positions, parse_positions
 from .memory import Memory, recall_builtin, TaskStore
 from .screen import WindowWatch, CohereVision
 from .tools import ToolRegistry
@@ -1253,6 +1258,8 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         from .browser_session import BrowserSession
         # "Use my Firefox sign-ins" is read at each browser start.
         self.browser = BrowserSession(firefox_signins=self.get_firefox_signins)
+        self.browser.pointer_fn = self._orb_point_page
+        self.browser.pointer_active_fn = self._orb_pointer_active
         self._pending_answer = None
         self._pending_source = None     # "button" or "typed", with _pending_answer
         self._answer_event = threading.Event()
@@ -1306,7 +1313,11 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
         self.click_handler.own_window_fn = self._own_window_handle
         # ...and the floating orb (when shown) by its handle too.
         self.click_handler.extra_own_windows_fn = self._orb_window_handles
+        # Every click path points the floating orb at its target first (a
+        # no-op returning False unless the orb is shown with flight + pointer).
+        self.click_handler.pointer_fn = self._orb_point
         self.uia_nav = EnhancedUIANavigator()
+        self.uia_nav.pointer_fn = self._orb_point
         self.agent = AgentLoop(self, self.uia_nav)
 
         # -- Event-driven core: bus, workspace, tasks, tools, executor --------
@@ -2482,17 +2493,24 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
 
     # "Orb follows the task" and "Task panels" (default off; an env flag,
     # MISTAI_ORB_FLIGHT / MISTAI_ORB_PANELS, overrides the saved value).
-    _ORB_OPTIONS = {"orb_flight": orb_flight_enabled, "orb_panels": orb_panels_enabled}
+    # "Orb points before clicking" (orb_pointer, MISTAI_ORB_POINTER) and "Idle
+    # drift" (orb_idle_drift, MISTAI_ORB_IDLE_DRIFT) default ON; the pointer
+    # only acts while "Orb follows the task" is on too.
+    _ORB_OPTIONS = {"orb_flight": orb_flight_enabled, "orb_panels": orb_panels_enabled,
+                    "orb_pointer": orb_pointer_enabled,
+                    "orb_idle_drift": orb_idle_drift_enabled}
+    _ORB_OPTION_DEFAULTS = {"orb_pointer": "on", "orb_idle_drift": "on"}
 
     def orb_option(self, name):
         """Is this orb option on? Read four times a second by the orb, so the
         saved value is cached and refreshed by set_orb_option."""
         cache = self.__dict__.setdefault("_orb_option_cache", {})
+        default = self._ORB_OPTION_DEFAULTS.get(name, "off")
         if name not in cache:
             try:
-                cache[name] = self.memory.get_profile(name, "off")
+                cache[name] = self.memory.get_profile(name, default)
             except Exception:
-                cache[name] = "off"
+                cache[name] = default
         return self._ORB_OPTIONS[name](cache[name])
 
     def get_orb_options(self):
@@ -2509,6 +2527,109 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                     "error": "Could not save the setting"}
         self.__dict__.setdefault("_orb_option_cache", {})[name] = value
         return {"success": True, "enabled": self.orb_option(name)}
+
+    # Task panel placement: a preset anchor (Settings dropdown, profile
+    # "panel_anchor"; MISTAI_PANEL_ANCHOR overrides) and the spots the user
+    # dragged panels to (profile "panel_positions", JSON {kind: [fx, fy]},
+    # fractions of the work area), cleared by "Reset panel positions".
+
+    def panel_anchor_setting(self):
+        cache = self.__dict__.setdefault("_orb_option_cache", {})
+        if "panel_anchor" not in cache:
+            try:
+                cache["panel_anchor"] = self.memory.get_profile("panel_anchor", "top-right")
+            except Exception:
+                cache["panel_anchor"] = "top-right"
+        return panel_anchor(cache["panel_anchor"])
+
+    def get_panel_anchor(self):
+        return {"anchor": self.panel_anchor_setting(), "presets": list(PANEL_ANCHORS)}
+
+    def set_panel_anchor(self, anchor):
+        anchor = str(anchor or "").strip().lower()
+        if anchor not in PANEL_ANCHORS:
+            return {"success": False, "anchor": self.panel_anchor_setting(),
+                    "error": "Unknown position"}
+        try:
+            self.memory.set_profile("panel_anchor", anchor)
+        except Exception:
+            return {"success": False, "anchor": self.panel_anchor_setting(),
+                    "error": "Could not save the setting"}
+        self.__dict__.setdefault("_orb_option_cache", {})["panel_anchor"] = anchor
+        return {"success": True, "anchor": self.panel_anchor_setting()}
+
+    def panel_positions(self):
+        """{kind: (fx, fy)} of the panels the user placed by hand (cached)."""
+        cache = self.__dict__.setdefault("_orb_option_cache", {})
+        if "panel_positions" not in cache:
+            try:
+                cache["panel_positions"] = parse_positions(
+                    self.memory.get_profile("panel_positions", ""))
+            except Exception:
+                cache["panel_positions"] = {}
+        return cache["panel_positions"]
+
+    def save_panel_position(self, kind, frac):
+        positions = dict(self.panel_positions())
+        positions[str(kind)] = (float(frac[0]), float(frac[1]))
+        positions = parse_positions(dump_positions(positions))
+        self.memory.set_profile("panel_positions", dump_positions(positions))
+        self.__dict__.setdefault("_orb_option_cache", {})["panel_positions"] = positions
+
+    def reset_panel_positions(self):
+        """Settings "Reset panel positions": every panel goes back to the preset."""
+        try:
+            self.memory.set_profile("panel_positions", "")
+        except Exception:
+            return {"success": False, "error": "Could not save the setting"}
+        self.__dict__.setdefault("_orb_option_cache", {})["panel_positions"] = {}
+        orb = self.__dict__.get("_orb")
+        panels = getattr(orb, "panels", None)
+        if panels is not None:
+            try:
+                panels.reset_positions()
+            except Exception:
+                pass
+        return {"success": True}
+
+    # -- the orb pointer (core/floating_orb.py point_before_click) ------------
+
+    def _orb_point(self, target):
+        """Every click path calls this right before it sends a click: the
+        orb flies beside ``target`` (a rect or point, physical px) and the
+        click waits at most orb_behavior.POINT_WAIT_S. True = the orb pointed
+        (skip the old click marker); False at once when the orb is hidden,
+        flight is off or the pointer is off."""
+        if self.__dict__.get("_orb") is None:
+            return False
+        from .floating_orb import point_before_click
+
+        return point_before_click(self, target)
+
+    def _orb_pointer_active(self):
+        if self.__dict__.get("_orb") is None:
+            return False
+        from .floating_orb import pointer_active
+
+        return pointer_active(self)
+
+    def _orb_point_page(self, info):
+        """browser_click: the element's viewport rect + window metrics
+        (BrowserSession) mapped to the screen like the search tour; no
+        pointing when the mapping can't be trusted."""
+        if not self._orb_pointer_active():
+            return False
+        try:
+            from .floating_orb import classify_page_rects
+            from .live_state import playwright_window
+
+            orb = self.__dict__.get("_orb")
+            hwnd = playwright_window()
+            window = orb._win.window_rect(hwnd) if hwnd and orb._win else None
+            rects = classify_page_rects(info, window, 1)[0] if window else None
+        except Exception:
+            rects = None
+        return self._orb_point(rects[0]) if rects else False
 
     # "Use my Firefox sign-ins" (default off; MISTAI_BROWSER_SEED_PROFILE
     # overrides the saved value). Read when MistAI's browser starts, so a
@@ -4040,7 +4161,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             activate = getattr(self.uia_nav, "activate_element", None)
             how = activate(element) if callable(activate) else (
                 "click" if self.uia_nav.click_element(element) else "")
-            if how:
+            if how and not self._orb_pointer_active():   # the orb pointed instead
                 try:
                     rect = element.rectangle()
                     from .caption import get_indicator
@@ -4359,7 +4480,7 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
             return False
         try:
             rect = row.get("rect")
-            if rect:
+            if rect and not self._orb_pointer_active():      # the orb pointed instead
                 from .caption import get_indicator
 
                 get_indicator().show((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2,
@@ -5092,15 +5213,17 @@ class Api(WindowActionsMixin, SystemActionsMixin, BrowserActionsMixin):
                         return False
                     self.last_click_effect = None
                     before = self._click_probe()
+                    pointed = self._orb_point((x, y))    # the orb flies beside it first
                     pyautogui.moveTo(x, y, duration=0.2)
                     time.sleep(0.08)
                     pyautogui.click()
-                    try:
-                        from .caption import get_indicator
+                    if not pointed:
+                        try:
+                            from .caption import get_indicator
 
-                        get_indicator().show(x, y, method="coords")   # after the click
-                    except Exception:
-                        pass  # debug-only; never block the real click
+                            get_indicator().show(x, y, method="coords")   # after the click
+                        except Exception:
+                            pass  # debug-only; never block the real click
                     if before:
                         self._report_click_effect(before)
                     else:

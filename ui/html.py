@@ -209,7 +209,11 @@ button:active:not(:disabled),.sw:active,.hint-chip:active,.res-link:active{trans
       <div class="toggle-row"><span>Captions</span><div class="sw" id="sw-cap"></div></div>
       <div class="toggle-row"><span>Floating orb</span><div class="sw" id="sw-orb" title="A small always-on-top orb that stays visible while Mist works"></div></div>
       <div class="toggle-row" id="row-orb_flight"><span>Orb follows the task</span><div class="sw" id="sw-orb_flight" title="Needs the floating orb. The orb flies beside the window Mist is working in"></div></div>
-      <div class="toggle-row" id="row-orb_panels"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Needs the floating orb. Two panels at the top of the screen: the steps Mist takes and its answer"></div></div>
+      <div class="toggle-row" id="row-orb_pointer"><span>Orb points before clicking</span><div class="sw" id="sw-orb_pointer" title="Needs the floating orb and Orb follows the task. The orb flies beside what Mist is about to click, then the click happens"></div></div>
+      <div class="toggle-row" id="row-orb_idle_drift"><span>Idle drift</span><div class="sw" id="sw-orb_idle_drift" title="Needs the floating orb. When nothing is happening the orb drifts a little now and then and comes back"></div></div>
+      <div class="toggle-row" id="row-orb_panels"><span>Task panels</span><div class="sw" id="sw-orb_panels" title="Needs the floating orb. Panels for the steps Mist takes and its answer; drag one by its top edge to move it"></div></div>
+      <div id="row-panel_anchor"><select id="sel-panel_anchor" aria-label="Task panel position" title="Where the task panels appear"><option value="top-right">Panels: top right</option><option value="top-left">Panels: top left</option><option value="top-center">Panels: top center</option><option value="bottom-right">Panels: bottom right</option><option value="bottom-left">Panels: bottom left</option></select>
+        <button class="btn-clear" id="btn-panel_reset" title="Put dragged panels back at the chosen position">Reset panel positions</button></div>
       <div class="toggle-row" id="row-firefox_signins"><span>Use my Firefox sign-ins</span><div class="sw" id="sw-firefox_signins" title="Copies your Firefox profile (cookies and saved logins) into MistAI's own browser so it can use sites you are signed in to. Off by default. Takes effect the next time MistAI's browser starts."></div></div>
     </div>
 
@@ -330,7 +334,8 @@ function makeSwitch(sw,label){
   sw.onkeydown=e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();if(sw.onclick)sw.onclick();}};
 }
 for(const [id,label] of [['sw-wake','Wake word'],['sw-cap','Captions'],['sw-orb','Floating orb'],
-  ['sw-orb_flight','Orb follows the task'],['sw-orb_panels','Task panels'],
+  ['sw-orb_flight','Orb follows the task'],['sw-orb_pointer','Orb points before clicking'],
+  ['sw-orb_idle_drift','Idle drift'],['sw-orb_panels','Task panels'],
   ['sw-firefox_signins','Use my Firefox sign-ins']]){
   const sw=document.getElementById(id);if(sw)makeSwitch(sw,label);
 }
@@ -519,20 +524,43 @@ ctrlCaption.onclick=toggleCaptions;
 const swOrb=document.getElementById('sw-orb');
 let orbOn=false;
 // The two orb options only act while the floating orb is on: dim them then.
+const ORB_OPTIONS=['orb_flight','orb_pointer','orb_idle_drift','orb_panels'];
 function showOrbDependents(){
-  for(const name of ['orb_flight','orb_panels']){
+  for(const name of ORB_OPTIONS.concat(['panel_anchor'])){
     const row=document.getElementById('row-'+name);
     if(row)row.classList.toggle('inactive',!orbOn);
   }
+}
+// Task panel position preset and "Reset panel positions" (dragged panels).
+async function loadPanelAnchor(){
+  const sel=document.getElementById('sel-panel_anchor'),reset=document.getElementById('btn-panel_reset');
+  if(!sel||typeof pywebview.api.get_panel_anchor!=='function')return;
+  const a=(await pywebview.api.get_panel_anchor())||{};
+  if(a.anchor)sel.value=a.anchor;
+  sel.onchange=async()=>{
+    try{
+      const r=await pywebview.api.set_panel_anchor(sel.value);
+      if(r&&r.anchor)sel.value=r.anchor;
+      if(r&&r.error)addMsg('Panels: '+r.error,'error');
+    }catch(e){console.error('Panel anchor error:',e);}
+  };
+  if(reset)reset.onclick=async()=>{
+    try{
+      const r=await pywebview.api.reset_panel_positions();
+      addMsg(r&&r.success?'Panel positions reset':'Panels: '+((r&&r.error)||'reset failed'),
+             r&&r.success?'system':'error');
+    }catch(e){console.error('Panel reset error:',e);}
+  };
 }
 async function loadOrbSetting(){
   if(typeof pywebview.api.get_floating_orb!=='function')return;
   orbOn=!!(await pywebview.api.get_floating_orb());
   setSw(swOrb,orbOn);
   showOrbDependents();
+  loadPanelAnchor();
   if(typeof pywebview.api.get_orb_options!=='function')return;
   const opts=(await pywebview.api.get_orb_options())||{};
-  for(const name of ['orb_flight','orb_panels']){
+  for(const name of ORB_OPTIONS){
     const sw=document.getElementById('sw-'+name);
     setSw(sw,!!opts[name]);
     sw.onclick=async()=>{
@@ -1172,6 +1200,9 @@ def orb_css():
         '.orb-wrap[data-state="completed"] .g-check{display:block}'
         '.orb-wrap[data-state="error"]{animation:shake .45s ease-in-out 1}'
         '.orb-wrap[data-state="error"] .g-excl{display:flex}'
+        # The pointer's one pulse on landing beside a click target: the inner
+        # ring once (inside the disc; transform/opacity only).
+        '.orb-wrap[data-pulse="1"] .ring{animation:pulse .6s ease-out 1}'
         + tint
         # A hidden or minimized page (the orb pages set data-hidden) pauses
         # every animation: nothing is composited for a window nobody sees.
@@ -1301,7 +1332,7 @@ window.addEventListener('pywebviewready',()=>{
   const LIVE=['listening','speaking'];
   const lvl=orbLevel(wrap);
   const HIDDEN_POLL_MS=2000;
-  let timer=null;
+  let timer=null,fast=false,lastPulse=0;
   const hidden=()=>document.visibilityState==='hidden';
   async function poll(){
     timer=null;
@@ -1311,9 +1342,16 @@ window.addEventListener('pywebviewready',()=>{
       wrap.dataset.state=STATES.includes(st)?st:'idle';
       wrap.dataset.motion=(s&&s.still)?'still':'on';
       lvl.set(LIVE.includes(wrap.dataset.state)&&s&&'level' in s?s.level:0);
+      // The pointer landed beside a click target: one pulse (restarted by
+      // clearing the attribute for a frame). "fast" while it points.
+      fast=!!(s&&s.fast);
+      if(s&&s.pulse&&s.pulse!==lastPulse){
+        lastPulse=s.pulse;wrap.dataset.pulse='0';
+        requestAnimationFrame(()=>{wrap.dataset.pulse='1';});
+      }
     }catch(e){}
     if(timer===null)timer=setTimeout(poll,hidden()?HIDDEN_POLL_MS
-      :LIVE.includes(wrap.dataset.state)?FAST_POLL_MS:POLL_MS);
+      :(fast||LIVE.includes(wrap.dataset.state))?FAST_POLL_MS:POLL_MS);
   }
   // Hidden / minimized: animations pause and the poll slows; coming back
   // shows the current state at once. One pending timer at any time.
@@ -1329,8 +1367,14 @@ window.addEventListener('pywebviewready',()=>{
   const HOLD_MS=280,DRAG_PX=6;
   let down=null,moved=false,holding=false,holdTimer=null;
   const talk=(kind)=>{try{pywebview.api.talk(kind);}catch(e){}};
+  // A press holds the orb: Python stops its own motion (flight, drift)
+  // until the release, then a drag's new spot becomes home.
+  const grab=(on)=>{try{pywebview.api.grab(on);}catch(e){}};
+  window.addEventListener('blur',()=>{if(down){grab(false);}});
+  document.addEventListener('pointercancel',()=>{if(down){grab(false);down=null;holding=false;}});
   document.addEventListener('pointerdown',(e)=>{
     if(e.button!==0)return;
+    grab(true);
     down={x:e.screenX,y:e.screenY};moved=false;holding=false;
     clearTimeout(holdTimer);
     holdTimer=setTimeout(()=>{if(down&&!moved){holding=true;talk('start');}},HOLD_MS);
@@ -1342,6 +1386,7 @@ window.addEventListener('pywebviewready',()=>{
   });
   document.addEventListener('pointerup',()=>{
     if(!down)return;
+    grab(false);
     clearTimeout(holdTimer);
     if(holding)talk('stop');
     else if(!moved)talk('toggle');
@@ -1385,6 +1430,13 @@ body{font:12.5px/1.4 'Segoe UI',system-ui,sans-serif;color:#e6f4f8;user-select:n
   background:#161c26;border:1px solid rgba(235,252,255,.14);overflow:hidden;
   animation:drop .22s ease-out both}
 @keyframes drop{from{transform:translateY(-28px);opacity:0}to{transform:none;opacity:1}}
+@keyframes rise{from{transform:translateY(28px);opacity:0}to{transform:none;opacity:1}}
+.panel.from-below{animation-name:rise}
+/* The top strip is the drag handle (pywebview drag region): the panel moves
+   with the pointer and Python remembers where it was dropped. */
+.grip{position:absolute;left:0;right:28px;top:0;height:10px;cursor:move;z-index:1}
+.grip::after{content:'';position:absolute;left:50%;top:3px;width:28px;height:3px;margin-left:-14px;
+  border-radius:2px;background:rgba(235,252,255,.16)}
 .close{position:absolute;top:6px;right:6px;width:18px;height:18px;border:0;border-radius:50%;
   background:rgba(255,255,255,.08);color:#cfe7ee;font-size:12px;line-height:18px;padding:0;cursor:pointer}
 .close:hover{background:rgba(255,255,255,.18)}
@@ -1407,7 +1459,7 @@ li.run{opacity:.75}
 </style>
 </head>
 <body>
-<div class="panel" id="panel"><div id="body"></div><button class="close" id="close" title="Close">&times;</button></div>
+<div class="panel" id="panel"><div class="grip pywebview-drag-region" title="Drag to move"></div><div id="body"></div><button class="close" id="close" title="Close">&times;</button></div>
 <script>
 window.addEventListener('pywebviewready',()=>{
   const body=document.getElementById('body'),panel=document.getElementById('panel');
@@ -1420,6 +1472,7 @@ window.addEventListener('pywebviewready',()=>{
     const key=JSON.stringify(s);
     if(key===last)return;
     last=key;
+    const below=String(s.side||'').indexOf('bottom')===0;
     body.textContent='';
     if(s.kind==='waiting'||s.kind==='error'){
       // Display-only: no close button, nothing to click or focus.
@@ -1447,6 +1500,7 @@ window.addEventListener('pywebviewready',()=>{
       body.className='answer';
       body.textContent=String(s.text||'');
     }
+    if(panel.classList.contains('from-below')!==below)panel.classList.toggle('from-below',below);
   }
   async function poll(){
     try{render(await pywebview.api.panel_state());}catch(e){}

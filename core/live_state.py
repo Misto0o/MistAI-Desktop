@@ -124,6 +124,10 @@ AGENT_STEP = "AgentStep"
 # ones too. Only while the floating orb is shown; for it and its panels only;
 # never logged.
 ORB_SIGNAL = "OrbSignal"
+# core/floating_orb.py point_before_click: {"rect": (l, t, r, b), "seq"} just
+# before a click is sent, only while the orb is shown with flight and the
+# pointer on; the orb flies beside the rect. Never logged.
+ORB_POINT = "OrbPoint"
 
 TASK_STARTED = "TaskStarted"
 TASK_PHASE_DONE = "TaskPhaseDone"
